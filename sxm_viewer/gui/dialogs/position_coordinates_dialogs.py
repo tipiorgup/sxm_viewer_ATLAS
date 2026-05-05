@@ -1,5 +1,7 @@
 from __future__ import annotations
+from pathlib import Path
 from ..._shared import QtCore, QtWidgets
+from ..thumbnail_render import sample_array_value
 
 
 class PositionCoordinatesDialog(QtWidgets.QDialog):
@@ -11,7 +13,6 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         self.setMinimumWidth(500)
         self._build_ui()
     
-
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(10)
@@ -67,6 +68,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         export_btn = QtWidgets.QPushButton("Export CSV")
         export_btn.clicked.connect(self._export_csv)
         layout.addWidget(export_btn)
+        self._update_default_csv_name()
 
     def _on_pick_toggled(self, active):
         canvas = getattr(self.viewer, "preview_canvas", None)
@@ -93,15 +95,45 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         y_nm = event.ydata
         if x_nm is None or y_nm is None:
             return
-        from ..thumbnail_render import sample_array_value
-        z_raw = sample_array_value(view.get("arr"), x_nm, y_nm, view.get("extent"))
-        z_ang = (z_raw * 10.0) if z_raw is not None else 0.0
-        self._points.append((x_nm * 10.0, y_nm * 10.0, z_ang))
+
+        extent = view.get("extent")
+        arr = view.get("arr")
+        if arr is None or extent is None:
+            return
+
+        h, w = arr.shape
+        xmin, xmax, ymin, ymax = extent
+        pixel_x = int((x_nm - xmin) / (xmax - xmin) * w)
+        pixel_y = int((y_nm - ymin) / (ymax - ymin) * h)
+        pixel_x = max(0, min(w - 1, pixel_x))
+        pixel_y = max(0, min(h - 1, pixel_y))
+
+        scan_width_ang = (xmax - xmin) * 10.0
+        scan_height_ang = (ymax - ymin) * 10.0
+        x_ang = pixel_x / w * scan_width_ang
+        y_ang = pixel_y / h * scan_height_ang
+
+        z_raw = sample_array_value(arr, x_nm, y_nm, extent)
+        if z_raw is not None:
+            display_unit = (view.get("unit") or "nm").strip()
+            unit_to_angstrom = {
+                "pm": 0.01,
+                "nm": 10.0,
+                "m": 1e10,
+                "Angstrom": 1.0,
+                "A": 1.0,
+            }
+            factor = unit_to_angstrom.get(display_unit, 10.0)
+            z_ang = z_raw * factor
+        else:
+            z_ang = 0.0
+
+        self._points.append((pixel_x, pixel_y, x_ang, y_ang, z_ang))
         self._refresh_table()
 
     def _refresh_table(self):
         self.table.setRowCount(len(self._points))
-        for i, (x, y, z) in enumerate(self._points):
+        for i, (px, py, x, y, z) in enumerate(self._points):
             for col, val in enumerate([str(i), f"{x:.4f}", f"{y:.4f}", f"{z:.4f}"]):
                 item = QtWidgets.QTableWidgetItem(val)
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
@@ -119,8 +151,9 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         self._refresh_table()
 
     def _browse_csv(self):
+        default_name = self.csv_le.text().strip() or "circle_input.csv"
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save CSV", "circle_input.csv", "CSV Files (*.csv);;All Files (*)"
+            self, "Save CSV", default_name, "CSV Files (*.csv);;All Files (*)"
         )
         if path:
             self.csv_le.setText(path)
@@ -133,17 +166,19 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         out_path = self.csv_le.text().strip() or "circle_input.csv"
         with open(out_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["X (Angstrom)", "Y (Angstrom)", "Height"])
-            for x, y, z in self._points:
-                writer.writerow([x, y, z])
+            writer.writerow(["Point", "Original_X", "Original_Y", "X (Angstrom)", "Y (Angstrom)", "Height", "Z (Angstrom)"])
+            for i, (px, py, x, y, z) in enumerate(self._points):
+                writer.writerow([i, px, py, x, y, z, 0])
         QtWidgets.QMessageBox.information(self, "Done", f"Saved {len(self._points)} points to:\n{out_path}")
+        self._export_npz(out_path)
+        QtWidgets.QMessageBox.information(self, "Done", f"Saved {len(self._points)} points to:\n{out_path}\nSTM grid saved as NPZ alongside.")
 
     def _draw_markers(self):
         canvas = getattr(self.viewer, "preview_canvas", None)
         if canvas is None or canvas.main_ax is None:
             return
         self._clear_markers(canvas)
-        for i, (x_ang, y_ang, _) in enumerate(self._points):
+        for i, (px, py, x_ang, y_ang, _) in enumerate(self._points):
             x_nm = x_ang / 10.0
             y_nm = y_ang / 10.0
             dot, = canvas.main_ax.plot(
@@ -178,3 +213,48 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
                 canvas.mpl_disconnect(self._pick_cid)
         self._clear_markers()
         super().closeEvent(event)
+
+    def _update_default_csv_name(self):
+        stem = ""
+        try:
+            canvas = getattr(self.viewer, "preview_canvas", None)
+            if canvas and canvas.views:
+                stem = Path(canvas.views[0].get("file_name", "")).stem
+            if not stem:
+                stem = Path(self.viewer.last_preview[0]).stem
+        except Exception:
+            pass
+        if stem:
+            self.csv_le.setText(f"{stem}_positions.csv")
+
+    def _export_npz(self, csv_path):
+        import numpy as np
+        canvas = getattr(self.viewer, "preview_canvas", None)
+        if canvas is None or not canvas.views:
+            return
+        view = canvas.views[0]
+        arr = view.get("arr")
+        extent = view.get("extent")
+        if arr is None or extent is None:
+            return
+
+        display_unit = (view.get("unit") or "nm").strip()
+        unit_to_angstrom = {
+            "pm": 0.01,
+            "nm": 10.0,
+            "m": 1e10,
+            "Angstrom": 1.0,
+            "A": 1.0,
+        }
+        factor = unit_to_angstrom.get(display_unit, 10.0)
+
+        h, w = arr.shape
+        xmin, xmax, ymin, ymax = extent
+        x_ang = np.linspace(xmin * 10.0, xmax * 10.0, w)
+        y_ang = np.linspace(ymin * 10.0, ymax * 10.0, h)
+        z_grid = arr * factor
+
+        npz_path = Path(csv_path).with_suffix(".npz")
+        np.savez(str(npz_path), x=x_ang, y=y_ang, z=z_grid)
+
+    
