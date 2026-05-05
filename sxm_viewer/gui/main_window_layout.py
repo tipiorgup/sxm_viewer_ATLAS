@@ -277,6 +277,8 @@ def _ensure_tools_menu(viewer):
     viewer.tools_load_molecule_act = viewer.tools_menu.addAction("Load molecule...")
     viewer.tools_load_molecule_act.setToolTip("Load a molecular structure overlay onto the preview canvas")
     viewer.tools_load_molecule_act.triggered.connect(viewer.on_load_molecule)
+    viewer.tools_pipeline_act = viewer.tools_menu.addAction("Position coordinates...")
+    viewer.tools_pipeline_act.triggered.connect(viewer.on_position_coordinates)
     viewer.tools_menu.addSeparator()
 
     viewer.tools_preview_detach_act = viewer.tools_menu.addAction("Float preview")
