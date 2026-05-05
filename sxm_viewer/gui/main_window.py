@@ -6105,7 +6105,9 @@ QLabel:hover {{
             pass
     
     def on_position_coordinates(self):
-        pass
+        from .dialogs.position_coordinates_dialogs import PositionCoordinatesDialog
+        dlg = PositionCoordinatesDialog(self, parent=self)
+        dlg.show()
 
     def _clear_molecules_for_paths(self, paths):
         if not paths:
