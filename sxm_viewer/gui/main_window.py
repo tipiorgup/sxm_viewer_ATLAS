@@ -135,9 +135,6 @@ class _CollectionTrayList(QtWidgets.QListWidget):
             "Use popup Collection actions when you want popup-specific overlays preserved."
         )
 
-    def on_position_coordinates(self):
-        pass
-
     def _restore_workspace_after_drop(self):
         try:
             self.viewer.on_recall_popouts()
@@ -6106,6 +6103,9 @@ QLabel:hover {{
             canvas.import_molecule_state(state)
         except Exception:
             pass
+    
+    def on_position_coordinates(self):
+        pass
 
     def _clear_molecules_for_paths(self, paths):
         if not paths:
