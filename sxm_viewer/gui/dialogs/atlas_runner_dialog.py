@@ -3,8 +3,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import yaml
-
 from ..._shared import QtCore, QtWidgets, QtGui
 
 
@@ -126,22 +124,43 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
         csv_path  = self.csv_le.text().strip()
         npz_path  = self.npz_le.text().strip()
 
+        missing = []
         if not yaml_path:
-            QtWidgets.QMessageBox.warning(self, "Missing file", "Please select the YAML config file.")
-            return
+            missing.append("Config YAML not selected.")
+        elif not Path(yaml_path).is_file():
+            missing.append(f"Config YAML not found:\n  {yaml_path}")
+
         if not csv_path:
-            QtWidgets.QMessageBox.warning(self, "Missing file", "Please select the positions CSV file.")
-            return
+            missing.append("Positions CSV not selected.")
+        elif not Path(csv_path).is_file():
+            missing.append(f"Positions CSV not found:\n  {csv_path}")
+
         if not npz_path:
-            QtWidgets.QMessageBox.warning(self, "Missing file", "Please select the STM grid NPZ file.")
+            missing.append("STM grid NPZ not selected.")
+        elif not Path(npz_path).is_file():
+            missing.append(f"STM grid NPZ not found:\n  {npz_path}")
+
+        if missing:
+            QtWidgets.QMessageBox.warning(
+                self, "Missing files",
+                "Cannot run ATLAS — please fix the following:\n\n" + "\n\n".join(missing)
+            )
             return
 
-        # Load YAML, patch paths, write to temp file
+        try:
+            import yaml
+        except ImportError:
+            QtWidgets.QMessageBox.critical(
+                self, "Missing dependency",
+                "PyYAML is not installed.\nRun:  pip install pyyaml"
+            )
+            return
+
         try:
             with open(yaml_path, "r") as f:
                 cfg = yaml.safe_load(f)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "YAML error", str(e))
+            QtWidgets.QMessageBox.critical(self, "YAML error", f"Could not read config file:\n{e}")
             return
 
         cfg["circle_input_path"] = csv_path
