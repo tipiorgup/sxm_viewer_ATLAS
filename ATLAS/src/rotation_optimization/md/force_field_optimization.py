@@ -6,14 +6,14 @@ from rdkit import Chem
 from ..geometry.geometry_utils import (
     cap_vectors, get_positions, set_positions,
     get_ring_normal_from_positions, calculate_center_of_mass,
-    get_ring_normal_absolute
+    get_ring_normal_absolute, calculate_moment_of_inertia
 )
 from .ring_functions import (
     detect_pyranose_rings, get_ring_reference_geometry,
     check_and_update_rings,
     apply_ring_constraints_dual_mode,
 )
-from .config import OptimizationConfig, RingConstraintConfig
+from .config import OptimizationConfig, RingConstraintConfig, RingRotationUnit
 from .utils import (
     check_convergence, calculate_rmsd, save_frame,
     fix_valence_issues, save_molecule, 
