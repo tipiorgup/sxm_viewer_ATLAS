@@ -186,7 +186,12 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
         self._process.readyReadStandardError.connect(self._on_stderr)
         self._process.finished.connect(self._on_finished)
 
+        env = QtCore.QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUTF8", "1")
+        self._process.setProcessEnvironment(env)
+
         args = [
+            "-X", "utf8",
             "module_B.py",
             "--input_file", self._tmp_yaml.name,
             "--iterations", str(self.iter_spin.value()),
