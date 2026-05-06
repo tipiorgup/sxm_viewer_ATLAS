@@ -25,13 +25,7 @@ from rdkit.Chem import (
     rdDepictor,
     rdDistGeom
 )
-from rdkit.Chem.Draw import rdMolDraw2D, IPythonConsole
-
-# IPython display
-from IPython.display import Image
-
-# RDKit configuration
-IPythonConsole.ipython_3d = True
+from rdkit.Chem.Draw import rdMolDraw2D
 print(f"RDKit version: {rdkit.__version__}")
 
 # Initialize RDKit feature factory for H-bond detection
