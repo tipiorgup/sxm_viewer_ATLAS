@@ -90,6 +90,8 @@ All are `QDialog` subclasses launched from menu actions. They receive `viewer` a
 
 - Then upload input file, csv and npz files and run ATLAS engine in different Tool executor
 
+- The folder ATLAS contain the code for running it, pipleine with fucntion, module_B being the main exceutor and the scratch file that connects to HPC. First we are going to run the ATLAS in the local install.
+
 ### ATLAS extension (`gui/dialogs/position_coordinates_dialogs.py`)
 `PositionCoordinatesDialog` — the core ATLAS tool. Opened from **Tools → Position coordinates**. Connects to `viewer.preview_canvas` via matplotlib's `mpl_connect("button_press_event")` to pick XY positions. Exports:
 - `<stem>_positions.csv` — columns: Point, Original_X, Original_Y, X (Angstrom), Y (Angstrom), Height, Z (Angstrom)
