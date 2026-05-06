@@ -108,10 +108,9 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         pixel_x = max(0, min(w - 1, pixel_x))
         pixel_y = max(0, min(h - 1, pixel_y))
 
-        scan_width_ang = (xmax - xmin) * 10.0
-        scan_height_ang = (ymax - ymin) * 10.0
-        x_ang = pixel_x / w * scan_width_ang
-        y_ang = pixel_y / h * scan_height_ang
+        # Absolute physical coordinates in Angstroms — same system as the NPZ grid
+        x_ang = x_nm * 10.0
+        y_ang = y_nm * 10.0
 
         z_raw = sample_array_value(arr, x_nm, y_nm, extent)
         if z_raw is not None:
