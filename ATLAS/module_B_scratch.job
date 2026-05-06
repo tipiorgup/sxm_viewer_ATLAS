@@ -1,0 +1,203 @@
+#!/bin/bash
+
+#@ job_name = lps_structure
+#@ job_type = MPICH
+#@ error = lps_structure.err.$(jobid)
+#@ output = lps_structure.out.$(jobid)
+#@ class = 128core
+#@ restart = no
+#@ node = 1
+#@ tasks_per_node = 4
+#@ wall_clock_limit = 999:59:00
+#@ stack_limit = unlimited
+#@ node_usage = shared
+#@ queue
+
+export OMP_NUM_THREADS=1
+
+# Define paths
+VENV_PATH="/home/kk/gomezf/envs_classic/cg_linux"
+PROJECT_DIR="/home/kk/gomezf/FKF/Glycolipid"           
+ITERATIONS="${ITERATIONS:-100}"
+POLYMERS="${POLYMERS:-10}"
+
+INPUT_PREFIXES=(
+    # "251129_032_h1"
+    # "251129_032_h2"
+    # "251129_032_h3"
+    # "250321_001"
+    # "250321_001_h3"
+    # "250321_001_h2"
+    "210605_Cu100_024"
+    "210610_Cu100_023"
+    "hs1"
+    'fa'
+    # "210604_Cu100_020"
+    # "210612_Cu100_050"
+    "glycopeptide"
+    "glycopeptide2"
+)
+
+# =============================================================================
+# OPTIMIZATION CONSTANTS 
+# =============================================================================
+
+# Geometry tolerances
+export DEFAULT_BOND_TOLERANCE="${DEFAULT_BOND_TOLERANCE:-0.02}"
+export DEFAULT_ANGLE_TOLERANCE="${DEFAULT_ANGLE_TOLERANCE:-1}"
+export DEFAULT_CONSTRAINED_RING_COM_LIMIT="${DEFAULT_CONSTRAINED_RING_COM_LIMIT:-0.01}"   
+export DEFAULT_FREE_RING_COM_LIMIT="${DEFAULT_FREE_RING_COM_LIMIT:-0.01}"   
+export EPSILON="${EPSILON:-1e-8}"
+
+# Optimization parameters
+export DEFAULT_COMPRESSION_STEPS="${DEFAULT_COMPRESSION_STEPS:-1500}"
+export DEFAULT_SLAB_STEP_SIZE="${DEFAULT_SLAB_STEP_SIZE:-0.0075}"
+export DEFAULT_SLAB_STEP_INTERVAL="${DEFAULT_SLAB_STEP_INTERVAL:-50}"
+export DEFAULT_GRAVITY="${DEFAULT_GRAVITY:-0.055}"
+export DEFAULT_SLAB_FORCE_SCALE="${DEFAULT_SLAB_FORCE_SCALE:-0.075}"
+export DEFAULT_STEP_SIZE="${DEFAULT_STEP_SIZE:-0.01}"
+
+# Ring monitoring
+export DEFAULT_CHECK_RINGS_INTERVAL="${DEFAULT_CHECK_RINGS_INTERVAL:-5}"
+export DEFAULT_MINIMIZE_INTERVAL="${DEFAULT_MINIMIZE_INTERVAL:-5}"
+export DEFAULT_MINIMIZE_ITERATIONS="${DEFAULT_MINIMIZE_ITERATIONS:-10}"
+
+# Dynamics parameters
+export DEFAULT_TIMESTEP="${DEFAULT_TIMESTEP:-0.05}"
+export DEFAULT_FRICTION="${DEFAULT_FRICTION:-10}"
+export DEFAULT_MAX_FORCE="${DEFAULT_MAX_FORCE:-75.0}"
+export DEFAULT_MAX_VELOCITY="${DEFAULT_MAX_VELOCITY:-0.75}"
+
+# Ring rotation parameters
+export DEFAULT_RING_ROTATION_FRICTION="${DEFAULT_RING_ROTATION_FRICTION:-0.1}"
+export DEFAULT_NORMAL_TOLERANCE_DEG="${DEFAULT_NORMAL_TOLERANCE_DEG:-5.0}"
+export DEFAULT_NORMAL_STIFFNESS="${DEFAULT_NORMAL_STIFFNESS:-100.0}"
+
+# Constrained ring parameters (CD mode)
+export CONSTRAINED_MAX_TRANSLATION="${CONSTRAINED_MAX_TRANSLATION:-1.0}"
+export CONSTRAINED_TRANSLATION_STIFFNESS="${CONSTRAINED_TRANSLATION_STIFFNESS:-500.0}"
+
+# Free ring parameters (3D mode)
+export FREE_MAX_TRANSLATION="${FREE_MAX_TRANSLATION:-0.5}"
+export FREE_TRANSLATION_STIFFNESS="${FREE_TRANSLATION_STIFFNESS:-50.0}"
+
+# Ring matching
+export RING_MATCHING_DISTANCE_THRESHOLD="${RING_MATCHING_DISTANCE_THRESHOLD:-1.0}"
+
+# Activate virtual environment
+echo "Activating virtual environment at: $VENV_PATH"
+if [ ! -d "$VENV_PATH" ]; then
+    echo "ERROR: Virtual environment not found at '$VENV_PATH'"
+    exit 1
+fi
+source "$VENV_PATH/bin/activate"
+echo "Virtual environment activated: $(which python)"
+
+# Loop through each input file
+for PREFIX in "${INPUT_PREFIXES[@]}"; do
+    INPUT_FILE="${PROJECT_DIR}/Inputs/${PREFIX}_input_file.yaml"
+    
+    # Use the prefix as base name
+    BASE_NAME="${PREFIX}"
+    
+    # Create unique scratch directory for this input
+    SCRATCH_DIR="/gaussscratch/gomezf/lps_${LOADL_STEP_ID}_${BASE_NAME}"
+    
+    # Check if input file exists
+    if [ ! -f "$INPUT_FILE" ]; then
+        echo "ERROR: Input file '$INPUT_FILE' not found!"
+        continue  # Skip to next file
+    fi
+
+    # Create scratch directory
+    echo "Creating scratch directory..."
+    mkdir -p "$SCRATCH_DIR"
+    cd "$SCRATCH_DIR"
+    echo "Working in scratch: $(pwd)"
+    
+    # Copy all necessary files to scratch
+    echo "Copying files to scratch..."
+    cp "$INPUT_FILE" ./
+    cp "$PROJECT_DIR"/pipeline.py ./
+    cp "$PROJECT_DIR"/module_B.py ./  # Main Python script
+    cp -r "$PROJECT_DIR"/src ./   # Source directory with modules
+    
+    # Modify the input path in input file
+    sed -i "s|^circle_input_path:.*|circle_input_path: '${PROJECT_DIR}/Inputs/${BASE_NAME}_coordinates.csv'|" "$(basename $INPUT_FILE)"
+    sed -i "s|^stm_grid_path:.*|stm_grid_path: '${PROJECT_DIR}/Inputs/${BASE_NAME}.npz'|" "$(basename $INPUT_FILE)"
+
+    # Verify files are copied
+    echo "Files in scratch directory:"
+    ls -la
+    
+    # Check if required directories exist
+    if [ ! -d "src" ]; then
+        echo "ERROR: 'src' directory not found in scratch!"
+        continue  # Skip to next input file
+    fi
+    
+    # Set Python path
+    export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+    
+    python module_B.py --input_file "$(basename $INPUT_FILE)" --iterations "$ITERATIONS" -p "$POLYMERS"
+    
+    # Check if calculation completed successfully
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "Molecular modeling calculation completed successfully!"
+       
+        # Show generated files in scratch
+        echo "Generated files in scratch:"
+        ls -la *.sdf *.log 2>/dev/null || echo "No structure files found"
+        
+        RESULTS_DIR="${PROJECT_DIR}/results"
+        echo "Creating results directory: $RESULTS_DIR"
+        
+        if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: RESULTS_DIR is empty!"
+            continue
+        fi
+       
+        mkdir -p "$RESULTS_DIR"
+       
+        if [ ! -d "$RESULTS_DIR" ]; then
+            echo "ERROR: Failed to create results directory '$RESULTS_DIR'"
+            continue
+        fi
+       
+        # Copy results back to home directory
+        echo "Copying results back to home directory..."
+        find . -name "*.sdf" -exec cp {} "$RESULTS_DIR/" \; 2>/dev/null && echo "SDF files copied" || echo "No SDF files to copy"
+        find . -name "*.xyz" -exec cp {} "$RESULTS_DIR/" \; 2>/dev/null && echo "SDF files copied" || echo "No SDF files to copy"
+        find . -name "*.log" -exec cp {} "$RESULTS_DIR/" \; 2>/dev/null && echo "LOG files copied" || echo "No LOG files to copy"
+        find . -name "*.crd" -exec cp {} "$RESULTS_DIR/" \; 2>/dev/null && echo "CRD files copied" || echo "No CRD files to copy"
+        find . -name "*.pkl" -exec cp {} "$RESULTS_DIR/" \; 2>/dev/null && echo "pkl files copied" || echo "No pkl files to copy"
+        
+        echo "Results saved to: $RESULTS_DIR"
+        echo "Files saved:"
+        if [ -d "$RESULTS_DIR" ]; then
+            ls -la "$RESULTS_DIR"
+        else
+            echo "ERROR: Results directory does not exist!"
+        fi
+        
+    else
+        echo "ERROR: Molecular modeling calculation failed with exit code $EXIT_CODE"
+        # Still copy any partial results
+        echo "Copying any partial results..."
+        RESULTS_DIR="$PROJECT_DIR/failed_results_$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "$RESULTS_DIR"
+        cp * "$RESULTS_DIR/" 2>/dev/null || echo "No files to copy"
+    fi
+    
+    # Clean up scratch directory
+    echo "Cleaning up scratch directory..."
+    cd /tmp
+    rm -rf "$SCRATCH_DIR"
+    
+    echo "Finished processing $BASE_NAME at: $(date)"
+    echo "Finished $BASE_NAME in $(( SECONDS - LOOP_START ))s at: $(date)"
+    
+done
+
+echo "All input files processed!"
