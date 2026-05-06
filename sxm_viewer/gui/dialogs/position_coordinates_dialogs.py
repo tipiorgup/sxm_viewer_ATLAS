@@ -128,12 +128,12 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         else:
             z_ang = 0.0
 
-        self._points.append((pixel_x, pixel_y, x_ang, y_ang, z_ang))
+        self._points.append((pixel_x, pixel_y, x_ang, y_ang, z_ang, x_nm, y_nm))
         self._refresh_table()
 
     def _refresh_table(self):
         self.table.setRowCount(len(self._points))
-        for i, (px, py, x, y, z) in enumerate(self._points):
+        for i, (px, py, x, y, z, *_) in enumerate(self._points):
             for col, val in enumerate([str(i), f"{x:.4f}", f"{y:.4f}", f"{z:.4f}"]):
                 item = QtWidgets.QTableWidgetItem(val)
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
@@ -149,6 +149,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
     def _clear_all(self):
         self._points.clear()
         self._refresh_table()
+
 
     def _browse_csv(self):
         default_name = self.csv_le.text().strip() or "circle_input.csv"
@@ -167,20 +168,23 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         with open(out_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Point", "Original_X", "Original_Y", "X (Angstrom)", "Y (Angstrom)", "Height", "Z (Angstrom)"])
-            for i, (px, py, x, y, z) in enumerate(self._points):
+            for i, (px, py, x, y, z, *_) in enumerate(self._points):
                 writer.writerow([i, px, py, x, y, z, 0])
-        QtWidgets.QMessageBox.information(self, "Done", f"Saved {len(self._points)} points to:\n{out_path}")
         self._export_npz(out_path)
-        QtWidgets.QMessageBox.information(self, "Done", f"Saved {len(self._points)} points to:\n{out_path}\nSTM grid saved as NPZ alongside.")
+        self._export_png(out_path)
+        QtWidgets.QMessageBox.information(
+            self, "Done",
+            f"Saved {len(self._points)} points to:\n{out_path}\n"
+            f"NPZ: {Path(out_path).with_suffix('.npz').name}\n"
+            f"PNG: {Path(out_path).with_suffix('.png').name}"
+        )
 
     def _draw_markers(self):
         canvas = getattr(self.viewer, "preview_canvas", None)
         if canvas is None or canvas.main_ax is None:
             return
         self._clear_markers(canvas)
-        for i, (px, py, x_ang, y_ang, _) in enumerate(self._points):
-            x_nm = x_ang / 10.0
-            y_nm = y_ang / 10.0
+        for i, (px, py, x_ang, y_ang, _z, x_nm, y_nm) in enumerate(self._points):
             dot, = canvas.main_ax.plot(
                 [x_nm], [y_nm], marker='o', color='#ff5252',
                 ms=7, mec='white', mew=0.8, zorder=20
@@ -188,7 +192,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
             lbl = canvas.main_ax.annotate(
                 str(i), xy=(x_nm, y_nm),
                 xytext=(4, 4), textcoords='offset points',
-                color='white', fontsize=7, zorder=21
+                color='#ffee00', fontsize=7, zorder=21
             )
             self._marker_artists.append((dot, lbl))
         canvas.draw_idle()
@@ -257,4 +261,50 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         npz_path = Path(csv_path).with_suffix(".npz")
         np.savez(str(npz_path), x=x_ang, y=y_ang, z=z_grid)
 
-    
+    def _export_png(self, csv_path):
+        import numpy as np
+        import matplotlib
+        matplotlib.use("Agg")  # off-screen backend for the export figure
+        import matplotlib.pyplot as plt
+
+        canvas = getattr(self.viewer, "preview_canvas", None)
+        if canvas is None or not canvas.views:
+            return
+        view = canvas.views[0]
+        arr = view.get("arr")
+        if arr is None:
+            return
+
+        # Match exactly what the viewer rendered: read origin + display extent
+        # from the canvas metadata so we don't guess.
+        meta = {}
+        if canvas.main_ax is not None:
+            meta = getattr(canvas, "_image_meta", {}).get(canvas.main_ax, {})
+        origin = meta.get("origin", "upper")
+        extent = meta.get("extent") or view.get("extent")
+
+        arr_plot = np.flipud(arr) if origin == "lower" else np.asarray(arr)
+        cmap = view.get("cmap", "gray")
+
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+        imshow_kw = dict(origin=origin, interpolation="nearest", cmap=cmap, aspect="equal")
+        if extent is not None:
+            ax.imshow(arr_plot, extent=extent, **imshow_kw)
+        else:
+            ax.imshow(arr_plot, **imshow_kw)
+
+        for i, (px, py, x_ang, y_ang, _z, x_nm, y_nm) in enumerate(self._points):
+            ax.plot(x_nm, y_nm, marker='o', color='#ff5252',
+                    ms=6, mec='white', mew=0.7, zorder=20)
+            ax.annotate(str(i), xy=(x_nm, y_nm),
+                        xytext=(4, 4), textcoords='offset points',
+                        color='#ffee00', fontsize=7, zorder=21)
+
+        ax.set_xlabel(f"x ({view.get('unit', 'nm')})")
+        ax.set_ylabel(f"y ({view.get('unit', 'nm')})")
+        ax.set_title(Path(csv_path).stem)
+        fig.tight_layout()
+
+        png_path = Path(csv_path).with_suffix(".png")
+        fig.savefig(str(png_path), dpi=150)
+        plt.close(fig)
