@@ -279,6 +279,8 @@ def _ensure_tools_menu(viewer):
     viewer.tools_load_molecule_act.triggered.connect(viewer.on_load_molecule)
     viewer.tools_pipeline_act = viewer.tools_menu.addAction("Position coordinates...")
     viewer.tools_pipeline_act.triggered.connect(viewer.on_position_coordinates)
+    viewer.tools_atlas_act = viewer.tools_menu.addAction("Run ATLAS...")
+    viewer.tools_atlas_act.triggered.connect(viewer.on_run_atlas)
     viewer.tools_menu.addSeparator()
 
     viewer.tools_preview_detach_act = viewer.tools_menu.addAction("Float preview")

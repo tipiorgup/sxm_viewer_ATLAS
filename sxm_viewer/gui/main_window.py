@@ -6109,6 +6109,11 @@ QLabel:hover {{
         dlg = PositionCoordinatesDialog(self, parent=self)
         dlg.show()
 
+    def on_run_atlas(self):
+        from .dialogs.atlas_runner_dialog import ATLASRunnerDialog
+        dlg = ATLASRunnerDialog(self, parent=self)
+        dlg.show()
+
     def _clear_molecules_for_paths(self, paths):
         if not paths:
             return
