@@ -253,9 +253,20 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
 
         h, w = arr.shape
         xmin, xmax, ymin, ymax = extent
-        x_ang = np.linspace(xmin * 10.0, xmax * 10.0, w)
-        y_ang = np.linspace(ymin * 10.0, ymax * 10.0, h)
-        z_grid = arr * factor
+
+        # Ensure axes are strictly increasing (extent Y is inverted for display)
+        x_ang = np.linspace(min(xmin, xmax) * 10.0, max(xmin, xmax) * 10.0, w)
+        y_ang = np.linspace(min(ymin, ymax) * 10.0, max(ymin, ymax) * 10.0, h)
+
+        # Align z to the sorted axes
+        z = arr * factor
+        if ymin > ymax:
+            z = np.flipud(z)
+        if xmin > xmax:
+            z = np.fliplr(z)
+
+        # ATLAS expects z.shape = (W, H): z[i,j] = height at x[i], y[j]
+        z_grid = z.T
 
         npz_path = Path(csv_path).with_suffix(".npz")
         np.savez(str(npz_path), x=x_ang, y=y_ang, z=z_grid)
