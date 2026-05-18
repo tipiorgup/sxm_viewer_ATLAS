@@ -112,6 +112,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         x_ang = x_nm * 10.0
         y_ang = y_nm * 10.0
 
+        import numpy as np
         z_raw = sample_array_value(arr, x_nm, y_nm, extent)
         if z_raw is not None:
             display_unit = (view.get("unit") or "nm").strip()
@@ -123,7 +124,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
                 "A": 1.0,
             }
             factor = unit_to_angstrom.get(display_unit, 10.0)
-            z_ang = z_raw * factor
+            z_ang = (z_raw - float(np.nanmin(arr))) * factor
         else:
             z_ang = 0.0
 
@@ -258,8 +259,8 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         x_ang = np.linspace(min(xmin, xmax) * 10.0, max(xmin, xmax) * 10.0, w)
         y_ang = np.linspace(min(ymin, ymax) * 10.0, max(ymin, ymax) * 10.0, h)
 
-        # Align z to the sorted axes
-        z = arr * factor
+        # Corrugation: subtract background (minimum), then convert to Å
+        z = (arr - np.nanmin(arr)) * factor
         if ymin > ymax:
             z = np.flipud(z)
         if xmin > xmax:
