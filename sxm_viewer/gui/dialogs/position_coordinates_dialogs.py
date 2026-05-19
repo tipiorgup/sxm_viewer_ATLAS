@@ -253,19 +253,17 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         factor = unit_to_angstrom.get(display_unit, 10.0)
 
         h, w = arr.shape
-        xmin, xmax, ymin, ymax = extent
+        x0, x1, y_top, y_bot = extent
+        scan_x_ang = abs(x1 - x0) * 10.0   # nm → Å
+        scan_y_ang = abs(y_top - y_bot) * 10.0
 
-        # Ensure axes are strictly increasing (extent Y is inverted for display)
-        x_ang = np.linspace(min(xmin, xmax) * 10.0, max(xmin, xmax) * 10.0, w)
-        y_ang = np.linspace(min(ymin, ymax) * 10.0, max(ymin, ymax) * 10.0, h)
+        # Pixel-size axes starting at 0, matching the reference sxm_data convention
+        x_ang = np.arange(w) * (scan_x_ang / w)
+        y_ang = np.arange(h) * (scan_y_ang / h)
 
-        # Corrugation: subtract background (minimum), then convert to Å
+        # Corrugation: baseline-subtract then convert to Å; fill NaN with 0
         z = (arr - np.nanmin(arr)) * factor
-        z = np.nan_to_num(z, nan=0.0)  # RectBivariateSpline cannot handle NaN
-        if ymin < ymax:
-            z = np.flipud(z)
-        if xmin > xmax:
-            z = np.fliplr(z)
+        z = np.nan_to_num(z, nan=0.0)
 
         # ATLAS expects z.shape = (W, H): z[i,j] = height at x[i], y[j]
         z_grid = z.T
