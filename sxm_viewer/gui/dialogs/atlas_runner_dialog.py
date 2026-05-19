@@ -184,6 +184,7 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
 
         results_dir = Path(csv_path).parent / "results"
         results_dir.mkdir(exist_ok=True)
+        self._results_dir = results_dir
 
         self._tmp_yaml = tempfile.NamedTemporaryFile(
             mode="w", suffix=".yml", delete=False, dir=str(results_dir)
@@ -245,6 +246,34 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._cleanup_tmp()
+        if exit_code == 0:
+            self._convert_sdf_outputs()
+
+    def _convert_sdf_outputs(self):
+        results_dir = getattr(self, "_results_dir", None)
+        if not results_dir:
+            return
+        try:
+            from rdkit import Chem
+        except ImportError:
+            self._append("[ATLAS] RDKit not available — skipping mol/mol2 export.")
+            return
+        sdf_files = list(results_dir.glob("*.sdf"))
+        converted = 0
+        for sdf_path in sdf_files:
+            try:
+                suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+                mol = next((m for m in suppl if m is not None), None)
+                if mol is None:
+                    continue
+                stem = sdf_path.stem
+                Chem.MolToMolFile(mol, str(results_dir / f"{stem}.mol"))
+                Chem.MolToMol2File(mol, str(results_dir / f"{stem}.mol2"))
+                converted += 1
+            except Exception as e:
+                self._append(f"[ATLAS] Could not convert {sdf_path.name}: {e}")
+        if converted:
+            self._append(f"[ATLAS] Converted {converted} SDF → mol + mol2")
 
     def _cleanup_tmp(self):
         if self._tmp_yaml:
