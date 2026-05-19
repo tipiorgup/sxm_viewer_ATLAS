@@ -261,7 +261,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
 
         # Corrugation: subtract background (minimum), then convert to Å
         z = (arr - np.nanmin(arr)) * factor
-        if ymin > ymax:
+        if ymin < ymax:
             z = np.flipud(z)
         if xmin > xmax:
             z = np.fliplr(z)
