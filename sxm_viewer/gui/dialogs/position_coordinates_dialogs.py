@@ -261,6 +261,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
 
         # Corrugation: subtract background (minimum), then convert to Å
         z = (arr - np.nanmin(arr)) * factor
+        z = np.nan_to_num(z, nan=0.0)  # RectBivariateSpline cannot handle NaN
         if ymin < ymax:
             z = np.flipud(z)
         if xmin > xmax:
