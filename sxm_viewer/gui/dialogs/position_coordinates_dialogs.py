@@ -108,9 +108,11 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         pixel_x = max(0, min(w - 1, pixel_x))
         pixel_y = max(0, min(h - 1, pixel_y))
 
-        # Absolute physical coordinates in Angstroms — same system as the NPZ grid
-        x_ang = x_nm * 10.0
-        y_ang = y_nm * 10.0
+        # Pixel-based Angstrom coords, matching NPZ grid (origin at 0)
+        scan_width_ang = abs(xmax - xmin) * 10.0   # nm → Å
+        scan_height_ang = abs(ymax - ymin) * 10.0
+        x_ang = pixel_x / w * scan_width_ang
+        y_ang = pixel_y / h * scan_height_ang
 
         import numpy as np
         z_raw = sample_array_value(arr, x_nm, y_nm, extent)
