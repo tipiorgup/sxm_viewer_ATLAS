@@ -1608,7 +1608,7 @@ def calculate_stm_surface_forces(positions, masses, gravity, stm_data):
 
         if x_min <= x_atom <= x_max and y_min <= y_atom <= y_max:
             # Inside STM scan: use surface potential
-            h_norm = float(interpolator(x_atom, y_atom))
+            h_norm = float(interpolator.ev(x_atom, y_atom))
             h_norm = max(1.0, min(2.0, h_norm))    # clamp to [1, 2]
 
             decay        = np.exp(-z_atom / LAMBDA_DECAY)
