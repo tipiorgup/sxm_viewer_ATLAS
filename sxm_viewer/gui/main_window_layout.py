@@ -281,6 +281,10 @@ def _ensure_tools_menu(viewer):
     viewer.tools_pipeline_act.triggered.connect(viewer.on_position_coordinates)
     viewer.tools_atlas_act = viewer.tools_menu.addAction("Run ATLAS...")
     viewer.tools_atlas_act.triggered.connect(viewer.on_run_atlas)
+    viewer.tools_avogadro_act = viewer.tools_menu.addAction("Open in Avogadro...")
+    viewer.tools_avogadro_act.triggered.connect(viewer.on_open_avogadro)
+    viewer.tools_edit_atoms_act = viewer.tools_menu.addAction("Edit atoms...")
+    viewer.tools_edit_atoms_act.triggered.connect(viewer.on_edit_atoms)
     viewer.tools_menu.addSeparator()
 
     viewer.tools_preview_detach_act = viewer.tools_menu.addAction("Float preview")

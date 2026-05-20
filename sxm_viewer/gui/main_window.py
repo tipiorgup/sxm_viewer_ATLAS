@@ -6114,6 +6114,16 @@ QLabel:hover {{
         dlg = ATLASRunnerDialog(self, parent=self)
         dlg.show()
 
+    def on_open_avogadro(self):
+        from .dialogs.avogadro_dialog import AvogadroDialog
+        dlg = AvogadroDialog(self, parent=self)
+        dlg.show()
+
+    def on_edit_atoms(self):
+        from .dialogs.molecule_atom_edit_dialog import MoleculeAtomEditDialog
+        dlg = MoleculeAtomEditDialog(self, parent=self)
+        dlg.show()
+
     def _clear_molecules_for_paths(self, paths):
         if not paths:
             return
