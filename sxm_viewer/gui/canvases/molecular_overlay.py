@@ -217,7 +217,7 @@ class Molecule:
             self._load_xyz(path)
         elif suffix == '.pdb':
             self._load_pdb(path)
-        elif suffix == '.mol':
+        elif suffix in ('.mol', '.sdf'):
             self._load_mol(path)
         
         # Center molecule at origin initially
