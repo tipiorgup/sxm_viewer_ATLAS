@@ -298,51 +298,6 @@ def create_phosphate_bond_from_IK(mol1_data, carbon1_name,
     c1_c2_distance = np.linalg.norm(c2_pos - c1_pos)
     print(f"\nC1-C2 distance: {c1_c2_distance:.3f}Å")
     
-    # ========================================================================
-    # NEW: Identify hydroxyl oxygens to remove
-    # ========================================================================
-
-    print(f"\nIdentifying hydroxyl groups to remove:")
-
-    # Check if molecules are pristine or already modified
-    oh_to_remove_mol1 = []
-    oh_to_remove_mol2 = []
-
-    # Only try to find OH if this carbon hasn't been used in bonds yet
-    # You can detect this by checking if the carbon already has 4 bonds
-    donor_oh = find_hydroxyl_oxygen_at_carbon(mol1_data, carbon1_idx, coords1)
-    if donor_oh:
-        oh_to_remove_mol1.extend(donor_oh)
-        print(f" {carbon1_name}: Will remove OH at O{donor_oh}")
-    else:
-        print(f" {carbon1_name}: No OH found (may already be bonded or modified)")
-
-    acceptor_oh = find_hydroxyl_oxygen_at_carbon(mol2_data, carbon2_idx, coords2)
-    if acceptor_oh:
-        oh_to_remove_mol2.extend(acceptor_oh)
-        print(f" {carbon2_name}: Will remove OH at O{acceptor_oh}")
-    else:
-        print(f" {carbon2_name}: No OH found (may already be bonded or modified)")
-
-
-    # print(f"\nIdentifying hydroxyl groups to remove:")
-    
-    # oh_to_remove_mol1 = []
-    # donor_oh = find_hydroxyl_oxygen_at_carbon(mol1_data, carbon1_idx, coords1)
-    # if donor_oh is not None:
-    #     oh_to_remove_mol1.append(donor_oh)
-    #     print(f"  ✓ {carbon1_name}: Will remove OH at O{donor_oh}")
-    # else:
-    #     print(f"  ⚠ {carbon1_name}: No hydroxyl found (may already be bonded)")
-    
-    # oh_to_remove_mol2 = []
-    # acceptor_oh = find_hydroxyl_oxygen_at_carbon(mol2_data, carbon2_idx, coords2)
-    # if acceptor_oh is not None:
-    #     oh_to_remove_mol2.append(acceptor_oh)
-    #     print(f"  ✓ {carbon2_name}: Will remove OH at O{acceptor_oh}")
-    # else:
-    #     print(f"  ⚠ {carbon2_name}: No hydroxyl found (may already be bonded)")
-    
     # Quality assessment
     max_bond_error = max(
         abs(o1_c1_dist - C_O_BOND),
@@ -381,8 +336,8 @@ def create_phosphate_bond_from_IK(mol1_data, carbon1_name,
         'p_o4_distance': float(o4_p_dist),
         'c1_c2_distance': float(c1_c2_distance),
         'quality': quality,
-        'donor_oh_to_remove': oh_to_remove_mol1,      # ← ADD THIS
-        'acceptor_oh_to_remove': oh_to_remove_mol2    # ← ADD THIS
+        'donor_oh_to_remove': [],
+        'acceptor_oh_to_remove': []
     }
 
 def find_hydroxyl_oxygen_at_carbon(mol_data, carbon_idx, coords):

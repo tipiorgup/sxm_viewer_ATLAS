@@ -31,20 +31,28 @@ def find_atom_by_position(conformer, target_pos, start_idx=0, end_idx=None, tole
     return None
 
 def find_oh_group_near_carbon(mol, conformer, carbon_idx, min_dist=1.3, max_dist=1.6):
-    """Find OH group bonded to a specific carbon."""
+    """Find OH group bonded to a specific carbon.
+
+    Uses BOTH distance (1.3-1.6 Å) AND topology: the oxygen must be an actual
+    RDKit neighbor of carbon_idx, not just spatially close.
+    """
     c_pos = conformer.GetAtomPosition(carbon_idx)
     c_arr = np.array([c_pos.x, c_pos.y, c_pos.z])
-    
+
     for i in range(mol.GetNumAtoms()):
         atom = mol.GetAtomWithIdx(i)
         if atom.GetSymbol() == 'O':
             pos = conformer.GetAtomPosition(i)
             pos_arr = np.array([pos.x, pos.y, pos.z])
             dist = np.linalg.norm(pos_arr - c_arr)
-            
+
             if min_dist < dist < max_dist:
-                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
-                if neighbors == ['C'] or set(neighbors) == {'C', 'H'}:
+                neighbor_indices = [n.GetIdx() for n in atom.GetNeighbors()]
+                # Must be topologically bonded to the target carbon
+                if carbon_idx not in neighbor_indices:
+                    continue
+                neighbor_symbols = [mol.GetAtomWithIdx(j).GetSymbol() for j in neighbor_indices]
+                if neighbor_symbols == ['C'] or set(neighbor_symbols) == {'C', 'H'}:
                     return i
     return None
 
@@ -244,78 +252,83 @@ def add_glycosidic_bonds(combined_rw, glycosidic_bonds, linkage_definitions, pro
 # ============================================================================
 
 def add_phosphate_bonds(combined_rw, phosphate_bonds_with_names, processed_mols):
-    """Add phosphate linkages between molecules (legacy approach - no OH removal)."""
+    """
+    Add phosphate linkages by reusing existing OH oxygens on the sugar carbons.
+    Only P, O3 (=O), O4 (-OH), and H are inserted as new atoms — no deletions.
+    """
     if phosphate_bonds_with_names is None:
         print("Skipping phosphate bonds (not provided)")
         return
-    
+
     print(f"\nAdding {len(phosphate_bonds_with_names)} phosphate bond(s)...")
     conf = combined_rw.GetConformer()
-    
+
     for mol1_name, mol2_name, phosphate_bond in phosphate_bonds_with_names:
         mol1_data = next((m for m in processed_mols if m['name'] == mol1_name), None)
         mol2_data = next((m for m in processed_mols if m['name'] == mol2_name), None)
-        
+
         if mol1_data is None or mol2_data is None:
             print(f"  ⚠ Skipping {mol1_name}-{mol2_name}: molecule not found")
             continue
-        
+
         carbon1_name = phosphate_bond.get('carbon1_name', 'C1')
         carbon2_name = phosphate_bond.get('carbon2_name', 'C1')
-        
-        # Use carbon_map to find carbons directly (NEW!)
-        carbon1_local = mol1_data['carbon_map'][carbon1_name]
-        c1_global = mol1_data['atom_offset'] + carbon1_local
-        
-        carbon2_local = mol2_data['carbon_map'][carbon2_name]
-        c2_global = mol2_data['atom_offset'] + carbon2_local
 
-        # # Find carbon atoms by position
-        # c1_global = find_atom_by_position(
-        #     conf, phosphate_bond['c1_position'],
-        #     mol1_data['atom_offset'],
-        #     mol1_data['atom_offset'] + mol1_data['num_atoms']
-        # )
-        
-        # c2_global = find_atom_by_position(
-        #     conf, phosphate_bond['c2_position'],
-        #     mol2_data['atom_offset'],
-        #     mol2_data['atom_offset'] + mol2_data['num_atoms']
-        # )
-        
-        # if c1_global is None or c2_global is None:
-        #     print(f"  ⚠ Could not find carbons for {mol1_name}-{mol2_name}")
-        #     continue
-        
-        # Add phosphate group
-        p_idx = combined_rw.AddAtom(Chem.Atom(15))
-        o1_idx = combined_rw.AddAtom(Chem.Atom(8))
-        o2_idx = combined_rw.AddAtom(Chem.Atom(8))
+        # Use stored 3D positions to find the correct global atom index.
+        # carbon_map offsets become stale after add_glycosidic_bonds removes
+        # intra-molecule atoms (e.g. KDO loses C1-OH and C4-OH before C6 is
+        # looked up), so position-based lookup is the reliable approach.
+        c1_pos_stored = phosphate_bond.get('c1_position')
+        c2_pos_stored = phosphate_bond.get('c2_position')
+
+        c1_global = find_atom_by_position(conf, c1_pos_stored, tolerance=0.05)
+        c2_global = find_atom_by_position(conf, c2_pos_stored, tolerance=0.05)
+
+        if c1_global is None:
+            print(f"  ⚠ Cannot locate {mol1_name}.{carbon1_name} by 3D position — skipping")
+            continue
+        if c2_global is None:
+            print(f"  ⚠ Cannot locate {mol2_name}.{carbon2_name} by 3D position — skipping")
+            continue
+
+        print(f"  Located {mol1_name}.{carbon1_name} at global #{c1_global}, "
+              f"{mol2_name}.{carbon2_name} at global #{c2_global}")
+
+        # Find the existing OH oxygen on each carbon using RDKit topology
+        o1_idx = find_oh_group_near_carbon(combined_rw, conf, c1_global)
+        o2_idx = find_oh_group_near_carbon(combined_rw, conf, c2_global)
+
+        if o1_idx is None:
+            print(f"  ⚠ No OH found on {mol1_name}.{carbon1_name} (global #{c1_global}) — skipping")
+            continue
+        if o2_idx is None:
+            print(f"  ⚠ No OH found on {mol2_name}.{carbon2_name} (global #{c2_global}) — skipping")
+            continue
+
+        print(f"  Reusing O#{o1_idx} ({mol1_name}.{carbon1_name}) and O#{o2_idx} ({mol2_name}.{carbon2_name})")
+
+        # Add only P, O3 (=O), O4 (-OH), H
+        p_idx  = combined_rw.AddAtom(Chem.Atom(15))
         o3_idx = combined_rw.AddAtom(Chem.Atom(8))
         o4_idx = combined_rw.AddAtom(Chem.Atom(8))
-        h_idx = combined_rw.AddAtom(Chem.Atom(1))
-        
-        conf.SetAtomPosition(p_idx, tuple(phosphate_bond['phosphorus_position']))
-        conf.SetAtomPosition(o1_idx, tuple(phosphate_bond['oxygen1_position']))
-        conf.SetAtomPosition(o2_idx, tuple(phosphate_bond['oxygen2_position']))
+        h_idx  = combined_rw.AddAtom(Chem.Atom(1))
+
+        conf.SetAtomPosition(p_idx,  tuple(phosphate_bond['phosphorus_position']))
         conf.SetAtomPosition(o3_idx, tuple(phosphate_bond['oxygen3_position']))
         conf.SetAtomPosition(o4_idx, tuple(phosphate_bond['oxygen4_position']))
-        
-        # Calculate hydrogen position
+
         o4_p_vec = np.array(phosphate_bond['phosphorus_position']) - np.array(phosphate_bond['oxygen4_position'])
         h_pos = np.array(phosphate_bond['oxygen4_position']) - (o4_p_vec / np.linalg.norm(o4_p_vec)) * 0.96
         conf.SetAtomPosition(h_idx, tuple(h_pos))
-        
-        # Create bonds
-        combined_rw.AddBond(c1_global, o1_idx, Chem.BondType.SINGLE)
-        combined_rw.AddBond(o1_idx, p_idx, Chem.BondType.SINGLE)
-        combined_rw.AddBond(p_idx, o2_idx, Chem.BondType.SINGLE)
-        combined_rw.AddBond(o2_idx, c2_global, Chem.BondType.SINGLE)
-        combined_rw.AddBond(p_idx, o3_idx, Chem.BondType.DOUBLE)
-        combined_rw.AddBond(p_idx, o4_idx, Chem.BondType.SINGLE)
-        combined_rw.AddBond(o4_idx, h_idx, Chem.BondType.SINGLE)
-        
-        print(f" {phosphate_bond['linkage']}")
+
+        # Bond P to the existing oxygens already attached to the carbons
+        combined_rw.AddBond(o1_idx, p_idx,  Chem.BondType.SINGLE)
+        combined_rw.AddBond(p_idx,  o2_idx, Chem.BondType.SINGLE)
+        combined_rw.AddBond(p_idx,  o3_idx, Chem.BondType.DOUBLE)
+        combined_rw.AddBond(p_idx,  o4_idx, Chem.BondType.SINGLE)
+        combined_rw.AddBond(o4_idx, h_idx,  Chem.BondType.SINGLE)
+
+        print(f"  ✓ {phosphate_bond['linkage']}")
 
 # ============================================================================
 # PEPTIDE BONDS (SUGAR-PEPTIDE)
