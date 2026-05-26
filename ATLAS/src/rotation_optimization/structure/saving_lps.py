@@ -1155,16 +1155,19 @@ def export_complete_structure_with_petn_and_lipids(
     
     # Step 1: Collect all molecules
     processed_mols = collect_molecules(chain_dict, unbonded_monomers, mol_name_to_conformer, conformers)
-    
+
+    # Freeze ring positions BEFORE any bonding touches the conformer
+    ring_snapshot = snapshot_ring_positions(chain_dict)
+
     # Step 2: Combine molecules
     combined_rw = combine_molecules(processed_mols)
-    
+
     # Step 3: Add glycosidic bonds
     add_glycosidic_bonds(combined_rw, glycosidic_bonds, linkage_definitions, processed_mols)
-    
+
     # Step 4: Add phosphate bonds
     add_phosphate_bonds(combined_rw, phosphate_bonds_with_names, processed_mols)
-    
+
     # Step 5-6: Add PEtN and lipid tails
     add_functional_groups(combined_rw, petn_linkages, lipid_linkages, processed_mols)
     
@@ -1213,7 +1216,7 @@ def export_complete_structure_with_petn_and_lipids(
         if atom.GetSymbol() == 'N':
             atom.SetNoImplicit(True)
     
-    restore_ring_coms_after_export(final_mol, chain_dict, tolerance=2.0)
+    restore_ring_positions_from_snapshot(final_mol, ring_snapshot)
 
     if filename is not None:
         # Write SDF using manual approach to preserve ALL bonds
@@ -1268,10 +1271,13 @@ def export_complete_glycopeptide(
     
     # Step 1: Collect all molecules (sugars only for now)
     processed_mols = collect_molecules(chain_dict, unbonded_monomers, mol_name_to_conformer, conformers)
-    
+
+    # Freeze ring positions BEFORE any bonding touches the conformer
+    ring_snapshot = snapshot_ring_positions(chain_dict)
+
     # Step 2: Combine sugar molecules
     combined_rw = combine_molecules(processed_mols)
-    
+
     # Step 3: Add glycosidic bonds (sugar-sugar)
     add_glycosidic_bonds(combined_rw, glycosidic_bonds, linkage_definitions, processed_mols)
     
@@ -1334,6 +1340,7 @@ def export_complete_glycopeptide(
         if atom.GetSymbol() == 'N':
             atom.SetNoImplicit(True)
     
+    restore_ring_positions_from_snapshot(final_mol, ring_snapshot)
     restore_glycopeptide_positions(final_mol, chain_dict, peptide_data, tolerance=2.0)
     
     # DEBUG IMMEDIATELY AFTER RESTORATION
@@ -1379,81 +1386,125 @@ def export_complete_glycopeptide(
     
     return final_mol, enforced_atoms
 
-def restore_ring_coms_after_export(final_mol, molecule_data_dict, tolerance=2.0):
+def snapshot_ring_positions(chain_dict):
     """
-    Restore ring COMs to experimental positions after export (GLYCOLIPIDS ONLY).
-    
-    This is the original working version for glycolipids without peptides.
+    Record exact ring atom positions from chain_dict BEFORE any bonding/export
+    operations. Uses carbon_map to identify the ring atoms (C1-C5 + ring_oxygen).
+
+    Returns
+    -------
+    dict  {mol_name: {atom_idx_in_monomer: [x, y, z]}}
+    """
+    snapshots = {}
+    for mol_name, mol_data in chain_dict.items():
+        carbon_map = mol_data.get('carbon_map', {})
+        coords = np.array(mol_data['absolute_coordinates'])
+
+        ring_indices = set()
+        for ci in range(1, 6):
+            idx = carbon_map.get(f'C{ci}')
+            if idx is not None and idx < len(coords):
+                ring_indices.add(idx)
+        ro_idx = carbon_map.get('ring_oxygen')
+        if ro_idx is not None and ro_idx < len(coords):
+            ring_indices.add(ro_idx)
+
+        snapshots[mol_name] = {idx: coords[idx].tolist() for idx in ring_indices}
+
+    return snapshots
+
+
+def snapshot_peptide_linker_positions(peptide_data):
+    """
+    Record exact positions of linker ring atoms (phenyl + oxadiazole) from the
+    already-positioned peptide.  Must be called BEFORE any bonding operations
+    modify or combine the peptide molecule.
+
+    Returns a dict in the same format as snapshot_ring_positions so it can be
+    merged and passed to restore_ring_positions_from_snapshot.
+
+    Returns
+    -------
+    dict  {'__linker__': {atom_idx: [x, y, z]}}   or {} if no linker found
+    """
+    from rdkit.Chem import MolFromSmarts as _smarts
+
+    mol = peptide_data.get('rdkit_mol') if peptide_data else None
+    if mol is None or mol.GetNumConformers() == 0:
+        return {}
+
+    phenyl_match    = mol.GetSubstructMatch(_smarts('c1ccccc1'))
+    oxadiazole_match = mol.GetSubstructMatch(_smarts('c1nnco1'))
+    linker_indices  = list(phenyl_match) + list(oxadiazole_match)
+
+    if not linker_indices:
+        return {}
+
+    conf = mol.GetConformer()
+    snapshot = {idx: list(conf.GetAtomPosition(idx)) for idx in linker_indices}
+    print(f"  [linker snapshot] captured {len(snapshot)} ring atoms "
+          f"(phenyl={len(phenyl_match)}, oxadiazole={len(oxadiazole_match)})")
+    return {'__linker__': snapshot}
+
+
+def restore_ring_positions_from_snapshot(final_mol, snapshots, pos_tolerance=0.5):
+    """
+    After bonding/export, find each snapshotted ring atom by its stored 3D
+    position (robust to index shifts from atom removal) and write back the
+    exact position recorded before bonding.
+
+    pos_tolerance : float
+        Ångström radius used to locate a snapshot atom in the final molecule.
+        Should be small (default 0.5 Å) since nothing should have moved the
+        ring atoms — it only needs to handle floating-point noise.
     """
     print("\n" + "="*70)
-    print("RESTORING RING COMs TO EXPERIMENTAL POSITIONS")
+    print("FREEZING RING POSITIONS (snapshot restore)")
     print("="*70)
-    
+
     conf = final_mol.GetConformer()
     n_atoms = final_mol.GetNumAtoms()
-    
-    # Get all positions
-    positions = np.zeros((n_atoms, 3))
+
+    current_positions = np.zeros((n_atoms, 3))
     for i in range(n_atoms):
-        pos = conf.GetAtomPosition(i)
-        positions[i] = [pos.x, pos.y, pos.z]
-    
-    # Detect pyranose rings
-    Chem.GetSymmSSSR(final_mol)
-    ring_info = final_mol.GetRingInfo()
-    pyranose_rings = []
-    
-    for ring in ring_info.AtomRings():
-        if len(ring) == 6:
-            oxygen_count = sum(1 for idx in ring if final_mol.GetAtomWithIdx(idx).GetSymbol() == 'O')
-            if oxygen_count == 1:
-                pyranose_rings.append(list(ring))
-    
-    print(f"Found {len(pyranose_rings)} pyranose rings to restore")
-    
-    # Match and restore each ring
-    for ring_idx, ring_atoms in enumerate(pyranose_rings):
-        ring_pos = positions[ring_atoms]
-        current_com = np.mean(ring_pos, axis=0)
-        
-        # Find matching monomer
-        best_match = None
-        min_dist = float('inf')
-        
-        for mol_name, mol_data in molecule_data_dict.items():
-            exp_com = np.array(mol_data['COM'])
-            dist = np.linalg.norm(current_com - exp_com)
-            
-            if dist < min_dist:
-                min_dist = dist
-                best_match = (mol_name, exp_com)
-        
-        if best_match and min_dist < tolerance:
-            mol_name, target_com = best_match
-            
-            # Calculate translation needed
-            translation = target_com - current_com
-            translation_mag = np.linalg.norm(translation)
-            
-            print(f"\n  Ring {ring_idx} ({mol_name}):")
-            print(f"    Current COM: [{current_com[0]:.3f}, {current_com[1]:.3f}, {current_com[2]:.3f}]")
-            print(f"    Target COM:  [{target_com[0]:.3f}, {target_com[1]:.3f}, {target_com[2]:.3f}]")
-            print(f"    Correction:  {translation_mag:.3f} Å")
-            
-            # Apply translation to ring atoms
-            for atom_idx in ring_atoms:
-                old_pos = positions[atom_idx]
-                new_pos = old_pos + translation
-                conf.SetAtomPosition(atom_idx, tuple(new_pos))
-                positions[atom_idx] = new_pos
-            
-            print(f"    ✓ Restored")
-        else:
-            print(f"\n  Ring {ring_idx}: No match found (min_dist={min_dist:.3f} Å)")
-    
-    print("\n" + "="*70)
-    print("✓ Ring COM restoration complete")
+        p = conf.GetAtomPosition(i)
+        current_positions[i] = [p.x, p.y, p.z]
+
+    total_restored = 0
+    total_drifted = 0
+
+    for mol_name, ring_atom_map in snapshots.items():
+        for _, stored_pos in ring_atom_map.items():
+            stored = np.array(stored_pos)
+
+            # Find the atom in the final molecule whose current position is
+            # closest to the stored position (within tolerance).
+            dists = np.linalg.norm(current_positions - stored, axis=1)
+            nearest_idx = int(np.argmin(dists))
+            nearest_dist = dists[nearest_idx]
+
+            if nearest_dist > pos_tolerance:
+                print(f"  WARNING ({mol_name}): snapshot atom not found within "
+                      f"{pos_tolerance} Å (nearest={nearest_dist:.3f} Å) — skipping")
+                continue
+
+            if nearest_dist > 1e-6:
+                conf.SetAtomPosition(nearest_idx, tuple(stored_pos))
+                current_positions[nearest_idx] = stored
+                total_drifted += 1
+
+            total_restored += 1
+
+    print(f"  Ring atoms found:   {total_restored}")
+    print(f"  Ring atoms drifted: {total_drifted}  (corrected)")
     print("="*70)
+
+
+def restore_ring_coms_after_export(final_mol, molecule_data_dict, tolerance=2.0):
+    """Kept for backward compatibility — no longer modifies positions."""
+    print("\n[restore_ring_coms_after_export] skipped — use snapshot_ring_positions "
+          "/ restore_ring_positions_from_snapshot instead.")
+    pass
 
 def restore_glycopeptide_positions(final_mol, molecule_data_dict, peptide_data, tolerance=2.0):
     """
@@ -1466,62 +1517,9 @@ def restore_glycopeptide_positions(final_mol, molecule_data_dict, peptide_data, 
     conf = final_mol.GetConformer()
     
     # ========================================================================
-    # PART 1: Restore sugar rings (same as glycolipids)
+    # PART 1: Sugar rings — already frozen by snapshot before bonding; skip.
     # ========================================================================
-    print(f"\nRestoring sugar rings...")
-    
-    n_atoms = final_mol.GetNumAtoms()
-    positions = np.zeros((n_atoms, 3))
-    for i in range(n_atoms):
-        pos = conf.GetAtomPosition(i)
-        positions[i] = [pos.x, pos.y, pos.z]
-    
-    Chem.GetSymmSSSR(final_mol)
-    ring_info = final_mol.GetRingInfo()
-    pyranose_rings = []
-    
-    for ring in ring_info.AtomRings():
-        if len(ring) == 6:
-            oxygen_count = sum(1 for idx in ring if final_mol.GetAtomWithIdx(idx).GetSymbol() == 'O')
-            if oxygen_count == 1:
-                pyranose_rings.append(list(ring))
-    
-    print(f"Found {len(pyranose_rings)} pyranose rings")
-    
-    for ring_idx, ring_atoms in enumerate(pyranose_rings):
-        ring_pos = positions[ring_atoms]
-        current_com = np.mean(ring_pos, axis=0)
-        
-        # Find matching sugar
-        best_match = None
-        min_dist = float('inf')
-        
-        for mol_name, mol_data in molecule_data_dict.items():
-            exp_com = np.array(mol_data['COM'])
-            dist = np.linalg.norm(current_com - exp_com)
-            
-            if dist < min_dist:
-                min_dist = dist
-                best_match = (mol_name, exp_com)
-        
-        if best_match and min_dist < tolerance:
-            mol_name, target_com = best_match
-            translation = target_com - current_com
-            translation_mag = np.linalg.norm(translation)
-            
-            print(f"\n  Ring {ring_idx} ({mol_name}):")
-            print(f"    Current COM: [{current_com[0]:.3f}, {current_com[1]:.3f}, {current_com[2]:.3f}]")
-            print(f"    Target COM:  [{target_com[0]:.3f}, {target_com[1]:.3f}, {target_com[2]:.3f}]")
-            print(f"    Correction:  {translation_mag:.3f} Å")
-            
-            # Apply translation
-            for atom_idx in ring_atoms:
-                old_pos = positions[atom_idx]
-                new_pos = old_pos + translation
-                conf.SetAtomPosition(atom_idx, tuple(new_pos))
-                positions[atom_idx] = new_pos
-            
-            print(f"    ✓ Restored")
+    print(f"\nSugar ring positions frozen via snapshot — no correction needed.")
     
     # ========================================================================
     # PART 2: Restore peptide residues (Cα + rotation)
