@@ -1274,6 +1274,9 @@ def export_complete_glycopeptide(
 
     # Freeze ring positions BEFORE any bonding touches the conformer
     ring_snapshot = snapshot_ring_positions(chain_dict)
+    # Freeze linker ring positions from the already-positioned peptide
+    linker_snapshot = snapshot_peptide_linker_positions(peptide_data)
+    ring_snapshot.update(linker_snapshot)
 
     # Step 2: Combine sugar molecules
     combined_rw = combine_molecules(processed_mols)
@@ -1340,8 +1343,12 @@ def export_complete_glycopeptide(
         if atom.GetSymbol() == 'N':
             atom.SetNoImplicit(True)
     
-    restore_ring_positions_from_snapshot(final_mol, ring_snapshot)
+    # Peptide Cα alignment runs first (translates residue atoms including linker)
     restore_glycopeptide_positions(final_mol, chain_dict, peptide_data, tolerance=2.0)
+    # Sugar + linker rings frozen last — overrides any drift from Cα alignment
+    restore_ring_positions_from_snapshot(final_mol, ring_snapshot)
+    # Absolute guarantee: linker rings always flat on surface (Z=0)
+    enforce_linker_flat(final_mol)
     
     # DEBUG IMMEDIATELY AFTER RESTORATION
     print("\n" + "="*70)
@@ -1447,16 +1454,102 @@ def snapshot_peptide_linker_positions(peptide_data):
     return {'__linker__': snapshot}
 
 
-def restore_ring_positions_from_snapshot(final_mol, snapshots, pos_tolerance=0.5):
+def _restore_linker_by_smarts(final_mol, linker_snapshot):
     """
-    After bonding/export, find each snapshotted ring atom by its stored 3D
-    position (robust to index shifts from atom removal) and write back the
-    exact position recorded before bonding.
+    Restore linker ring (phenyl + oxadiazole) positions using SMARTS matching on
+    the final molecule.  Topology-based and immune to large displacements caused by
+    SetDihedralRad or Cα alignment — unlike position-based search which can pick
+    the wrong atom when the linker has moved far from its snapshot location.
 
-    pos_tolerance : float
-        Ångström radius used to locate a snapshot atom in the final molecule.
-        Should be small (default 0.5 Å) since nothing should have moved the
-        ring atoms — it only needs to handle floating-point noise.
+    Matching: greedy nearest-neighbour within the SMARTS-identified ring atom set.
+    The linker moves as a rigid body so relative distances within the ring are
+    preserved and greedy assignment is reliable.
+
+    Returns number of atoms restored.
+    """
+    from rdkit.Chem import MolFromSmarts as _smarts
+
+    conf = final_mol.GetConformer()
+
+    phenyl_match = final_mol.GetSubstructMatch(_smarts('c1ccccc1'))
+    oxadia_match = final_mol.GetSubstructMatch(_smarts('c1nnco1'))
+    final_indices = list(phenyl_match) + list(oxadia_match)
+
+    if not final_indices:
+        print("  [linker] WARNING: linker rings not found in final mol by SMARTS — skipping restore")
+        return 0
+
+    snapshot_positions = list(linker_snapshot.values())
+
+    if len(final_indices) != len(snapshot_positions):
+        print(f"  [linker] WARNING: SMARTS found {len(final_indices)} atoms but snapshot "
+              f"has {len(snapshot_positions)} — skipping")
+        return 0
+
+    # Greedy nearest-neighbour: for each snapshot position find the closest
+    # unmatched atom from the SMARTS-identified linker atom set.
+    used_final = set()
+    assignments = []  # (final_atom_idx, snapshot_pos)
+
+    for snap_pos in snapshot_positions:
+        snap = np.array(snap_pos)
+        best_fi, best_dist = None, float('inf')
+        for fi in final_indices:
+            if fi in used_final:
+                continue
+            p = conf.GetAtomPosition(fi)
+            d = np.linalg.norm(np.array([p.x, p.y, p.z]) - snap)
+            if d < best_dist:
+                best_dist, best_fi = d, fi
+        if best_fi is not None:
+            assignments.append((best_fi, snap_pos))
+            used_final.add(best_fi)
+
+    n_restored = 0
+    for fi, pos in assignments:
+        p = conf.GetAtomPosition(fi)
+        if np.linalg.norm(np.array([p.x, p.y, p.z]) - np.array(pos)) > 1e-6:
+            conf.SetAtomPosition(fi, (float(pos[0]), float(pos[1]), float(pos[2])))
+        n_restored += 1
+
+    print(f"  [linker] SMARTS restore: {n_restored} ring atoms → snapshot positions (XY experimental, Z=0)")
+    return n_restored
+
+
+def enforce_linker_flat(final_mol):
+    """
+    Force all linker ring atoms (phenyl + oxadiazole) to Z = 0.
+    Called after snapshot restore as an absolute guarantee of surface flatness,
+    regardless of any upstream drift from SetDihedralRad or Cα alignment.
+    """
+    from rdkit.Chem import MolFromSmarts as _smarts
+
+    conf = final_mol.GetConformer()
+    phenyl_match = final_mol.GetSubstructMatch(_smarts('c1ccccc1'))
+    oxadia_match = final_mol.GetSubstructMatch(_smarts('c1nnco1'))
+    all_linker = list(phenyl_match) + list(oxadia_match)
+
+    n_forced = 0
+    for idx in all_linker:
+        p = conf.GetAtomPosition(idx)
+        if abs(p.z) > 1e-6:
+            conf.SetAtomPosition(idx, (p.x, p.y, 0.0))
+            n_forced += 1
+
+    if all_linker:
+        print(f"  [linker] Z=0 enforced on {len(all_linker)} ring atoms "
+              f"({n_forced} had non-zero Z)")
+    else:
+        print("  [linker] no linker rings found by SMARTS — Z=0 enforcement skipped")
+
+
+def restore_ring_positions_from_snapshot(final_mol, snapshots, sugar_tolerance=0.5):
+    """
+    After bonding/export, restore ring atom positions from pre-bonding snapshot.
+
+    Sugar rings  — position-based matching with tight tolerance (they do not move).
+    Linker rings — SMARTS matching on final mol (reliable regardless of displacement;
+                   SetDihedralRad and Cα alignment can move the linker 10–30 Å).
     """
     print("\n" + "="*70)
     print("FREEZING RING POSITIONS (snapshot restore)")
@@ -1471,21 +1564,25 @@ def restore_ring_positions_from_snapshot(final_mol, snapshots, pos_tolerance=0.5
         current_positions[i] = [p.x, p.y, p.z]
 
     total_restored = 0
-    total_drifted = 0
+    total_drifted  = 0
 
     for mol_name, ring_atom_map in snapshots.items():
+        if mol_name == '__linker__':
+            n = _restore_linker_by_smarts(final_mol, ring_atom_map)
+            total_restored += n
+            total_drifted  += n
+            continue
+
+        # Sugar rings: position-based with tight tolerance
         for _, stored_pos in ring_atom_map.items():
             stored = np.array(stored_pos)
-
-            # Find the atom in the final molecule whose current position is
-            # closest to the stored position (within tolerance).
             dists = np.linalg.norm(current_positions - stored, axis=1)
-            nearest_idx = int(np.argmin(dists))
+            nearest_idx  = int(np.argmin(dists))
             nearest_dist = dists[nearest_idx]
 
-            if nearest_dist > pos_tolerance:
+            if nearest_dist > sugar_tolerance:
                 print(f"  WARNING ({mol_name}): snapshot atom not found within "
-                      f"{pos_tolerance} Å (nearest={nearest_dist:.3f} Å) — skipping")
+                      f"{sugar_tolerance} Å (nearest={nearest_dist:.3f} Å) — skipping")
                 continue
 
             if nearest_dist > 1e-6:
