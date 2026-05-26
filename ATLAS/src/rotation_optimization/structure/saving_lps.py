@@ -106,10 +106,35 @@ def collect_molecules(chain_dict, unbonded_monomers, mol_name_to_conformer, conf
         first_conf = list(conformers[conformer_type].keys())[0]
         mol = Chem.Mol(conformers[conformer_type][first_conf]['molecule'])
         
+        # Sanity check: coord array must match atom count
+        if len(coords) != mol.GetNumAtoms():
+            print(f"  WARNING {mol_name}: absolute_coordinates has {len(coords)} entries "
+                  f"but molecule has {mol.GetNumAtoms()} atoms — index mismatch!")
+
         conf = mol.GetConformer()
         for i, coord in enumerate(coords):
+            if i >= mol.GetNumAtoms():
+                break
             conf.SetAtomPosition(i, (float(coord[0]), float(coord[1]), float(coord[2])))
-        
+
+        # Diagnostic: print ring atom positions and check ring regularity
+        ring_indices = []
+        for ci in range(1, 6):
+            idx = carbon_map.get(f'C{ci}')
+            if idx is not None and idx < len(coords):
+                ring_indices.append(idx)
+        ro_idx = carbon_map.get('ring_oxygen')
+        if ro_idx is not None and ro_idx < len(coords):
+            ring_indices.append(ro_idx)
+
+        if ring_indices:
+            ring_pos = np.array([coords[i] for i in ring_indices])
+            centroid = ring_pos.mean(axis=0)
+            dists = np.linalg.norm(ring_pos - centroid, axis=1)
+            print(f"  {mol_name}: ring centroid Z={centroid[2]:.2f} Å, "
+                  f"radii min={dists.min():.2f} max={dists.max():.2f} Å "
+                  f"({'OK' if dists.max() - dists.min() < 0.5 else 'DISTORTED'})")
+
         processed_mols.append({
             'name': mol_name,
             'mol': mol,
@@ -117,7 +142,7 @@ def collect_molecules(chain_dict, unbonded_monomers, mol_name_to_conformer, conf
             'carbon_map': carbon_map,
             'num_atoms': mol.GetNumAtoms()
         })
-        
+
         print(f"  {mol_name}: {mol.GetNumAtoms()} atoms")
         atom_offset += mol.GetNumAtoms()
     
