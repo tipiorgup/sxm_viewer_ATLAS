@@ -1004,17 +1004,16 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     fixed_atoms = config.fixed_atoms.copy() if config.fixed_atoms else []
     from .utils import save_molecule
 
-    # PHASE 1: CONSTRAINED MINIMIZATION 
+    if fixed_atoms:
+        print(f"\n  Fixed atoms from config: {len(fixed_atoms)}")
+
+    # PHASE 1: CONSTRAINED MINIMIZATION
     t0 = time.perf_counter()
     mol_copy = run_minimization_phase_no_cog(
-        mol_copy, props, use_mmff, 
-        [],
-        # fixed_atoms,
+        mol_copy, props, use_mmff,
+        fixed_atoms,
         n_atoms, config,
         trajectory_path=trajectory_path
-        # ,pyranose_rings=pyranose_rings,           
-        # initial_ring_coms=initial_ring_coms,     
-        # ring_rotation_units=ring_rotation_units  
     )
     t_phase1 = time.perf_counter() - t0
 
@@ -1027,23 +1026,24 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     final_slab_z, _, last_valid_mol = run_compression_phase(
         mol_copy, conf, n_atoms, masses, props, use_mmff,
         ring_rotation_units, ring_references,
-        config, last_valid_mol, [],
+        config, last_valid_mol, fixed_atoms,
         xy_constrained_atoms=lipid_tail_indices or [],
         molecule_data_dict=molecule_data_dict,
         stm_data=stm_data,
-        trajectory_path=trajectory_path                    
+        trajectory_path=trajectory_path
     )
     t_phase2 = time.perf_counter() - t0
 
 
     save_molecule(mol_copy, f"{config.output_name}_phase2_compressed", file_format='sdf')
     print(f"  💾 Saved: {config.output_name}_phase2_compressed.sdf")
-    
-    # PHASE 3: FINAL FREE MINIMIZATION 
+
+    # PHASE 3: FINAL MINIMIZATION WITH LINKER STILL FROZEN
 
     t0 = time.perf_counter()
     mol_copy = run_final_minimization_phase(
         mol_copy, props, use_mmff, config,
+        fixed_atoms=fixed_atoms,
         trajectory_path=trajectory_path
     )
     t_phase3 = time.perf_counter() - t0
@@ -1168,18 +1168,25 @@ def fix_overvalent_carbons(mol):
 
 def run_final_minimization_phase(mol_copy, props, use_mmff,
                                  config: OptimizationConfig,
+                                 fixed_atoms=None,
                                  trajectory_path=None):
     """
     Phase 4: Final gentle minimization without constraints.
+    fixed_atoms: list of atom indices to pin (e.g. linker ring atoms).
     """
+    if fixed_atoms is None:
+        fixed_atoms = []
     total_iterations = 200  # Gentle final polish
     steps_per_update = 4
     num_updates = total_iterations // steps_per_update  # 50 updates
-    
+
     for update in range(num_updates):
         if use_mmff:
             ff = AllChem.MMFFGetMoleculeForceField(mol_copy, props)
             if ff:
+                for atom_idx in fixed_atoms:
+                    if 0 <= atom_idx < mol_copy.GetNumAtoms():
+                        ff.MMFFAddPositionConstraint(atom_idx, 0.0, 1e15)
                 ff.Initialize()
                 ff.Minimize(maxIts=steps_per_update)  # Only 4 steps at a time
             else:

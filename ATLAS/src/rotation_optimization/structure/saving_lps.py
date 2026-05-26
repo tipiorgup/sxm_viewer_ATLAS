@@ -1479,42 +1479,65 @@ def snapshot_peptide_linker_positions(peptide_data):
     return {'__linker__': snapshot}
 
 
+def _find_linker_ring_atoms(mol):
+    """
+    Find phenyl (6-membered all-carbon) and oxadiazole (5-membered, 2N+1O+2C)
+    ring atoms by ring topology — no reliance on aromaticity perception.
+
+    Safe to call after SANITIZE_NONE or bond-order normalisation that may have
+    cleared aromatic flags.
+
+    Returns (phenyl_indices, oxadiazole_indices) as lists of atom indices.
+    """
+    Chem.GetSymmSSSR(mol)
+    ring_info = mol.GetRingInfo()
+    phenyl, oxadiazole = [], []
+
+    for ring in ring_info.AtomRings():
+        syms = [mol.GetAtomWithIdx(i).GetSymbol() for i in ring]
+        if len(ring) == 6 and all(s == 'C' for s in syms):
+            phenyl = list(ring)
+        elif (len(ring) == 5 and
+              syms.count('N') == 2 and syms.count('O') == 1 and syms.count('C') == 2):
+            oxadiazole = list(ring)
+
+    return phenyl, oxadiazole
+
+
 def _restore_linker_by_smarts(final_mol, linker_snapshot):
     """
-    Restore linker ring (phenyl + oxadiazole) positions using SMARTS matching on
-    the final molecule.  Topology-based and immune to large displacements caused by
-    SetDihedralRad or Cα alignment — unlike position-based search which can pick
-    the wrong atom when the linker has moved far from its snapshot location.
+    Restore linker ring (phenyl + oxadiazole) positions by matching ring atoms
+    in the final molecule to their pre-bonding snapshot positions.
 
-    Matching: greedy nearest-neighbour within the SMARTS-identified ring atom set.
-    The linker moves as a rigid body so relative distances within the ring are
+    Uses ring topology (size + heteroatom count) instead of SMARTS so this works
+    even when aromaticity flags are absent (SANITIZE_NONE path).
+
+    Matching: greedy nearest-neighbour within the topology-identified ring set.
+    Because the linker moves as a rigid body, relative intra-ring distances are
     preserved and greedy assignment is reliable.
 
     Returns number of atoms restored.
     """
-    from rdkit.Chem import MolFromSmarts as _smarts
-
     conf = final_mol.GetConformer()
 
-    phenyl_match = final_mol.GetSubstructMatch(_smarts('c1ccccc1'))
-    oxadia_match = final_mol.GetSubstructMatch(_smarts('c1nnco1'))
-    final_indices = list(phenyl_match) + list(oxadia_match)
+    phenyl, oxadiazole = _find_linker_ring_atoms(final_mol)
+    final_indices = phenyl + oxadiazole
 
     if not final_indices:
-        print("  [linker] WARNING: linker rings not found in final mol by SMARTS — skipping restore")
+        print("  [linker] WARNING: phenyl/oxadiazole rings not found by topology — skipping restore")
         return 0
 
     snapshot_positions = list(linker_snapshot.values())
 
     if len(final_indices) != len(snapshot_positions):
-        print(f"  [linker] WARNING: SMARTS found {len(final_indices)} atoms but snapshot "
+        print(f"  [linker] WARNING: topology found {len(final_indices)} atoms but snapshot "
               f"has {len(snapshot_positions)} — skipping")
         return 0
 
     # Greedy nearest-neighbour: for each snapshot position find the closest
-    # unmatched atom from the SMARTS-identified linker atom set.
+    # unmatched atom from the topology-identified linker atom set.
     used_final = set()
-    assignments = []  # (final_atom_idx, snapshot_pos)
+    assignments = []
 
     for snap_pos in snapshot_positions:
         snap = np.array(snap_pos)
@@ -1537,22 +1560,22 @@ def _restore_linker_by_smarts(final_mol, linker_snapshot):
             conf.SetAtomPosition(fi, (float(pos[0]), float(pos[1]), float(pos[2])))
         n_restored += 1
 
-    print(f"  [linker] SMARTS restore: {n_restored} ring atoms → snapshot positions (XY experimental, Z=0)")
+    print(f"  [linker] topology restore: {n_restored} ring atoms → snapshot positions "
+          f"(phenyl={len(phenyl)}, oxadiazole={len(oxadiazole)})")
     return n_restored
 
 
 def enforce_linker_flat(final_mol):
     """
     Force all linker ring atoms (phenyl + oxadiazole) to Z = 0.
-    Called after snapshot restore as an absolute guarantee of surface flatness,
-    regardless of any upstream drift from SetDihedralRad or Cα alignment.
-    """
-    from rdkit.Chem import MolFromSmarts as _smarts
 
+    Uses ring topology matching (not SMARTS) so this works even when the
+    molecule has gone through SANITIZE_NONE and aromatic flags may be absent.
+    Called last in the export pipeline as an absolute guarantee of flatness.
+    """
     conf = final_mol.GetConformer()
-    phenyl_match = final_mol.GetSubstructMatch(_smarts('c1ccccc1'))
-    oxadia_match = final_mol.GetSubstructMatch(_smarts('c1nnco1'))
-    all_linker = list(phenyl_match) + list(oxadia_match)
+    phenyl, oxadiazole = _find_linker_ring_atoms(final_mol)
+    all_linker = phenyl + oxadiazole
 
     n_forced = 0
     for idx in all_linker:
@@ -1563,9 +1586,10 @@ def enforce_linker_flat(final_mol):
 
     if all_linker:
         print(f"  [linker] Z=0 enforced on {len(all_linker)} ring atoms "
-              f"({n_forced} had non-zero Z)")
+              f"(phenyl={len(phenyl)}, oxadiazole={len(oxadiazole)}, "
+              f"{n_forced} had non-zero Z)")
     else:
-        print("  [linker] no linker rings found by SMARTS — Z=0 enforcement skipped")
+        print("  [linker] WARNING: no phenyl/oxadiazole rings found — Z=0 enforcement skipped")
 
 
 def restore_ring_positions_from_snapshot(final_mol, snapshots, sugar_tolerance=0.5):

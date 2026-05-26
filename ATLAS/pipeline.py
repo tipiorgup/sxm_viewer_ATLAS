@@ -1080,28 +1080,54 @@ def export_structure(chain_dict, mol_name_to_conformer, bonds_glyco,
 # CONSTRAINT MANAGEMENT
 # ============================================================================
 
-def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices):
+def _find_linker_ring_atoms(mol):
+    """
+    Topology-based linker ring detection (phenyl + oxadiazole).
+    Works regardless of aromaticity state (no SMARTS).
+      - phenyl    : 6-membered ring, all Carbon
+      - oxadiazole: 5-membered ring, 2N + 1O + 2C
+    Returns (phenyl_indices, oxadiazole_indices) as lists.
+    """
+    from rdkit import Chem as _Chem
+    _Chem.GetSymmSSSR(mol)
+    ring_info = mol.GetRingInfo()
+    phenyl, oxadiazole = [], []
+    for ring in ring_info.AtomRings():
+        syms = [mol.GetAtomWithIdx(i).GetSymbol() for i in ring]
+        if len(ring) == 6 and all(s == 'C' for s in syms):
+            phenyl = list(ring)
+        elif (len(ring) == 5 and
+              syms.count('N') == 2 and syms.count('O') == 1 and syms.count('C') == 2):
+            oxadiazole = list(ring)
+    return phenyl, oxadiazole
+
+
+def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices,
+                       mol=None):
     """
     Gather fixed atoms based on structure type.
     Similar dispatch pattern to export_structure.
-    
+
     - Glycopeptide: fix trans bond dihedral atoms from enforced_atoms
-    - Glycolipid: fix lipid tail carbons
-    
+                    + linker ring atoms (phenyl + oxadiazole) if mol provided
+    - Glycolipid:   fix lipid tail carbons
+
     Args:
-        peptide_data: Peptide structure data (None if glycolipid)
-        enforced_atoms: List of trans bond constraint dicts from peptide linkages
+        peptide_data:       Peptide structure data (None if glycolipid)
+        enforced_atoms:     List of trans bond constraint dicts from peptide linkages
         lipid_tail_indices: List of lipid tail carbon indices
-    
+        mol:                Combined molecule (final_with_h) used to locate linker
+                            ring atoms by topology. Pass None to skip linker freeze.
+
     Returns:
         list: Deduplicated list of atom indices to fix during optimization
     """
     print("\n" + "="*70)
     print("GATHERING FIXED ATOMS FOR OPTIMIZATION")
     print("="*70)
-    
+
     fixed_atoms = []
-    
+
     if peptide_data is not None:
         # ====================================================================
         # GLYCOPEPTIDE PATH: Fix trans bond dihedrals
@@ -1109,17 +1135,28 @@ def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices):
         print("\n→ Structure type: GLYCOPEPTIDE")
         print("→ Constraint mode: Trans bond dihedral atoms")
         print("-" * 60)
-        
+
         for bond_info in enforced_atoms:
             dihedral_atoms = bond_info['dihedral_atoms']
             aa_type = bond_info.get('aa_type', 'Unknown')
             glyc_type = bond_info.get('glycosylation_type', 'Unknown')
-            
+
             fixed_atoms.extend(dihedral_atoms)
             print(f"  {aa_type} ({glyc_type}): atoms {dihedral_atoms}")
-        
+
         print(f"\n  ✓ Collected {len(fixed_atoms)} trans bond constraint atoms")
-    
+
+        # Freeze linker ring atoms so they stay flat (Z=0) during all MD phases
+        if mol is not None:
+            phenyl, oxadiazole = _find_linker_ring_atoms(mol)
+            linker = phenyl + oxadiazole
+            if linker:
+                fixed_atoms.extend(linker)
+                print(f"  Linker rings frozen: {len(linker)} atoms "
+                      f"(phenyl={len(phenyl)}, oxadiazole={len(oxadiazole)})")
+            else:
+                print("  ⚠ Linker rings not found in mol — skipping linker freeze")
+
     else:
         # ====================================================================
         # GLYCOLIPID PATH: Fix lipid tail carbons
@@ -1127,7 +1164,7 @@ def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices):
         print("\n→ Structure type: GLYCOLIPID")
         print("→ Constraint mode: Lipid tail carbons")
         print("-" * 60)
-        
+
         if lipid_tail_indices and len(lipid_tail_indices) > 0:
             fixed_atoms = lipid_tail_indices.copy()
             print(f"  Lipid tail carbons: {lipid_tail_indices}")
@@ -1135,14 +1172,14 @@ def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices):
         else:
             print("  ⚠ WARNING: No lipid tail indices found!")
             print("    Lipids may flip unrealistically during optimization")
-    
+
     # Deduplicate
     fixed_atoms = list(set(fixed_atoms))
-    
+
     print("\n" + "="*70)
     print(f"TOTAL FIXED ATOMS: {len(fixed_atoms)}")
     print("="*70)
-    
+
     return fixed_atoms
 
 # ============================================================================

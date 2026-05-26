@@ -335,7 +335,8 @@ def main():
 
                     with timer.section(f"{tag}   Gather fixed atoms", level=3):
                         fixed_atoms = lpf.gather_fixed_atoms(
-                            peptide_data, enforced_atoms, lipid_tail_indices
+                            peptide_data, enforced_atoms, lipid_tail_indices,
+                            mol=final_with_h
                         )
                         reference_normals = None
 
