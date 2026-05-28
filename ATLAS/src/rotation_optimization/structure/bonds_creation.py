@@ -3,9 +3,29 @@ from scipy.spatial.transform import Rotation as R
 from rdkit import Chem
 from openbabel import openbabel as ob
 from ..geometry.geometry_utils import (
-    get_perpendicular_vector,  
+    get_perpendicular_vector,
     VDW_RADII,
 )
+
+
+def _compute_ring_normal(mol_data, coords):
+    """Return unit normal to the pyranose ring plane, or None if ring data is missing."""
+    carbon_map = mol_data.get('carbon_map', {})
+    ring_carbons = carbon_map.get('all_ring_carbons', [])
+    ring_o_idx = carbon_map.get('ring_oxygen')
+
+    ring_indices = list(ring_carbons)
+    if ring_o_idx is not None:
+        ring_indices.append(ring_o_idx)
+
+    valid = [i for i in ring_indices if i < len(coords)]
+    if len(valid) < 3:
+        return None
+
+    ring_pos = np.array([coords[i] for i in valid])
+    centroid = ring_pos.mean(axis=0)
+    _, _, vh = np.linalg.svd(ring_pos - centroid)
+    return vh[-1]  # unit normal (SVD guarantees unit length)
 
 def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, anomeric='beta', linkage_name='1-6'):
 
@@ -48,13 +68,30 @@ def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, ano
     projection_dist = C_O_BOND_LENGTH * cos_angle_at_c1
     height = C_O_BOND_LENGTH * np.sqrt(1 - cos_angle_at_c1**2)
     
-    if abs(c1_to_c2_norm[2]) < 0.9:
-        perpendicular_base = np.cross(c1_to_c2_norm, np.array([0, 0, 1]))
-    else:
-        perpendicular_base = np.cross(c1_to_c2_norm, np.array([1, 0, 0]))
-    
-    perpendicular = perpendicular_base / np.linalg.norm(perpendicular_base)
-    
+    # Use the donor ring-plane normal so the oxygen is always placed above/below
+    # the ring, never inside it.  Fall back to an arbitrary perpendicular only
+    # when ring atom data are unavailable or collinear with the bond axis.
+    ring_normal = _compute_ring_normal(mol1_data, coords1)
+    perpendicular = None
+
+    if ring_normal is not None:
+        # Remove the component parallel to the C1→C2 axis
+        proj = np.dot(ring_normal, c1_to_c2_norm)
+        candidate = ring_normal - proj * c1_to_c2_norm
+        norm_mag = np.linalg.norm(candidate)
+        if norm_mag > 0.1:
+            perpendicular = candidate / norm_mag
+            print(f"  Using ring-normal perpendicular (ring out-of-plane guaranteed)")
+
+    if perpendicular is None:
+        # Fallback: arbitrary perpendicular (old behaviour)
+        if abs(c1_to_c2_norm[2]) < 0.9:
+            perpendicular_base = np.cross(c1_to_c2_norm, np.array([0, 0, 1]))
+        else:
+            perpendicular_base = np.cross(c1_to_c2_norm, np.array([1, 0, 0]))
+        perpendicular = perpendicular_base / np.linalg.norm(perpendicular_base)
+        print(f"  Using fallback perpendicular (ring normal unavailable or parallel to bond)")
+
     if anomeric == 'alpha':
         perpendicular = -perpendicular
     
