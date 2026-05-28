@@ -82,18 +82,30 @@ def identify_sugar_carbons(mol):
             c1_candidate = carbons_bonded_to_ring_o[0]
             c5_candidate = carbons_bonded_to_ring_o[1]
 
-            c1_atom = mol.GetAtomWithIdx(c1_candidate)
-            c5_atom = mol.GetAtomWithIdx(c5_candidate)
+            # Explicit override: atom map number :1 in the SMILES marks the anomeric carbon.
+            # Needed for sugars like KDO where the oxygen-count heuristic is ambiguous.
+            explicit_c1 = next(
+                (idx for idx in carbons_bonded_to_ring_o
+                 if mol.GetAtomWithIdx(idx).GetAtomMapNum() == 1),
+                None
+            )
 
-            c1_oxygens = sum(1 for n in c1_atom.GetNeighbors() if n.GetSymbol() == 'O')
-            c5_oxygens = sum(1 for n in c5_atom.GetNeighbors() if n.GetSymbol() == 'O')
-
-            if c1_oxygens >= c5_oxygens:
-                carbon_map['C1'] = c1_candidate
-                carbon_map['C5'] = c5_candidate
+            if explicit_c1 is not None:
+                carbon_map['C1'] = explicit_c1
+                carbon_map['C5'] = next(i for i in carbons_bonded_to_ring_o if i != explicit_c1)
             else:
-                carbon_map['C1'] = c5_candidate
-                carbon_map['C5'] = c1_candidate
+                c1_atom = mol.GetAtomWithIdx(c1_candidate)
+                c5_atom = mol.GetAtomWithIdx(c5_candidate)
+
+                c1_oxygens = sum(1 for n in c1_atom.GetNeighbors() if n.GetSymbol() == 'O')
+                c5_oxygens = sum(1 for n in c5_atom.GetNeighbors() if n.GetSymbol() == 'O')
+
+                if c1_oxygens >= c5_oxygens:
+                    carbon_map['C1'] = c1_candidate
+                    carbon_map['C5'] = c5_candidate
+                else:
+                    carbon_map['C1'] = c5_candidate
+                    carbon_map['C5'] = c1_candidate
 
             carbon_map['ring_oxygen'] = ring_oxygen_idx
 
