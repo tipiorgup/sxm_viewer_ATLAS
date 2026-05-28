@@ -313,25 +313,11 @@ def main():
                         final_with_h, pyranose_rings_no_h = lpf.prepare_structure_for_optimization(
                             final_no_h, name, conformers_selection
                         )
-                        # re-find constrained indices on final_with_h
+                        # use stored linker ring indices directly — no position matching needed
                         if not sugars and peptide_data is not None and \
-                           'constrained_positions' in peptide_data:
-                            conf_with_h = final_with_h.GetConformer()
-                            constrained_positions = np.array(peptide_data['constrained_positions'])
-                            lipid_tail_indices = []
-                            for target_pos in constrained_positions:
-                                best_idx, best_dist = None, float('inf')
-                                for atom in final_with_h.GetAtoms():
-                                    if atom.GetSymbol() == 'H':
-                                        continue
-                                    pos = conf_with_h.GetAtomPosition(atom.GetIdx())
-                                    pos_arr = np.array([pos.x, pos.y, pos.z])
-                                    dist = np.linalg.norm(pos_arr - target_pos)
-                                    if dist < best_dist:
-                                        best_dist = dist
-                                        best_idx = atom.GetIdx()
-                                lipid_tail_indices.append(best_idx)
-                            print(f"  XY constraining {len(lipid_tail_indices)} atoms (Ca + linker rings)")
+                           'linker_ring_indices' in peptide_data:
+                            lipid_tail_indices = peptide_data['linker_ring_indices']
+                            print(f"  Freezing {len(lipid_tail_indices)} linker ring atoms (phenyl + oxadiazole)")
 
                     with timer.section(f"{tag}   Gather fixed atoms", level=3):
                         fixed_atoms = lpf.gather_fixed_atoms(

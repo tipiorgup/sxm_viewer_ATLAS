@@ -5,7 +5,8 @@ from ..geometry.geometry_utils import (
     get_positions,
     set_positions,
     get_positions_for_atoms,
-    calculate_alignment_rotation
+    calculate_alignment_rotation,
+    get_ring_normal_from_positions,
 )
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -174,23 +175,14 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
         AllChem.EmbedMolecule(peptide, randomSeed=np.random.randint(0, 100000), useMacrocycleTorsions=True)
         AllChem.MMFFOptimizeMolecule(peptide, maxIters=2000)
         residue_info = find_all_ca_in_macrocycle(peptide, aa_sequence)
-        # store positions to constrain in XY during optimization
-        conf_temp = peptide.GetConformer()
-        constrained_positions = []
-        # Ca positions
-        for res in residue_info:
-            pos = conf_temp.GetAtomPosition(res['ca_idx'])
-            constrained_positions.append([pos.x, pos.y, pos.z])
-        # linker ring positions
+        # Identify linker ring indices before alignment — indices are invariant
         phenyl = peptide.GetSubstructMatch(MolFromSmarts('c1ccccc1'))
         oxadiazole = peptide.GetSubstructMatch(MolFromSmarts('c1nnco1'))
-        for idx in list(phenyl) + list(oxadiazole):
-            pos = conf_temp.GetAtomPosition(idx)
-            constrained_positions.append([pos.x, pos.y, pos.z])
+        linker_ring_indices = list(phenyl) + list(oxadiazole)
         position_cyclic_peptide(peptide, residue_info, residue_data)
         conf = peptide.GetConformer()
         atom_positions = [[*conf.GetAtomPosition(i)] for i in range(peptide.GetNumAtoms())]
-        
+
         return {
             'rdkit_mol': peptide,
             'sequence': aa_sequence,
@@ -199,7 +191,7 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
             'conformer': conf,
             'residue_info': residue_info,
             'experimental_data': residue_data,
-            'constrained_positions': constrained_positions 
+            'linker_ring_indices': linker_ring_indices,
         }
     
     aa_smiles = {
@@ -1163,6 +1155,24 @@ def embed_cyclic_molecule(mol, residue_info, residue_data):
     print(f"  Embedded: {mol.GetNumAtoms()} atoms")
     return mol
 
+
+def _flatten_ring_to_surface(ring_indices, all_positions, target_z):
+    """
+    Rigid-body rotate a ring so its plane is parallel to the surface (XY),
+    then translate it to target_z.  Preserves all internal bond lengths and
+    angles — treats the ring as a rigid body throughout.
+    """
+    ring_pos = all_positions[ring_indices]
+    centroid = ring_pos.mean(axis=0)
+
+    normal = get_ring_normal_from_positions(all_positions, ring_indices)
+    rot_matrix = calculate_alignment_rotation(normal, [0.0, 0.0, 1.0])
+
+    rotated = (rot_matrix @ (ring_pos - centroid).T).T + centroid
+    rotated[:, 2] += target_z - rotated[:, 2].mean()
+    return rotated
+
+
 def position_cyclic_peptide(peptide, residue_info, residue_data, linker_data=None):
     """
     Align cyclic peptide to experimental Ca positions using a global
@@ -1218,9 +1228,13 @@ def position_cyclic_peptide(peptide, residue_info, residue_data, linker_data=Non
 
     if linker_ring_atoms:
         ring_z = np.mean([all_rotated[i, 2] for i in linker_ring_atoms])
-        for i in linker_ring_atoms:
-            all_rotated[i, 2] = ring_z
-        print(f"  Linker rings flattened to Z={ring_z:.3f} A ({len(linker_ring_atoms)} atoms)")
+
+        for match, name in [(phenyl_match, 'phenyl'), (oxadiazole_match, 'oxadiazole')]:
+            if match:
+                flat = _flatten_ring_to_surface(list(match), all_rotated, ring_z)
+                for j, atom_idx in enumerate(match):
+                    all_rotated[atom_idx] = flat[j]
+                print(f"  {name} ring rigid-body flattened to Z={ring_z:.3f} A")
     set_positions(conf, all_rotated, n_atoms)
 
     final_ca = get_positions_for_atoms(conf, ca_indices)
