@@ -765,6 +765,48 @@ def extract_lipid_tail_indices(final_no_h, molecule_data_dict):
     
     return lipid_constraint_indices
 
+
+def extract_petn_nitrogen_indices(final_no_h, petn_linkages):
+    """
+    Find the terminal N atom of each PEtN chain by position matching.
+    Pinning N keeps the chain direction fixed so KDO optimizes around it.
+    Heavy-atom indices are stable through AddHs.
+    """
+    import numpy as np
+
+    if not petn_linkages:
+        return []
+
+    conf = final_no_h.GetConformer()
+    n_atoms = final_no_h.GetNumAtoms()
+    fixed = []
+
+    print("\n" + "="*70)
+    print("EXTRACTING PETN NITROGEN INDICES (N freeze)")
+    print("="*70)
+
+    for mol_name, petn_data in petn_linkages:
+        target = np.array(petn_data['n_position'])
+        best_idx, min_dist = None, float('inf')
+        for atom_idx in range(n_atoms):
+            if final_no_h.GetAtomWithIdx(atom_idx).GetSymbol() != 'N':
+                continue
+            pos = conf.GetAtomPosition(atom_idx)
+            d = np.linalg.norm(np.array([pos.x, pos.y, pos.z]) - target)
+            if d < min_dist:
+                min_dist = d
+                best_idx = atom_idx
+        if best_idx is not None and min_dist < 0.5:
+            fixed.append(best_idx)
+            print(f"  {mol_name} PEtN N: atom #{best_idx} (dist={min_dist:.3f} Å)")
+        else:
+            print(f"  ⚠ {mol_name} PEtN N: NOT FOUND (min={min_dist:.4f} Å)")
+
+    print(f"\n  Total PEtN N atoms frozen: {len(fixed)}")
+    print("="*70)
+    return fixed
+
+
 def extract_lipid_tail_indices_3_points(final_no_h, molecule_data_dict):
     """
     Extract lipid chain carbon indices BEFORE optimization.

@@ -297,6 +297,10 @@ def main():
                     with timer.section(f"{tag}   Lipid tail index extraction", level=3):
                         lipid_tail_indices = lpf.extract_lipid_tail_indices(
                             final_no_h, molecule_data_dict)
+                        petn_n_indices = lpf.extract_petn_nitrogen_indices(
+                            final_no_h, petn_linkages)
+                        if petn_n_indices:
+                            lipid_tail_indices = list(set(lipid_tail_indices + petn_n_indices))
 
 
                 # ============================================================
