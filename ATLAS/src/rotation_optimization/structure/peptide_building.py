@@ -1229,12 +1229,11 @@ def position_cyclic_peptide(peptide, residue_info, residue_data, linker_data=Non
     if linker_ring_atoms:
         ring_z = np.mean([all_rotated[i, 2] for i in linker_ring_atoms])
 
-        for match, name in [(phenyl_match, 'phenyl'), (oxadiazole_match, 'oxadiazole')]:
-            if match:
-                flat = _flatten_ring_to_surface(list(match), all_rotated, ring_z)
-                for j, atom_idx in enumerate(match):
-                    all_rotated[atom_idx] = flat[j]
-                print(f"  {name} ring rigid-body flattened to Z={ring_z:.3f} A")
+        # Treat phenyl + oxadiazole as one rigid body so both share the same plane
+        flat = _flatten_ring_to_surface(linker_ring_atoms, all_rotated, ring_z)
+        for j, atom_idx in enumerate(linker_ring_atoms):
+            all_rotated[atom_idx] = flat[j]
+        print(f"  Linker (phenyl + oxadiazole) flattened as single rigid body to Z={ring_z:.3f} A")
     set_positions(conf, all_rotated, n_atoms)
 
     final_ca = get_positions_for_atoms(conf, ca_indices)
