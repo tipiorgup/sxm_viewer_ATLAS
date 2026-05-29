@@ -1659,7 +1659,11 @@ def restore_glycopeptide_positions(final_mol, molecule_data_dict, peptide_data, 
     print("\n" + "="*70)
     print("RESTORING GLYCOPEPTIDE TO EXPERIMENTAL POSITIONS")
     print("="*70)
-    
+
+    # Must be called before any is_sugar_ring_carbon() / find_residue_atoms() checks
+    # so that GetRingInfo() returns correct data and the BFS stops at sugar boundaries.
+    Chem.GetSymmSSSR(final_mol)
+
     conf = final_mol.GetConformer()
     
     # ========================================================================
@@ -1769,8 +1773,8 @@ def restore_glycopeptide_positions(final_mol, molecule_data_dict, peptide_data, 
 def _find_side_chain_atoms(mol, ca_idx):
     """
     BFS from ca_idx into the side chain only.
-    Stops at backbone N and backbone C=O so only true side-chain atoms are returned.
-    Hydrogen atoms are excluded.
+    Stops at backbone N, backbone C=O, sugar ring carbons, and H atoms.
+    Requires ring info to be populated (call Chem.GetSymmSSSR before using).
     """
     ca_atom = mol.GetAtomWithIdx(ca_idx)
     backbone_n, backbone_c = None, None
@@ -1803,6 +1807,8 @@ def _find_side_chain_atoms(mol, ca_idx):
         for n in mol.GetAtomWithIdx(cur).GetNeighbors():
             nidx = n.GetIdx()
             if nidx not in visited and mol.GetAtomWithIdx(nidx).GetSymbol() != 'H':
+                if is_sugar_ring_carbon(mol, nidx):
+                    continue
                 visited.add(nidx)
                 queue.append(nidx)
                 side_atoms.append(nidx)
