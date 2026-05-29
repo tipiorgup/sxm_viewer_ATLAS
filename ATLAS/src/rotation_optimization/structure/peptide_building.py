@@ -496,125 +496,124 @@ def calculate_ring_centroid(mol, conf):
     centroid = np.mean(positions, axis=0)
     return centroid
 
-def position_peptide_at_experimental_positions(peptide, residue_info, residue_data):
-    """Position peptide using Cα AND functional group positions with rotation."""
-    
-    conf = peptide.GetConformer()
-    
-    print(f"\nPositioning {len(residue_info)} residues:")
-    
-    for res_idx, (res_info, res_data) in enumerate(zip(residue_info, residue_data)):
-        
-        target_ca = np.array(res_data['ca_position'])
-        ca_idx = res_info['ca_idx']
-        
-        # Step 1: Translate entire peptide to position this Cα
-        current_ca = conf.GetAtomPosition(ca_idx)
-        current_ca = np.array([current_ca.x, current_ca.y, current_ca.z])
-        
-        translation = target_ca - current_ca
-        translation[2] = 0
-        
-        for atom_idx in range(peptide.GetNumAtoms()):
-            pos = conf.GetAtomPosition(atom_idx)
-            new_pos = np.array([pos.x, pos.y, pos.z]) + translation
-            conf.SetAtomPosition(atom_idx, new_pos.tolist())
-        
-        print(f"  Residue {res_idx} ({res_info['aa']}): Cα at [{target_ca[0]:.2f}, {target_ca[1]:.2f}, {target_ca[2]:.2f}]")
-        
-        # Step 2: Rotate residue to align functional group (if available)
-        if res_data.get('functional_position') is not None and res_info['functional_idx'] not in [None, 'centroid']:
-            
-            target_func = np.array(res_data['functional_position'])
-            functional_idx = res_info['functional_idx']
-            
-            # Get current functional group position (after translation)
-            current_func_pos = conf.GetAtomPosition(functional_idx)
-            current_func = np.array([current_func_pos.x, current_func_pos.y, current_func_pos.z])
-            
-            # Vectors from Cα to functional group
-            current_vec = current_func - target_ca
-            target_vec = target_func - target_ca
-            
-            current_vec[2] = 0
-            target_vec[2] = 0
-            
-            # Skip if too close
-            if np.linalg.norm(current_vec) < 0.1 or np.linalg.norm(target_vec) < 0.1:
-                print(f"    ⚠ Functional group too close to Cα, skipping rotation")
-                continue
-            
-            # Calculate rotation matrix using existing function
-            rotation_matrix = calculate_alignment_rotation(current_vec, target_vec)
-            
-            # Apply rotation to ALL atoms in peptide around Cα
-            for atom_idx in range(peptide.GetNumAtoms()):
-                pos = conf.GetAtomPosition(atom_idx)
-                pos_arr = np.array([pos.x, pos.y, pos.z])
-                
-                # Rotate around Cα
-                relative_pos = pos_arr - target_ca
-                rotated_relative = rotation_matrix @ relative_pos
-                rotated_pos = rotated_relative + target_ca
-                
-                rotated_pos[2] = 0
-                conf.SetAtomPosition(atom_idx, rotated_pos.tolist())
-            
-            # Verify alignment
-            final_func_pos = conf.GetAtomPosition(functional_idx)
-            final_func = np.array([final_func_pos.x, final_func_pos.y, final_func_pos.z])
-            error = np.linalg.norm(final_func - target_func)
-            
-            print(f"    Functional group aligned: {error:.3f} Å")
-        
-        elif res_info['functional_idx'] == 'centroid':
-            # Handle ring centroid alignment
-            target_func = np.array(res_data['functional_position'])
-            current_centroid = calculate_ring_centroid(peptide, conf)
-            
-            if current_centroid is not None:
-                current_vec = current_centroid - target_ca
-                target_vec = target_func - target_ca
-                
-                if np.linalg.norm(current_vec) > 0.1 and np.linalg.norm(target_vec) > 0.1:
-                    rotation_matrix = calculate_alignment_rotation(current_vec, target_vec)
-                    
-                    for atom_idx in range(peptide.GetNumAtoms()):
-                        pos = conf.GetAtomPosition(atom_idx)
-                        pos_arr = np.array([pos.x, pos.y, pos.z])
-                        
-                        relative_pos = pos_arr - target_ca
-                        rotated_relative = rotation_matrix @ relative_pos
-                        rotated_pos = rotated_relative + target_ca
-                        
-                        conf.SetAtomPosition(atom_idx, rotated_pos.tolist())
-                    
-                    final_centroid = calculate_ring_centroid(peptide, conf)
-                    error = np.linalg.norm(final_centroid - target_func)
-                    print(f"    Ring centroid aligned: {error:.3f} Å")
+def _get_side_chain_atoms_linear(mol, ca_idx):
+    """
+    BFS from ca_idx into the side chain only.
+    Stops at backbone N and backbone C=O so only true side-chain atoms are returned.
+    """
+    ca_atom = mol.GetAtomWithIdx(ca_idx)
+    backbone_n, backbone_c = None, None
+    for nb in ca_atom.GetNeighbors():
+        if nb.GetSymbol() == 'N':
+            backbone_n = nb.GetIdx()
+        elif nb.GetSymbol() == 'C':
+            for nn in nb.GetNeighbors():
+                if nn.GetSymbol() == 'O':
+                    bond = mol.GetBondBetweenAtoms(nb.GetIdx(), nn.GetIdx())
+                    if bond and bond.GetBondTypeAsDouble() == 2.0:
+                        backbone_c = nb.GetIdx()
+                        break
 
-    print(f"\n  Final flattening to Z=0 plane...")
-    
-    z_min_before = float('inf')
-    z_max_before = float('-inf')
-    
-    for atom_idx in range(peptide.GetNumAtoms()):
+    blocked = {ca_idx}
+    if backbone_n is not None:
+        blocked.add(backbone_n)
+    if backbone_c is not None:
+        blocked.add(backbone_c)
+
+    roots = [n.GetIdx() for n in ca_atom.GetNeighbors()
+             if n.GetIdx() not in blocked and n.GetSymbol() != 'H']
+    if not roots:
+        return []
+
+    visited = {ca_idx} | set(roots)
+    queue = list(roots)
+    side_atoms = list(roots)
+    while queue:
+        cur = queue.pop(0)
+        for n in mol.GetAtomWithIdx(cur).GetNeighbors():
+            nidx = n.GetIdx()
+            if nidx not in visited:
+                visited.add(nidx)
+                queue.append(nidx)
+                side_atoms.append(nidx)
+    return side_atoms
+
+
+def _rotate_side_chain_toward(conf, side_atoms, ca_xy, target_xy):
+    """
+    Rotate side_atoms in XY around ca_xy so their centroid points toward target_xy.
+    Returns the rotation angle applied (degrees), or 0 if skipped.
+    """
+    if not side_atoms:
+        return 0.0
+    positions = np.array([[conf.GetAtomPosition(i).x,
+                           conf.GetAtomPosition(i).y] for i in side_atoms])
+    centroid_xy = positions.mean(axis=0)
+    current_vec = centroid_xy - ca_xy
+    target_vec  = target_xy  - ca_xy
+    if np.linalg.norm(current_vec) < 0.1 or np.linalg.norm(target_vec) < 0.1:
+        return 0.0
+    cv = current_vec / np.linalg.norm(current_vec)
+    tv = target_vec  / np.linalg.norm(target_vec)
+    angle = np.arctan2(np.cross(cv, tv), np.dot(cv, tv))
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    rot2d = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+    for atom_idx in side_atoms:
         pos = conf.GetAtomPosition(atom_idx)
-        z_min_before = min(z_min_before, pos.z)
-        z_max_before = max(z_max_before, pos.z)
-    
-    z_range_before = z_max_before - z_min_before
-    
-    if z_range_before > 0.01:  # If not already flat
-        print(f"    Z range before: [{z_min_before:.3f}, {z_max_before:.3f}] Å (spread: {z_range_before:.3f} Å)")
-        
-        for atom_idx in range(peptide.GetNumAtoms()):
-            pos = conf.GetAtomPosition(atom_idx)
-            conf.SetAtomPosition(atom_idx, [pos.x, pos.y, 0.0])
-        
-        print(f"    ✓ All {peptide.GetNumAtoms()} atoms moved to Z=0")
-    else:
-        print(f"    ✓ Peptide already flat (Z spread: {z_range_before:.4f} Å)")
+        rel = np.array([pos.x, pos.y]) - ca_xy
+        new_xy = rot2d @ rel + ca_xy
+        conf.SetAtomPosition(atom_idx, (new_xy[0], new_xy[1], 0.0))
+    return float(np.degrees(angle))
+
+
+def position_peptide_at_experimental_positions(peptide, residue_info, residue_data):
+    """
+    Position peptide backbone via global Kabsch alignment on Cα positions,
+    then orient each side chain toward its experimental functional_position.
+    """
+    conf = peptide.GetConformer()
+    n_atoms = peptide.GetNumAtoms()
+
+    ca_indices = [ri['ca_idx'] for ri in residue_info]
+    current_ca = np.array([[*conf.GetAtomPosition(i)] for i in ca_indices], dtype=float)
+    target_ca  = np.array([rd['ca_position'] for rd in residue_data], dtype=float)
+
+    # ── Global Kabsch in XY ──────────────────────────────────────────────────
+    cur_xy = current_ca.copy(); cur_xy[:, 2] = 0.0
+    tgt_xy = target_ca.copy();  tgt_xy[:, 2] = 0.0
+
+    cur_center = cur_xy.mean(axis=0)
+    tgt_center = tgt_xy.mean(axis=0)
+    H = (cur_xy - cur_center).T @ (tgt_xy - tgt_center)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    rot = Vt.T @ np.diag([1, 1, d]) @ U.T
+
+    all_pos = np.array([[*conf.GetAtomPosition(i)] for i in range(n_atoms)], dtype=float)
+    all_rot = (rot @ (all_pos - cur_center).T).T + tgt_center
+    all_rot[:, 2] = 0.0   # flatten to surface
+
+    for i in range(n_atoms):
+        conf.SetAtomPosition(i, all_rot[i].tolist())
+
+    print(f"\nGlobal Kabsch alignment applied ({len(ca_indices)} Cα).")
+
+    # ── Per-residue side-chain orientation ───────────────────────────────────
+    print(f"Orienting side chains:")
+    for res_idx, (res_info, res_data) in enumerate(zip(residue_info, residue_data)):
+        func_pos = res_data.get('functional_position')
+        if func_pos is None:
+            print(f"  Residue {res_idx} ({res_info['aa']}): no functional_position, skipped")
+            continue
+
+        ca_idx = res_info['ca_idx']
+        pos = conf.GetAtomPosition(ca_idx)
+        ca_xy = np.array([pos.x, pos.y])
+        target_xy = np.array(func_pos[:2])
+
+        side_atoms = _get_side_chain_atoms_linear(peptide, ca_idx)
+        deg = _rotate_side_chain_toward(conf, side_atoms, ca_xy, target_xy)
+        print(f"  Residue {res_idx} ({res_info['aa']}): side chain rotated {deg:.1f}°")
 
 def find_glycosylation_site(peptide_data, residue_index=0, aa_type=None):
     romol = peptide_data['rdkit_mol']
@@ -1156,6 +1155,72 @@ def embed_cyclic_molecule(mol, residue_info, residue_data):
     return mol
 
 
+def _get_side_chain_atoms_cyclic(mol, ca_idx, backbone_ring_set):
+    """BFS from ca_idx into the side chain; does not cross the macrocycle backbone."""
+    roots = [n.GetIdx() for n in mol.GetAtomWithIdx(ca_idx).GetNeighbors()
+             if n.GetIdx() not in backbone_ring_set]
+    if not roots:
+        return []
+    visited = {ca_idx} | set(roots)
+    queue, side_atoms = list(roots), list(roots)
+    while queue:
+        cur = queue.pop(0)
+        for n in mol.GetAtomWithIdx(cur).GetNeighbors():
+            nidx = n.GetIdx()
+            if nidx not in visited and nidx not in backbone_ring_set:
+                visited.add(nidx)
+                queue.append(nidx)
+                side_atoms.append(nidx)
+    return side_atoms
+
+
+def _orient_side_chains_cyclic(mol, all_positions, residue_info, residue_data):
+    """
+    Rotate each residue's side chain in XY (around its Cα) so the side-chain
+    centroid points toward the experimental functional_position.
+    Operates on all_positions numpy array in-place.
+    """
+    from rdkit import Chem as _Chem
+    _Chem.GetSymmSSSR(mol)
+    all_rings = list(mol.GetRingInfo().AtomRings())
+    if not all_rings:
+        return
+    backbone_ring = set(max(all_rings, key=len))
+
+    print("  Orienting side chains (cyclic):")
+    for res_info, res_data in zip(residue_info, residue_data):
+        func_pos = res_data.get('functional_position')
+        if func_pos is None:
+            continue
+
+        ca_idx = res_info['ca_idx']
+        ca_xy = all_positions[ca_idx, :2]
+        target_xy = np.array(func_pos[:2])
+
+        side_atoms = _get_side_chain_atoms_cyclic(mol, ca_idx, backbone_ring)
+        if not side_atoms:
+            print(f"    {res_info['aa']}: no side-chain atoms, skipped")
+            continue
+
+        centroid_xy = all_positions[side_atoms, :2].mean(axis=0)
+        cv = centroid_xy - ca_xy
+        tv = target_xy  - ca_xy
+        if np.linalg.norm(cv) < 0.1 or np.linalg.norm(tv) < 0.1:
+            print(f"    {res_info['aa']}: vector too small, skipped")
+            continue
+
+        cv /= np.linalg.norm(cv); tv /= np.linalg.norm(tv)
+        angle = np.arctan2(np.cross(cv, tv), np.dot(cv, tv))
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        rot2d = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+
+        for atom_idx in side_atoms:
+            rel = all_positions[atom_idx, :2] - ca_xy
+            all_positions[atom_idx, :2] = rot2d @ rel + ca_xy
+
+        print(f"    {res_info['aa']}: side chain rotated {np.degrees(angle):.1f}°")
+
+
 def _flatten_ring_to_surface(ring_indices, all_positions, target_z):
     """
     Rigid-body rotate a ring so its plane is parallel to the surface (XY),
@@ -1234,6 +1299,10 @@ def position_cyclic_peptide(peptide, residue_info, residue_data, linker_data=Non
         for j, atom_idx in enumerate(linker_ring_atoms):
             all_rotated[atom_idx] = flat[j]
         print(f"  Linker (phenyl + oxadiazole) flattened as single rigid body to Z={ring_z:.3f} A")
+
+    # Orient each side chain toward its experimental functional_position
+    _orient_side_chains_cyclic(peptide, all_rotated, residue_info, residue_data)
+
     set_positions(conf, all_rotated, n_atoms)
 
     final_ca = get_positions_for_atoms(conf, ca_indices)

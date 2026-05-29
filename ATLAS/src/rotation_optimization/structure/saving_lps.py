@@ -1728,44 +1728,32 @@ def restore_glycopeptide_positions(final_mol, molecule_data_dict, peptide_data, 
         
         print(f"    Translation: {np.linalg.norm(translation):.3f} Å")
         
-        # STEP 2: Rotate around Cα if functional group position is provided
+        # STEP 2: Rotate side chain toward functional_position using centroid
+        # (func_idx from residue_info is stale after mol combination — use centroid instead)
         target_func = exp_residues[exp_idx].get('functional_position')
-        
-        if target_func is not None and residue_info[exp_idx]['functional_idx'] is not None:
-            func_idx = residue_info[exp_idx]['functional_idx']
-            
-            if func_idx != 'centroid':  # Actual atom index
-                # Get current functional position (after translation)
-                current_func_pos = conf.GetAtomPosition(func_idx)
-                current_func = np.array([current_func_pos.x, current_func_pos.y, current_func_pos.z])
-                target_func = np.array(target_func)
-                
-                # Vectors from Cα
-                current_vec = current_func - target_ca
-                target_vec = target_func - target_ca
-                
-                # Only rotate if vectors are long enough
-                if np.linalg.norm(current_vec) > 0.1 and np.linalg.norm(target_vec) > 0.1:
-                    current_vec[2] = 0  # Keep in XY plane
-                    target_vec[2] = 0
-                    
-                    # Calculate 2D rotation matrix
-                    rotation_matrix = calculate_alignment_rotation(current_vec, target_vec)
-                    
-                    # Apply rotation to all residue atoms around Cα
-                    for atom_idx in residue_atoms:
+
+        if target_func is not None:
+            ca_xy = target_ca[:2]
+            target_xy = np.array(target_func[:2])
+
+            side_atoms = _find_side_chain_atoms(final_mol, ca_idx)
+            if side_atoms:
+                sc_positions = np.array([[conf.GetAtomPosition(i).x,
+                                          conf.GetAtomPosition(i).y] for i in side_atoms])
+                centroid_xy = sc_positions.mean(axis=0)
+                cv = centroid_xy - ca_xy
+                tv = target_xy  - ca_xy
+                if np.linalg.norm(cv) > 0.1 and np.linalg.norm(tv) > 0.1:
+                    cv /= np.linalg.norm(cv); tv /= np.linalg.norm(tv)
+                    angle = np.arctan2(np.cross(cv, tv), np.dot(cv, tv))
+                    cos_a, sin_a = np.cos(angle), np.sin(angle)
+                    rot2d = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+                    for atom_idx in side_atoms:
                         pos = conf.GetAtomPosition(atom_idx)
-                        pos_arr = np.array([pos.x, pos.y, pos.z])
-                        
-                        # Rotate around target_ca
-                        relative_pos = pos_arr - target_ca
-                        rotated_relative = rotation_matrix @ relative_pos
-                        rotated_pos = rotated_relative + target_ca
-                        rotated_pos[2] = 0.0
-                        
-                        conf.SetAtomPosition(atom_idx, tuple(rotated_pos))
-                    
-                    print(f"    Rotated to align functional group")
+                        rel = np.array([pos.x, pos.y]) - ca_xy
+                        new_xy = rot2d @ rel + ca_xy
+                        conf.SetAtomPosition(atom_idx, (new_xy[0], new_xy[1], 0.0))
+                    print(f"    Side chain rotated {np.degrees(angle):.1f}° → functional_position")
         
         # Flatten to Z=0
         for atom_idx in residue_atoms:
@@ -1777,6 +1765,49 @@ def restore_glycopeptide_positions(final_mol, molecule_data_dict, peptide_data, 
     print("\n" + "="*70)
     print("✓ Glycopeptide restoration complete")
     print("="*70)
+
+def _find_side_chain_atoms(mol, ca_idx):
+    """
+    BFS from ca_idx into the side chain only.
+    Stops at backbone N and backbone C=O so only true side-chain atoms are returned.
+    Hydrogen atoms are excluded.
+    """
+    ca_atom = mol.GetAtomWithIdx(ca_idx)
+    backbone_n, backbone_c = None, None
+    for nb in ca_atom.GetNeighbors():
+        if nb.GetSymbol() == 'N':
+            backbone_n = nb.GetIdx()
+        elif nb.GetSymbol() == 'C':
+            for nn in nb.GetNeighbors():
+                if nn.GetSymbol() == 'O':
+                    bond = mol.GetBondBetweenAtoms(nb.GetIdx(), nn.GetIdx())
+                    if bond and bond.GetBondTypeAsDouble() == 2.0:
+                        backbone_c = nb.GetIdx()
+                        break
+
+    blocked = {ca_idx}
+    if backbone_n is not None:
+        blocked.add(backbone_n)
+    if backbone_c is not None:
+        blocked.add(backbone_c)
+
+    roots = [n.GetIdx() for n in ca_atom.GetNeighbors()
+             if n.GetIdx() not in blocked and n.GetSymbol() != 'H']
+    if not roots:
+        return []
+
+    visited = {ca_idx} | set(roots)
+    queue, side_atoms = list(roots), list(roots)
+    while queue:
+        cur = queue.pop(0)
+        for n in mol.GetAtomWithIdx(cur).GetNeighbors():
+            nidx = n.GetIdx()
+            if nidx not in visited and mol.GetAtomWithIdx(nidx).GetSymbol() != 'H':
+                visited.add(nidx)
+                queue.append(nidx)
+                side_atoms.append(nidx)
+    return side_atoms
+
 
 def find_residue_atoms(mol, ca_idx):
     """
