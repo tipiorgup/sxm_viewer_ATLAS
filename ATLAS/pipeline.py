@@ -1201,19 +1201,12 @@ def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices,
 
     else:
         # ====================================================================
-        # GLYCOLIPID PATH: Fix lipid tail carbons
+        # GLYCOLIPID PATH: No atoms frozen — lipid tails free to optimize
         # ====================================================================
         print("\n→ Structure type: GLYCOLIPID")
-        print("→ Constraint mode: Lipid tail carbons")
+        print("→ Constraint mode: None (lipid tails free)")
         print("-" * 60)
-
-        if lipid_tail_indices and len(lipid_tail_indices) > 0:
-            fixed_atoms = lipid_tail_indices.copy()
-            print(f"  Lipid tail carbons: {lipid_tail_indices}")
-            print(f"\n  ✓ Collected {len(fixed_atoms)} lipid tail constraint atoms")
-        else:
-            print("  ⚠ WARNING: No lipid tail indices found!")
-            print("    Lipids may flip unrealistically during optimization")
+        print("  Lipid tails are free to move during optimization")
 
     # Deduplicate
     fixed_atoms = list(set(fixed_atoms))
