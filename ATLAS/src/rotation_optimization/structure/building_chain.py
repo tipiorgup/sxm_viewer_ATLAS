@@ -298,78 +298,76 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
         if target_orientation:
             print(f"  Surface orientation: {target_orientation}")
         
-        # Choose optimization method
-        if target_orientation and len(available_linkages) > 1:
-            # Multi-bond with orientation constraint
-            print(f"  Using 1D Z-axis rotation (optimizing {len(available_linkages)} bonds)")
-            
-            # Use first linkage as primary, rest as additional
-            primary = available_linkages[0]
-            additional = available_linkages[1:]
-            
-            additional_bonds = []
-            for add_link in additional:
-                additional_bonds.append({
-                    'donor_carbon': add_link['donor_carbon'],
-                    'target': add_link['target'],
-                    'target_carbon': add_link['target_carbon']
-                })
-            
-            best_mol, distance, params = find_rotation_1D_Z_AXIS(
-                template, primary['donor_carbon'], 
-                primary['target'], primary['target_carbon'],
-                chain_list, fixed_com,
-                target_orientation=target_orientation,
-                n_samples=iterations,
-                additional_bonds=additional_bonds
-            )
-            
-        elif target_orientation:
-            # Single bond with orientation constraint
-            print(f"  Using 1D Z-axis rotation (360° search)")
-            link_info = available_linkages[0]
-            best_mol, distance, params = find_rotation_1D_Z_AXIS(
-                template, link_info['donor_carbon'], 
-                link_info['target'], link_info['target_carbon'],
-                chain_list, fixed_com,
-                target_orientation=target_orientation,
-                n_samples=iterations,
-                existing_linkages=sorted_linkages , future_bonds_to_this_mol=future_bonds_to_this_mol  
-            )
-        else:
-            # No orientation constraint - use FULL 3D quaternion rotation
-            print(f"  Using FULL 3D quaternion rotation")
-            
-            if len(available_linkages) > 1:
-                # Multi-bond 3D optimization
+        # Choose optimization method — always fall back to experimental position if
+        # the rotation optimizer raises so the molecule is never absent from chain_dict.
+        best_mol = None
+        try:
+            if target_orientation and len(available_linkages) > 1:
+                # Multi-bond with orientation constraint
+                print(f"  Using 1D Z-axis rotation (optimizing {len(available_linkages)} bonds)")
                 primary = available_linkages[0]
                 additional = available_linkages[1:]
-                
-                additional_bonds = []
-                for add_link in additional:
-                    additional_bonds.append({
-                        'donor_carbon': add_link['donor_carbon'],
-                        'target': add_link['target'],
-                        'target_carbon': add_link['target_carbon']
-                    })
-                
-                best_mol, distance, params = find_rotation_FULL_3D_QUATERNION(
-                    template, primary['donor_carbon'], 
+                additional_bonds = [{'donor_carbon': a['donor_carbon'],
+                                     'target': a['target'],
+                                     'target_carbon': a['target_carbon']}
+                                    for a in additional]
+                best_mol, distance, params = find_rotation_1D_Z_AXIS(
+                    template, primary['donor_carbon'],
                     primary['target'], primary['target_carbon'],
                     chain_list, fixed_com,
+                    target_orientation=target_orientation,
                     n_samples=iterations,
                     additional_bonds=additional_bonds
                 )
-            else:
-                # Single bond 3D optimization
+
+            elif target_orientation:
+                # Single bond with orientation constraint
+                print(f"  Using 1D Z-axis rotation (360° search)")
                 link_info = available_linkages[0]
-                best_mol, distance, params = find_rotation_FULL_3D_QUATERNION(
-                    template, link_info['donor_carbon'], 
+                best_mol, distance, params = find_rotation_1D_Z_AXIS(
+                    template, link_info['donor_carbon'],
                     link_info['target'], link_info['target_carbon'],
                     chain_list, fixed_com,
-                    n_samples=iterations
+                    target_orientation=target_orientation,
+                    n_samples=iterations,
+                    existing_linkages=sorted_linkages, future_bonds_to_this_mol=future_bonds_to_this_mol
                 )
-        
+
+            else:
+                # No orientation constraint - use FULL 3D quaternion rotation
+                print(f"  Using FULL 3D quaternion rotation")
+                if len(available_linkages) > 1:
+                    primary = available_linkages[0]
+                    additional = available_linkages[1:]
+                    additional_bonds = [{'donor_carbon': a['donor_carbon'],
+                                         'target': a['target'],
+                                         'target_carbon': a['target_carbon']}
+                                        for a in additional]
+                    best_mol, distance, params = find_rotation_FULL_3D_QUATERNION(
+                        template, primary['donor_carbon'],
+                        primary['target'], primary['target_carbon'],
+                        chain_list, fixed_com,
+                        n_samples=iterations,
+                        additional_bonds=additional_bonds
+                    )
+                else:
+                    link_info = available_linkages[0]
+                    best_mol, distance, params = find_rotation_FULL_3D_QUATERNION(
+                        template, link_info['donor_carbon'],
+                        link_info['target'], link_info['target_carbon'],
+                        chain_list, fixed_com,
+                        n_samples=iterations
+                    )
+
+        except Exception as e:
+            print(f"  WARNING: Rotation optimization failed for {donor_mol}: {e}")
+            print(f"           Falling back to experimental position so bond can still be formed")
+            best_mol = None
+
+        if best_mol is None:
+            print(f"  WARNING: Using experimental position for {donor_mol} (rotation could not be computed)")
+            best_mol = molecule_data_dict[donor_mol].copy()
+
         chain_dict[donor_mol] = best_mol
         chain_list.append(best_mol)
         processed_molecules.add(donor_mol)
@@ -672,55 +670,57 @@ def align_and_position_molecules_TOP_N_POLYMERS(
             })
         
         # OPTIMIZE WITH TOP N
-        if target_orientation:
-            print(f"  → Using 1D Z-axis optimizer (orientation constrained)")
-            print(f"  [INFO] 1D Z-axis TOP N not yet implemented, using single solution")
-            
-            # Fallback to single solution
-            primary = available_linkages[0]
-            additional = [{'donor_carbon': a['donor_carbon'], 
-                          'target': a['target'], 
-                          'target_carbon': a['target_carbon']} 
-                         for a in available_linkages[1:]]
-            
-            best_mol, distance, params = find_rotation_1D_Z_AXIS(
-                template, primary['donor_carbon'],
-                primary['target'], primary['target_carbon'],
-                current_best_chain, fixed_com,
-                target_orientation=target_orientation,
-                n_samples=iterations,
-                additional_bonds=additional if additional else None,
-                existing_linkages=sorted_linkages,
-                future_bonds_to_this_mol=future_bonds_to_this_mol
-            )
-            
-            # Wrap as single solution
-            mol_solutions = [best_mol]
-            
-        else:
-            print(f"  → Using 3D QUEST variants TOP N optimizer")
-            
-            # Call TOP N optimizer
-            top_solutions, metadata = find_rotation_QUEST_VARIANTS_TOP_N(
-                template=template,
-                bonds_to_optimize=bonds_to_optimize,
-                existing_chain=current_best_chain,
-                existing_linkages=sorted_linkages,
-                fixed_com=fixed_com,
-                n_top=n_polymers,  # Get up to n_polymers solutions
-                n_quest_variants=n_quest_variants,
-                max_uniform_samples=iterations,
-                clash_factor=0.6
-            )
-            
-            if not top_solutions:
-                print(f"  ✗ WARNING: No valid rotations found for {donor_mol}")
-                # Use template as fallback
-                mol_solutions = [template]
+        mol_solutions = None
+        try:
+            if target_orientation:
+                print(f"  → Using 1D Z-axis optimizer (orientation constrained)")
+                print(f"  [INFO] 1D Z-axis TOP N not yet implemented, using single solution")
+                primary = available_linkages[0]
+                additional = [{'donor_carbon': a['donor_carbon'],
+                               'target': a['target'],
+                               'target_carbon': a['target_carbon']}
+                              for a in available_linkages[1:]]
+                best_mol, distance, params = find_rotation_1D_Z_AXIS(
+                    template, primary['donor_carbon'],
+                    primary['target'], primary['target_carbon'],
+                    current_best_chain, fixed_com,
+                    target_orientation=target_orientation,
+                    n_samples=iterations,
+                    additional_bonds=additional if additional else None,
+                    existing_linkages=sorted_linkages,
+                    future_bonds_to_this_mol=future_bonds_to_this_mol
+                )
+                mol_solutions = [best_mol]
+
             else:
-                mol_solutions = [sol['mol'] for sol in top_solutions]
-                print(f"  ✓ Found {len(mol_solutions)} valid solutions for {donor_mol}")
-        
+                print(f"  → Using 3D QUEST variants TOP N optimizer")
+                top_solutions, metadata = find_rotation_QUEST_VARIANTS_TOP_N(
+                    template=template,
+                    bonds_to_optimize=bonds_to_optimize,
+                    existing_chain=current_best_chain,
+                    existing_linkages=sorted_linkages,
+                    fixed_com=fixed_com,
+                    n_top=n_polymers,
+                    n_quest_variants=n_quest_variants,
+                    max_uniform_samples=iterations,
+                    clash_factor=0.6
+                )
+                if not top_solutions:
+                    print(f"  ✗ WARNING: No valid rotations found for {donor_mol}")
+                    mol_solutions = [molecule_data_dict[donor_mol].copy()]
+                else:
+                    mol_solutions = [sol['mol'] for sol in top_solutions]
+                    print(f"  ✓ Found {len(mol_solutions)} valid solutions for {donor_mol}")
+
+        except Exception as e:
+            print(f"  WARNING: Rotation optimization failed for {donor_mol}: {e}")
+            print(f"           Falling back to experimental position so bond can still be formed")
+            mol_solutions = None
+
+        if mol_solutions is None:
+            print(f"  WARNING: Using experimental position for {donor_mol}")
+            mol_solutions = [molecule_data_dict[donor_mol].copy()]
+
         # Store solutions for this molecule
         solutions_dict[donor_mol] = mol_solutions
         processed_molecules.add(donor_mol)
