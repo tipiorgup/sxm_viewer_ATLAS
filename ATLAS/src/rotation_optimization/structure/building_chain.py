@@ -248,6 +248,12 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
                 })
         
         if not available_linkages:
+            # Acceptor not positioned yet — use original template position as fallback
+            # so chain_dict is always complete and bonding can always proceed.
+            print(f"  WARNING: No positioned acceptors for {donor_mol} — using original position as fallback")
+            chain_dict[donor_mol] = molecule_data_dict[donor_mol].copy()
+            chain_list.append(chain_dict[donor_mol])
+            processed_molecules.add(donor_mol)
             continue
 
         future_bonds_to_this_mol = []
@@ -257,7 +263,7 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
             future_donor_c = future_link[1]
             future_acceptor = future_link[2]
             future_acceptor_c = future_link[3]
-            
+
             # If future molecule will bond TO current molecule being positioned
             if future_acceptor == donor_mol and future_donor not in processed_molecules:
                 # This is a future bond!
@@ -606,8 +612,13 @@ def align_and_position_molecules_TOP_N_POLYMERS(
                 })
         
         if not available_linkages:
+            # Acceptor not positioned yet — fall back to original template position
+            # so solutions_dict is always complete and bonding can always proceed.
+            print(f"  WARNING: No positioned acceptors for {donor_mol} — using original position as fallback")
+            solutions_dict[donor_mol] = [molecule_data_dict[donor_mol].copy()]
+            processed_molecules.add(donor_mol)
             continue
-        
+
         # Detect future bonds
         future_bonds_to_this_mol = []
         for future_link in sorted_linkages:
@@ -812,15 +823,24 @@ def create_glycosidic_bonds_in_chain(chain_dict, linkage_definitions):
    
     for donor_mol, donor_c, acceptor_mol, acceptor_c, anom, name in linkage_definitions:
         print(f"\n{name}: {donor_mol}.{donor_c} → {acceptor_mol}.{acceptor_c}")
-       
+
+        if acceptor_mol not in chain_dict:
+            print(f"  WARNING: {acceptor_mol} missing from chain_dict — skipping bond {name}")
+            continue
+        if donor_mol not in chain_dict:
+            print(f"  WARNING: {donor_mol} missing from chain_dict — skipping bond {name}")
+            continue
+
         target = chain_dict[acceptor_mol]
         donor = chain_dict[donor_mol]
-       
-        # Create glycosidic bond
-        bond = create_glycosidic_bond(
-            target, acceptor_c, donor, donor_c, anom, name
-        )
-        bonds[name] = bond 
+
+        try:
+            bond = create_glycosidic_bond(
+                target, acceptor_c, donor, donor_c, anom, name
+            )
+            bonds[name] = bond
+        except Exception as e:
+            print(f"  WARNING: Bond creation failed for {name}: {e} — skipping")
    
     print(f"\n{'='*70}")
     print(f"GLYCOSIDIC BONDS COMPLETE")
