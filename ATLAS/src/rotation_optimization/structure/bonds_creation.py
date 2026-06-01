@@ -9,7 +9,7 @@ from ..geometry.geometry_utils import (
 
 
 def _compute_ring_normal(mol_data, coords):
-    """Return unit normal to the pyranose ring plane, or None if ring data is missing."""
+    """Return (unit_normal, centroid) of the pyranose ring plane, or (None, None)."""
     carbon_map = mol_data.get('carbon_map', {})
     ring_carbons = carbon_map.get('all_ring_carbons', [])
     ring_o_idx = carbon_map.get('ring_oxygen')
@@ -20,12 +20,12 @@ def _compute_ring_normal(mol_data, coords):
 
     valid = [i for i in ring_indices if i < len(coords)]
     if len(valid) < 3:
-        return None
+        return None, None
 
     ring_pos = np.array([coords[i] for i in valid])
     centroid = ring_pos.mean(axis=0)
     _, _, vh = np.linalg.svd(ring_pos - centroid)
-    return vh[-1]  # unit normal (SVD guarantees unit length)
+    return vh[-1], centroid  # unit normal (SVD guarantees unit length), centroid
 
 def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, anomeric='beta', linkage_name='1-6'):
 
@@ -69,9 +69,9 @@ def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, ano
     height = C_O_BOND_LENGTH * np.sqrt(1 - cos_angle_at_c1**2)
     
     # Use the donor ring-plane normal so the oxygen is always placed above/below
-    # the ring, never inside it.  Fall back to an arbitrary perpendicular only
+    # the ring, never through it.  Fall back to an arbitrary perpendicular only
     # when ring atom data are unavailable or collinear with the bond axis.
-    ring_normal = _compute_ring_normal(mol1_data, coords1)
+    ring_normal, ring_centroid = _compute_ring_normal(mol1_data, coords1)
     perpendicular = None
 
     if ring_normal is not None:
@@ -84,18 +84,40 @@ def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, ano
             print(f"  Using ring-normal perpendicular (ring out-of-plane guaranteed)")
 
     if perpendicular is None:
-        # Fallback: arbitrary perpendicular (old behaviour)
-        if abs(c1_to_c2_norm[2]) < 0.9:
-            perpendicular_base = np.cross(c1_to_c2_norm, np.array([0, 0, 1]))
+        # Degenerate: bond axis is nearly parallel to ring normal.
+        # Pick a direction that lies IN the ring plane so the displacement
+        # stays perpendicular to the ring normal and cannot cross it.
+        if ring_normal is not None:
+            ref = np.array([1, 0, 0]) if abs(ring_normal[0]) < 0.9 else np.array([0, 1, 0])
+            in_plane = np.cross(ring_normal, ref)
+            perpendicular = in_plane / np.linalg.norm(in_plane)
+            print(f"  Degenerate: bond≈ring_normal — using ring-plane direction")
         else:
-            perpendicular_base = np.cross(c1_to_c2_norm, np.array([1, 0, 0]))
-        perpendicular = perpendicular_base / np.linalg.norm(perpendicular_base)
-        print(f"  Using fallback perpendicular (ring normal unavailable or parallel to bond)")
+            # No ring data at all: last-resort arbitrary perpendicular
+            if abs(c1_to_c2_norm[2]) < 0.9:
+                perpendicular_base = np.cross(c1_to_c2_norm, np.array([0, 0, 1]))
+            else:
+                perpendicular_base = np.cross(c1_to_c2_norm, np.array([1, 0, 0]))
+            perpendicular = perpendicular_base / np.linalg.norm(perpendicular_base)
+            print(f"  Using fallback perpendicular (no ring data)")
 
     if anomeric == 'alpha':
         perpendicular = -perpendicular
-    
+
     oxygen_pos = c1_pos + projection_dist * c1_to_c2_norm + height * perpendicular
+
+    # Post-placement verification: regardless of which path chose perpendicular,
+    # confirm the oxygen is on the correct side of the ring SVD plane and flip if not.
+    if ring_normal is not None and ring_centroid is not None:
+        oxygen_side = np.dot(oxygen_pos - ring_centroid, ring_normal)
+        want_above = (anomeric == 'beta')
+        wrong_side = (want_above and oxygen_side < 0) or (not want_above and oxygen_side > 0)
+        if wrong_side:
+            perpendicular = -perpendicular
+            oxygen_pos = c1_pos + projection_dist * c1_to_c2_norm + height * perpendicular
+            print(f"  Post-check: flipped oxygen to correct side for {anomeric} (was {oxygen_side:+.3f})")
+        else:
+            print(f"  Post-check: oxygen on correct side for {anomeric} (side={oxygen_side:+.3f})")
     
     # Verify geometry
     o_c1_dist = np.linalg.norm(oxygen_pos - c1_pos)
