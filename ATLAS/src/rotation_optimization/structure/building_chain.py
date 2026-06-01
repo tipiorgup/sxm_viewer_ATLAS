@@ -824,6 +824,10 @@ def create_glycosidic_bonds_in_chain(chain_dict, linkage_definitions):
     for donor_mol, donor_c, acceptor_mol, acceptor_c, anom, name in linkage_definitions:
         print(f"\n{name}: {donor_mol}.{donor_c} → {acceptor_mol}.{acceptor_c}")
 
+        # Coordinate-based linkages have a numpy array as acceptor — not a molecule bond
+        if not isinstance(acceptor_mol, str):
+            print(f"  Skipping coordinate-based linkage {name} (acceptor is a position, not a molecule)")
+            continue
         if acceptor_mol not in chain_dict:
             print(f"  WARNING: {acceptor_mol} missing from chain_dict — skipping bond {name}")
             continue

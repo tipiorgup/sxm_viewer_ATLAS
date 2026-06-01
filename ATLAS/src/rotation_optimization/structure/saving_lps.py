@@ -176,15 +176,28 @@ def collect_glycosidic_bond_info(glycosidic_bonds, linkage_definitions, processe
     
     for linkage_def in linkage_definitions:
         donor_name, donor_c, acceptor_name, acceptor_c, anomeric, name = linkage_def
-        
-        # Look up bond data by name from dictionary
+
+        # Coordinate-based linkages (acceptor is a position array) have no molecule to bond
+        if not isinstance(acceptor_name, str):
+            print(f"  Skipping coordinate-based linkage {name}")
+            continue
+
+        # Bond may have been skipped during creation (e.g. missing molecule) — warn and continue
         if name not in glycosidic_bonds:
-            raise KeyError(f"Bond '{name}' not found in glycosidic_bonds dictionary")
-        
+            print(f"  WARNING: bond '{name}' was not created — skipping")
+            continue
+
         bond_data = glycosidic_bonds[name]
-        
-        donor_data = next(m for m in processed_mols if m['name'] == donor_name)
-        acceptor_data = next(m for m in processed_mols if m['name'] == acceptor_name)
+
+        donor_data = next((m for m in processed_mols if m['name'] == donor_name), None)
+        acceptor_data = next((m for m in processed_mols if m['name'] == acceptor_name), None)
+
+        if donor_data is None:
+            print(f"  WARNING: donor '{donor_name}' not found in processed_mols — skipping bond {name}")
+            continue
+        if acceptor_data is None:
+            print(f"  WARNING: acceptor '{acceptor_name}' not found in processed_mols — skipping bond {name}")
+            continue
         
         donor_c_local = donor_data['carbon_map'][donor_c]
         acceptor_c_local = acceptor_data['carbon_map'][acceptor_c]
@@ -1173,7 +1186,7 @@ def export_complete_structure_with_petn_and_lipids(
         for linkage_def in linkage_definitions:
             bond_name = linkage_def[5]
             if bond_name not in glycosidic_bonds:
-                raise ValueError(f"Bond name '{bond_name}' from linkage_definitions not found in glycosidic_bonds dictionary")
+                print(f"  WARNING: bond '{bond_name}' from linkage_definitions was not created — will be skipped")
     
     if phosphate_bonds_with_names is not None and unbonded_monomers is None:
         raise ValueError("unbonded_monomers required when phosphate_bonds_with_names is provided")
