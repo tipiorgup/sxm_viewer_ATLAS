@@ -1464,6 +1464,9 @@ def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
     steps_per_update = 4
     num_updates = total_iterations // steps_per_update  # 375 updates
     
+    fixed_set = set(fixed_atoms) if fixed_atoms else set()
+    conf_p1 = mol_copy.GetConformer()
+
     for update in range(num_updates):
         t0 = time.perf_counter()
         success = minimize_with_constraint_no_com(
@@ -1473,6 +1476,16 @@ def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
         call_time = time.perf_counter() - t0
         t_minimize += call_time
         call_times.append(call_time)
+
+        # Optional stochastic kicks — disabled by default (enable_phase1_kicks=False).
+        # Mimics phase 2's velocity reinitialization to help escape torsional local
+        # minima (e.g. twisted bonded sugar rings) without disturbing well-built structures.
+        if config.enable_phase1_kicks and update > 0 and update % config.phase1_kick_interval == 0:
+            for i in range(n_atoms):
+                if i not in fixed_set:
+                    pos = conf_p1.GetAtomPosition(i)
+                    dx, dy, dz = np.random.randn(3) * config.phase1_kick_amplitude
+                    conf_p1.SetAtomPosition(i, (pos.x + dx, pos.y + dy, pos.z + dz))
 
         if trajectory_path is not None and update % config.image_interval == 0:
             energy = None

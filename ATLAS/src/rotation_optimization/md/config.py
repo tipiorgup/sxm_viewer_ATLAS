@@ -41,6 +41,8 @@ from ...constants import (
     DEFAULT_MINIMIZE_INTERVAL,
     DEFAULT_MINIMIZE_ITERATIONS,
     DEFAULT_IMAGE_INTERVAL,
+    DEFAULT_PHASE1_KICK_INTERVAL,
+    DEFAULT_PHASE1_KICK_AMPLITUDE,
     DEFAULT_MAX_FORCE,
     DEFAULT_MAX_VELOCITY,
     DEFAULT_RING_ROTATION_FRICTION,
@@ -177,6 +179,16 @@ class OptimizationConfig:
     # Ring rotation
     enable_ring_rotation: bool = True
     ring_rotation_friction: float = DEFAULT_RING_ROTATION_FRICTION
+
+    # Phase 1 stochastic kicks
+    # When True, small random displacements are applied to free atoms every
+    # kick_interval updates during phase 1 minimization — same escape mechanism
+    # phase 2 uses via velocity reinitialization.  Leave False for LPS runs
+    # where the structure is already well-positioned; enable for glycopeptides
+    # with large initial torsional clashes between bonded sugar rings.
+    enable_phase1_kicks: bool = False
+    phase1_kick_interval: int = DEFAULT_PHASE1_KICK_INTERVAL
+    phase1_kick_amplitude: float = DEFAULT_PHASE1_KICK_AMPLITUDE
 
     # Convergence
     enable_convergence: bool = True

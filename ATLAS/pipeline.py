@@ -1293,8 +1293,10 @@ def check_and_fix_geometry(final_with_h):
     
     return final_with_h
 
-def run_optimization(final_with_h, fixed_atoms, reference_normals, 
-                    name, conformers_selection, molecule_data_dict, lipid_tail_indices, stm_npy_path=None, pyranose_rings_no_h=None, initial_ring_coms=None):
+def run_optimization(final_with_h, fixed_atoms, reference_normals,
+                    name, conformers_selection, molecule_data_dict, lipid_tail_indices,
+                    stm_npy_path=None, pyranose_rings_no_h=None, initial_ring_coms=None,
+                    enable_phase1_kicks=False):
     """
     Run force field optimization using constants.
     
@@ -1342,6 +1344,9 @@ def run_optimization(final_with_h, fixed_atoms, reference_normals,
         reference_normals=reference_normals,
         enable_ring_rotation=True,
         ring_rotation_friction=constants.DEFAULT_RING_ROTATION_FRICTION,
+
+        # Phase 1 stochastic kicks — enable for glycopeptides with torsional clashes
+        enable_phase1_kicks=enable_phase1_kicks,
 
         # Convergence
         enable_convergence=True,

@@ -119,6 +119,13 @@ DEFAULT_MINIMIZE_ITERATIONS = get_env_int('DEFAULT_MINIMIZE_ITERATIONS', 10)
 DEFAULT_IMAGE_INTERVAL = get_env_int('DEFAULT_IMAGE_INTERVAL', 50)
 """Steps between trajectory frame writes (and optional PNG saves)."""
 
+DEFAULT_PHASE1_KICK_INTERVAL = get_env_int('DEFAULT_PHASE1_KICK_INTERVAL', 25)
+"""Phase 1: number of minimisation update cycles between stochastic kicks.
+Only active when --phase1_kicks is passed."""
+
+DEFAULT_PHASE1_KICK_AMPLITUDE = get_env_float('DEFAULT_PHASE1_KICK_AMPLITUDE', 0.05)
+"""Å — magnitude of random displacement applied per atom during phase 1 kicks."""
+
 # ============================================================================
 # Slab parameters (phase 2 compression)
 # ============================================================================

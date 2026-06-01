@@ -115,6 +115,12 @@ def parse_arguments():
         default=5,
         help="Number of independent polymers to generate (default: 5)"
     )
+    parser.add_argument(
+        "--phase1_kicks",
+        action="store_true",
+        default=False,
+        help="Enable stochastic kicks during phase 1 minimization to escape torsional local minima"
+    )
     args = parser.parse_args()
     return args
 
@@ -347,7 +353,8 @@ def main():
                             lipid_tail_indices,
                             pyranose_rings_no_h=pyranose_rings_no_h,
                             initial_ring_coms=initial_ring_coms,
-                            stm_npy_path=stm_npz_path
+                            stm_npy_path=stm_npz_path,
+                            enable_phase1_kicks=args.phase1_kicks
                         )
 
                     with timer.section(f"{tag}   Save results", level=3):

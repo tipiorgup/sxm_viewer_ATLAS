@@ -57,6 +57,11 @@ export DEFAULT_GRAVITY="${DEFAULT_GRAVITY:-0.055}"
 export DEFAULT_SLAB_FORCE_SCALE="${DEFAULT_SLAB_FORCE_SCALE:-0.075}"
 export DEFAULT_STEP_SIZE="${DEFAULT_STEP_SIZE:-0.01}"
 
+# Phase 1 stochastic kicks (set PHASE1_KICKS=true to enable)
+PHASE1_KICKS="${PHASE1_KICKS:-false}"
+export DEFAULT_PHASE1_KICK_INTERVAL="${DEFAULT_PHASE1_KICK_INTERVAL:-25}"
+export DEFAULT_PHASE1_KICK_AMPLITUDE="${DEFAULT_PHASE1_KICK_AMPLITUDE:-0.05}"
+
 # Ring monitoring
 export DEFAULT_CHECK_RINGS_INTERVAL="${DEFAULT_CHECK_RINGS_INTERVAL:-5}"
 export DEFAULT_MINIMIZE_INTERVAL="${DEFAULT_MINIMIZE_INTERVAL:-5}"
@@ -139,7 +144,9 @@ for PREFIX in "${INPUT_PREFIXES[@]}"; do
     # Set Python path
     export PYTHONPATH="${PYTHONPATH}:$(pwd)"
     
-    python module_B.py --input_file "$(basename $INPUT_FILE)" --iterations "$ITERATIONS" -p "$POLYMERS"
+    KICKS_FLAG=""
+    [ "$PHASE1_KICKS" = "true" ] && KICKS_FLAG="--phase1_kicks"
+    python module_B.py --input_file "$(basename $INPUT_FILE)" --iterations "$ITERATIONS" -p "$POLYMERS" $KICKS_FLAG
     
     # Check if calculation completed successfully
     EXIT_CODE=$?
