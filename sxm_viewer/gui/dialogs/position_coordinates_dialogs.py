@@ -349,8 +349,8 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
             writer.writerow(["Point", "Original_X", "Original_Y",
                              "X (Angstrom)", "Y (Angstrom)", "Height", "Z (Angstrom)"])
             for i, (ox, oy, x, y, z, *_rest) in enumerate(self._points):
-                # Demo: Height in Angstrom from originalimg; Z == Height.
-                writer.writerow([i, ox, oy, x, y, z, z])
+                # Height in Angstrom from originalimg; Z defaults to 0.
+                writer.writerow([i, ox, oy, x, y, z, 0.0])
         self._export_npz(out_path)
         self._export_png(out_path)
         QtWidgets.QMessageBox.information(
