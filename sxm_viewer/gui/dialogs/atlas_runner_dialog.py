@@ -221,6 +221,7 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
             "--input_file", self._tmp_yaml.name,
             "--iterations", str(self.iter_spin.value()),
             "--n_polymers", str(self.poly_spin.value()),
+            "--phase1_kicks",
         ]
         self._process.start(sys.executable, args)
 
