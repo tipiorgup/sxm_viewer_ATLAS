@@ -194,7 +194,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
         self._fig = Figure(figsize=(5, 5))
         self._ax = self._fig.add_subplot(111)
-        self._ax.imshow(self._img, cmap="afmhot", origin="lower", interpolation="nearest")
+        self._ax.imshow(self._img, cmap="magma", origin="lower", interpolation="nearest")
         self._ax.set_xlabel("col (px)")
         self._ax.set_ylabel("row (px)")
         self._fig.tight_layout()
@@ -378,7 +378,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
         if self._img is None:
             return
         fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-        ax.imshow(self._img, cmap="afmhot", origin="lower", interpolation="nearest")
+        ax.imshow(self._img, cmap="magma", origin="lower", interpolation="nearest")
         for i, (ox, oy, x_ang, y_ang, _z, col, row) in enumerate(self._points):
             ax.plot(col, row, marker="o", color="#2196f3", ms=6, mec="white", mew=0.7, zorder=20)
             ax.annotate(str(i), xy=(col, row), xytext=(4, 4),
