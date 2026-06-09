@@ -4,6 +4,9 @@ from rdkit import Chem
 from ..geometry.geometry_utils import get_perpendicular_vector, normalize_vector
 from ...IK.fabrikSolver import FabrikSolver3D
 
+#To-do: Add lipid anchor_position into ring (get_anchor_postion)
+
+
 def build_zigzag_chain(start_pos, direction, n_carbons, C_C_BOND=1.54):
     """
     Build a carbon chain with zigzag (trans) conformation
@@ -78,6 +81,9 @@ def get_anchor_position(connection_anchor, mol_data, carbon_name, connection_blo
     """
     Now accepts target_position to intelligently offset towards it.
     """
+    if connection_anchor == "ring":
+        #Populate fucniton for diozene, eliminate hydrogen from carbon and build lipid dircetlt as in lipid lipod
+
     if connection_anchor == "sugar":
         if carbon_name is None:
             raise ValueError("Sugar attachment requires a carbon name")
