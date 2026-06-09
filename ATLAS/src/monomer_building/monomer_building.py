@@ -52,6 +52,86 @@ def view_mol(smiles):
     view.show()
 
 
+def identify_aromatic_ring_atoms(mol):
+    """Identify atoms in a 6-membered all-carbon aromatic ring (e.g. benzene, anisole).
+
+    Labels ring atoms C1-C6 so that C1 is the ring atom with the most
+    heteroatom substituents (e.g. the C-OMe carbon in anisole).  This makes
+    C1 the natural bonding anchor and keeps the returned dict compatible with
+    the same ``carbon_map`` keys used by the rest of the pipeline.
+
+    Returns:
+        dict with keys C1-C6, all_ring_carbons, ring_type='aromatic', or
+        an empty dict if no suitable ring is found.
+    """
+    ring_info = mol.GetRingInfo()
+    ring_map = {}
+
+    for ring in ring_info.AtomRings():
+        if len(ring) != 6:
+            continue
+
+        atoms = [mol.GetAtomWithIdx(idx) for idx in ring]
+        # Must be an all-carbon ring
+        if not all(a.GetSymbol() == 'C' for a in atoms):
+            continue
+        # At least one atom must be flagged aromatic
+        if not any(mol.GetAtomWithIdx(idx).GetIsAromatic() for idx in ring):
+            continue
+
+        ring_set = set(ring)
+
+        def _heteroatom_substituents(idx):
+            return sum(
+                1 for n in mol.GetAtomWithIdx(idx).GetNeighbors()
+                if n.GetIdx() not in ring_set and n.GetSymbol() not in ('C', 'H')
+            )
+
+        def _total_substituents(idx):
+            return sum(
+                1 for n in mol.GetAtomWithIdx(idx).GetNeighbors()
+                if n.GetIdx() not in ring_set
+            )
+
+        # C1 = ring atom with most heteroatom substituents; break ties by total subs
+        sorted_ring = sorted(
+            ring,
+            key=lambda idx: (_heteroatom_substituents(idx), _total_substituents(idx)),
+            reverse=True
+        )
+        start_idx = sorted_ring[0]
+
+        # Walk ring from start_idx to produce a consistent ordering
+        ordered = [start_idx]
+        visited = {start_idx}
+        current = start_idx
+        while len(ordered) < 6:
+            moved = False
+            for neighbor in mol.GetAtomWithIdx(current).GetNeighbors():
+                n_idx = neighbor.GetIdx()
+                if n_idx in ring_set and n_idx not in visited:
+                    ordered.append(n_idx)
+                    visited.add(n_idx)
+                    current = n_idx
+                    moved = True
+                    break
+            if not moved:
+                break
+
+        if len(ordered) != 6:
+            continue
+
+        for i, idx in enumerate(ordered, 1):
+            ring_map[f'C{i}'] = idx
+
+        ring_map['all_ring_carbons'] = list(ring)
+        ring_map['ring_type'] = 'aromatic'
+        # No ring_oxygen for aromatic rings; downstream code uses .get('ring_oxygen')
+        break
+
+    return ring_map
+
+
 def identify_sugar_carbons(mol):
     """Identify ALL carbons in pyranose ring (C1-C5) plus C6 if present."""
     ring_info = mol.GetRingInfo()
@@ -214,7 +294,6 @@ def find_anomeric_oxygen(mol, carbon_map):
 
     return anomeric_oxygen
 
-
 def classify_anomeric_configuration(mol, conf_id, carbon_map, ring_normal, ring_centroid):
     """
     Classify the anomeric configuration as alpha or beta from 3D coordinates.
@@ -245,6 +324,11 @@ def classify_anomeric_configuration(mol, conf_id, carbon_map, ring_normal, ring_
         'anomeric_oxygen_idx': None
     }
 
+        # Aromatic monomers have no anomeric centre
+    if carbon_map.get('ring_type') == 'aromatic':
+        result['anomer'] = 'not_applicable'
+        return result
+    
     if 'C1' not in carbon_map or 'C5' not in carbon_map:
         return result
 
@@ -378,7 +462,6 @@ def calculate_cremer_pople_parameters(ring_coords):
         }
     }
 
-
 def classify_puckering(Q, theta_deg, phi_deg):
     """
     Classify 6-membered ring conformation based on Cremer-Pople parameters.
@@ -415,7 +498,6 @@ def classify_puckering(Q, theta_deg, phi_deg):
             return "envelope"
     else:
         return "twist_intermediate"
-
 
 def analyze_conformer_puckering_cremer_pople(mol, conf_id, carbon_map=None):
     """
@@ -479,7 +561,6 @@ def analyze_conformer_puckering_cremer_pople(mol, conf_id, carbon_map=None):
     print(f"  No 6-membered ring found in conformer {conf_id}")
     return None
 
-
 # ============================================================================
 # MAIN CONFORMER GENERATION FUNCTION
 # ============================================================================
@@ -513,6 +594,9 @@ def generate_monomer_conformers(smiles, num_conformers=25, max_keep=15,
     # FIX Issue 1: carbon_map is computed on flat mol (topology), atom indices
     # are stable across conformer generation so this is correct.
     carbon_map = identify_sugar_carbons(mol)
+    if not carbon_map:
+        carbon_map = identify_aromatic_ring_atoms(mol)
+    monomer_type = carbon_map.get('ring_type', 'sugar')
 
     try:
         AllChem.EmbedMultipleConfs(mol, numConfs=num_conformers,
@@ -584,12 +668,18 @@ def generate_monomer_conformers(smiles, num_conformers=25, max_keep=15,
                 phi = puck_params['phi']
                 anomer = puck_params['anomer']
 
+                # Aromatic rings are always planar; override label for clarity
+                if monomer_type == 'aromatic':
+                    anomer = 'not_applicable'
+                    puckering_descriptor = 'planar'
+
                 if known_ring_type is not None:
                     base_type = puckering_descriptor.split('_')[0]
                     if base_type.lower() != known_ring_type.lower():
                         continue
 
-                if known_anomer is not None:
+                # known_anomer filter is meaningless for aromatic monomers
+                if known_anomer is not None and monomer_type != 'aromatic':
                     if anomer.lower() != known_anomer.lower():
                         continue
 
@@ -743,6 +833,7 @@ def generate_monomer_conformers(smiles, num_conformers=25, max_keep=15,
                 'ring_puckering': float(puckering_amplitude),
                 'energy': energy,
                 'anomer': anomer,
+                'monomer_type': monomer_type
             }
 
             if use_cremer_pople and puck_params is not None:
