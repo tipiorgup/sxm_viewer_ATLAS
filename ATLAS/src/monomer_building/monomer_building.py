@@ -52,6 +52,9 @@ def view_mol(smiles):
     view.show()
 
 
+##To do: First identifify 6-member rings. If they are all carbons it goes to identify_aromatic_ring_atoms, if there is an oxugen it goe to idneitgy_ dugar_atoms and if O>1 we need to behave as 
+# identify aromagic_ring_carbos and use substituent as C1.
+
 def identify_aromatic_ring_atoms(mol):
     """Identify atoms in a 6-membered all-carbon aromatic ring (e.g. benzene, anisole).
 
@@ -63,6 +66,13 @@ def identify_aromatic_ring_atoms(mol):
     Returns:
         dict with keys C1-C6, all_ring_carbons, ring_type='aromatic', or
         an empty dict if no suitable ring is found.
+
+    To-do:  Carbon 1 is te one with the most subsituents and between susbtituents
+    If they are 2 it does not matter 
+    Methoxy carbon we never bond, is free soul
+
+    Numbering for dioxan:
+
     """
     ring_info = mol.GetRingInfo()
     ring_map = {}
