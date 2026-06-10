@@ -1010,25 +1010,40 @@ def add_hydrogens_with_openbabel(
     
     except Exception as e:
         error_msg = str(e)
-        if verbose:
-            print(f"ERROR converting back to RDKit: {error_msg[:150]}")
-        
-        # Check if it's a valence error
-        if "valence" in error_msg.lower():
-            if verbose:
-                print("Original structure has valence issues")
-        
-        # Save directly from Open Babel
-        if filename is not None:
-            out_format = filename.split('.')[-1] if '.' in filename else 'sdf'
-            ob_conv.SetOutFormat(out_format)
-            success = ob_conv.WriteFile(ob_mol, filename)
-            
-            if success and verbose:
-                print(f"Saved to {filename} directly from Open Babel")
-         
-        # Return the Open Babel molecule instead
-        return ob_mol
+        print(f"  OpenBabel→RDKit MDL round-trip failed ({error_msg[:120]}); "
+              f"falling back to RDKit AddHs")
+
+        # The MDL round-trip is fragile for large molecules (V2000's 999-atom
+        # limit corrupts the bond block → "bad bond CFG"). Rather than return a
+        # raw OBMol — which callers like fix_overvalent_carbons cannot consume
+        # (Chem.RWMol(OBMol) raises) — bypass OpenBabel for the conversion and
+        # add hydrogens with RDKit directly. `mol` here is the pre-H RDKit mol
+        # with a valid conformer, so addCoords gives reasonable H positions; the
+        # geometry is refined later during optimization anyway.
+        if not return_as_openbabel:
+            try:
+                mol_with_h = Chem.AddHs(mol, addCoords=True)
+                try:
+                    Chem.SanitizeMol(mol_with_h)
+                except Exception as sanitize_error:
+                    print(f"  Warning: sanitize after RDKit AddHs: "
+                          f"{str(sanitize_error)[:100]}")
+                # fall through to the shared save/return path below
+            except Exception as rdkit_error:
+                print(f"  RDKit AddHs fallback also failed "
+                      f"({str(rdkit_error)[:120]}); returning OBMol")
+                if filename is not None:
+                    out_format = filename.split('.')[-1] if '.' in filename else 'sdf'
+                    ob_conv.SetOutFormat(out_format)
+                    ob_conv.WriteFile(ob_mol, filename)
+                return ob_mol
+        else:
+            # Caller explicitly asked for an OBMol.
+            if filename is not None:
+                out_format = filename.split('.')[-1] if '.' in filename else 'sdf'
+                ob_conv.SetOutFormat(out_format)
+                ob_conv.WriteFile(ob_mol, filename)
+            return ob_mol
     
    
     # ========================================================================
