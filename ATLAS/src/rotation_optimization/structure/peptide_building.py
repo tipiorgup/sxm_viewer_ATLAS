@@ -469,41 +469,57 @@ def find_functional_group_atom(mol, aa, functional_type):
     
     return None
 
+def _collect_hydroxyl(mol, carboxyl_c):
+    """Return [O(H) idx, H idx] for the single-bonded -OH on a carboxyl carbon."""
+    c_term_oh = []
+    for n in mol.GetAtomWithIdx(carboxyl_c).GetNeighbors():
+        if n.GetSymbol() == 'O':
+            bond = mol.GetBondBetweenAtoms(carboxyl_c, n.GetIdx())
+            if bond.GetBondType() == Chem.BondType.SINGLE:
+                c_term_oh.append(n.GetIdx())
+                for nn in n.GetNeighbors():
+                    if nn.GetSymbol() == 'H':
+                        c_term_oh.append(nn.GetIdx())
+    return c_term_oh
+
 def find_c_terminus(mol):
-    """Find C-terminus C(=O)OH."""
-    for atom in mol.GetAtoms():
-        if atom.GetSymbol() == 'C':
-            neighbors = list(atom.GetNeighbors())
-            o_count = sum(1 for n in neighbors if n.GetSymbol() == 'O')
-            if o_count == 2:
-                c_term_c = atom.GetIdx()
-                c_term_oh = []
-                for n in neighbors:
-                    if n.GetSymbol() == 'O':
-                        bond = mol.GetBondBetweenAtoms(c_term_c, n.GetIdx())
-                        if bond.GetBondType() == Chem.BondType.SINGLE:
-                            c_term_oh.append(n.GetIdx())
-                            for nn in n.GetNeighbors():
-                                if nn.GetSymbol() == 'H':
-                                    c_term_oh.append(nn.GetIdx())
-                return c_term_c, c_term_oh
+    """Find the BACKBONE C-terminus carboxyl C(=O)OH.
+
+    Must NOT match side-chain carboxyls (Asp/Glu), which are also C(=O)OH. The
+    backbone C-terminus sits on an N–Cα–C(=O)OH motif: its carboxyl carbon is
+    bonded to a Cα that is itself bonded to a backbone N. Asp/Glu side-chain
+    carboxyls fail this (their preceding carbon is a CH2, not bonded to N), so
+    this disambiguates them. Returns (c_term_c, c_term_oh).
+    """
+    # N–Cα–C(=O)–OH ; atoms: 0=N 1=Cα 2=carboxyl C 3==O 4=OH
+    patt = MolFromSmarts('[NX3,NX4][CX4][CX3](=[OX1])[OX2H1]')
+    matches = mol.GetSubstructMatches(patt)
+    if matches:
+        if len(matches) > 1:
+            print(f"  ⚠ find_c_terminus: {len(matches)} backbone-COOH motifs "
+                  f"found; using the first")
+        c_term_c = matches[0][2]
+        return c_term_c, _collect_hydroxyl(mol, c_term_c)
+
+    # Fallback: any free carboxyl (e.g. unusual terminus) — old behavior.
+    patt = MolFromSmarts('[CX3](=[OX1])[OX2H1]')
+    matches = mol.GetSubstructMatches(patt)
+    if matches:
+        c_term_c = matches[0][0]
+        return c_term_c, _collect_hydroxyl(mol, c_term_c)
     raise ValueError("Could not find C-terminus")
 
 def find_n_terminus(mol, ca_idx):
-    """Find N-terminus NH2, or pyrrolidine N for Pro."""
-    for atom in mol.GetAtoms():
-        if atom.GetSymbol() == 'N' and atom.GetIdx() != ca_idx:
-            h_neighbors = [n for n in atom.GetNeighbors() if n.GetSymbol() == 'H']
-            if len(h_neighbors) >= 1:
-                return atom.GetIdx(), [h_neighbors[0].GetIdx()]
-    
-    # fallback for Pro: tertiary N with no H
-    for atom in mol.GetAtoms():
-        if atom.GetSymbol() == 'N' and atom.GetIdx() != ca_idx:
-            c_neighbors = [n for n in atom.GetNeighbors() if n.GetSymbol() == 'C']
-            if len(c_neighbors) >= 2:
-                return atom.GetIdx(), []
-    
+    """Find the BACKBONE N-terminus: the amine N bonded to the Cα.
+
+    Using Cα adjacency avoids picking side-chain nitrogens (Lys/Arg/Asn/Gln/
+    His/Trp), which also carry H's. Works for Pro (ring N bonded to Cα) too.
+    Returns (n_idx, [h_idx] or []).
+    """
+    for n in mol.GetAtomWithIdx(ca_idx).GetNeighbors():
+        if n.GetSymbol() == 'N':
+            h_neighbors = [x.GetIdx() for x in n.GetNeighbors() if x.GetSymbol() == 'H']
+            return n.GetIdx(), ([h_neighbors[0]] if h_neighbors else [])
     raise ValueError("Could not find N-terminus")
 
 def calculate_ring_centroid(mol, conf):
