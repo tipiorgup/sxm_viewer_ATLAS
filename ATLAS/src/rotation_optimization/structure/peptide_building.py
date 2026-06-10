@@ -166,7 +166,18 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
     print(f"\n{'='*60}")
     print(f"Building peptide with RDKit: {'-'.join(aa_sequence)}")
     print(f"Using {len(residue_data)} residues with Cα + functional positions")
-    
+
+    # For large linear chains the per-residue whole-peptide embed (below) gets
+    # expensive and RDKit's embedder silently fails (returns -1, no conformer).
+    # Switch to a cheap per-residue placement strategy: never embed the full
+    # molecule, just place each residue's individually-embedded geometry at its
+    # experimental Cα. Small peptides keep the existing (good-geometry) path.
+    PER_RESIDUE_THRESHOLD = 40
+    big_chain = (not cyclic) and len(aa_sequence) > PER_RESIDUE_THRESHOLD
+    if big_chain:
+        print(f"  Large chain ({len(aa_sequence)} residues) → "
+              f"per-residue placement (skipping whole-peptide embed)")
+
 
     sequence_key = '-'.join(aa_sequence)
     if cyclic and sequence_key in CYCLIC_PEPTIDE_SMILES:
@@ -225,7 +236,13 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
         aa_mol = Chem.MolFromSmiles(aa_smiles[aa])
         aa_mol = Chem.AddHs(aa_mol)
         AllChem.EmbedMolecule(aa_mol, randomSeed=42)
-        
+
+        # Tag every atom with its residue index so the per-residue placement
+        # path can recover membership after CombineMols/RemoveAtom shuffles
+        # indices. Properties survive editing; harmless for the small path.
+        for atom in aa_mol.GetAtoms():
+            atom.SetIntProp('residue_id', i)
+
         # Find Cα
         ca_idx = find_ca_in_aa(aa_mol, aa)
         
@@ -269,9 +286,15 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
             
             peptide = editable.GetMol()
             Chem.SanitizeMol(peptide)
-            peptide = Chem.AddHs(peptide)
-            AllChem.EmbedMolecule(peptide, randomSeed=42)
-            
+            if not big_chain:
+                # Small path (unchanged): re-embed the whole growing peptide so
+                # Kabsch positioning has distinct, globally-consistent Cα coords.
+                peptide = Chem.AddHs(peptide)
+                AllChem.EmbedMolecule(peptide, randomSeed=42)
+            # Big path: skip the whole-peptide embed. The combined conformer
+            # carries each residue's individually-embedded coordinates through
+            # CombineMols; per-residue placement re-positions them afterwards.
+
             # Adjust indices
             if functional_idx != 'centroid' and functional_idx is not None:
                 functional_idx_adj = peptide_offset + functional_idx - sum(1 for x in atoms_to_remove if x < peptide_offset + functional_idx)
@@ -293,6 +316,10 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
         peptide, residue_info = close_peptide_ring(peptide, residue_info)
         peptide = embed_cyclic_molecule(peptide, residue_info, residue_data)
         position_cyclic_peptide(peptide, residue_info, residue_data)
+    elif big_chain:
+        position_peptide_per_residue(
+            peptide, residue_info, residue_data
+        )
     else:
         position_peptide_at_experimental_positions(
             peptide, residue_info, residue_data
@@ -598,7 +625,11 @@ def position_peptide_at_experimental_positions(peptide, residue_info, residue_da
 
     print(f"\nGlobal Kabsch alignment applied ({len(ca_indices)} Cα).")
 
-    # ── Per-residue side-chain orientation ───────────────────────────────────
+    _orient_all_side_chains(peptide, conf, residue_info, residue_data)
+
+
+def _orient_all_side_chains(peptide, conf, residue_info, residue_data):
+    """Rotate each residue's side chain in XY toward its functional_position."""
     print(f"Orienting side chains:")
     for res_idx, (res_info, res_data) in enumerate(zip(residue_info, residue_data)):
         func_pos = res_data.get('functional_position')
@@ -614,6 +645,44 @@ def position_peptide_at_experimental_positions(peptide, residue_info, residue_da
         side_atoms = _get_side_chain_atoms_linear(peptide, ca_idx)
         deg = _rotate_side_chain_toward(conf, side_atoms, ca_xy, target_xy)
         print(f"  Residue {res_idx} ({res_info['aa']}): side chain rotated {deg:.1f}°")
+
+
+def position_peptide_per_residue(peptide, residue_info, residue_data):
+    """
+    Cheap placement for large linear chains (no global embed, no global Kabsch).
+
+    Each residue keeps the internal geometry from its individual EmbedMolecule
+    (carried through CombineMols). We translate every residue rigidly so its Cα
+    lands on the experimental position, flatten to the surface (z=0), then orient
+    side chains. This never embeds the full molecule, so it is cheap and cannot
+    hit the silent embedder failure that occurs on large peptides.
+    """
+    from collections import defaultdict
+
+    if peptide.GetNumConformers() == 0:
+        raise ValueError("position_peptide_per_residue: peptide has no conformer "
+                         "(per-AA embeds did not propagate through CombineMols)")
+    conf = peptide.GetConformer()
+
+    # Recover residue membership from the residue_id tag set during the build.
+    members = defaultdict(list)
+    for atom in peptide.GetAtoms():
+        if atom.HasProp('residue_id'):
+            members[atom.GetIntProp('residue_id')].append(atom.GetIdx())
+
+    print(f"\nPer-residue placement ({len(residue_info)} residues):")
+    for res_idx, (res_info, res_data) in enumerate(zip(residue_info, residue_data)):
+        ca_idx = res_info['ca_idx']
+        ca_pos = np.array([*conf.GetAtomPosition(ca_idx)], dtype=float)
+        target = np.array(res_data['ca_position'], dtype=float)
+        shift = target - ca_pos
+        for aid in members.get(res_idx, [ca_idx]):
+            p = np.array([*conf.GetAtomPosition(aid)], dtype=float) + shift
+            p[2] = 0.0   # flatten to surface
+            conf.SetAtomPosition(aid, p.tolist())
+
+    _orient_all_side_chains(peptide, conf, residue_info, residue_data)
+
 
 def find_glycosylation_site(peptide_data, residue_index=0, aa_type=None):
     romol = peptide_data['rdkit_mol']
