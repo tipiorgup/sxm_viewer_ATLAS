@@ -9,9 +9,7 @@ from ..geometry.geometry_utils import (
 
 #TO:DO Implemenet CC bond simple
 
-def simple_CC_bond(mol1_data, carbon1_name, mol2_data, carbon2_name);
-    "Simple, bond carbons"
-    
+  
 def _compute_ring_normal(mol_data, coords):
     """Return (unit_normal, centroid) of the pyranose ring plane, or (None, None)."""
     carbon_map = mol_data.get('carbon_map', {})

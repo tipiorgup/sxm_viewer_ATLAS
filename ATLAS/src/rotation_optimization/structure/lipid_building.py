@@ -81,9 +81,6 @@ def get_anchor_position(connection_anchor, mol_data, carbon_name, connection_blo
     """
     Now accepts target_position to intelligently offset towards it.
     """
-    if connection_anchor == "ring":
-        #Populate fucniton for diozene, eliminate hydrogen from carbon and build lipid dircetlt as in lipid lipod
-
     if connection_anchor == "sugar":
         if carbon_name is None:
             raise ValueError("Sugar attachment requires a carbon name")
