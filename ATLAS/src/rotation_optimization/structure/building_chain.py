@@ -881,8 +881,12 @@ def add_hydrogens_with_openbabel(
         mol = mol.GetMol()
 
     
-    sdf_string = Chem.MolToMolBlock(mol)
-    
+    # V2000 molblocks use fixed 3-char index fields → hard 999-atom limit.
+    # Large structures (e.g. RNAse, ~2000 atoms with H) overflow it and produce
+    # a corrupt bond block. Use V3000 (no limit) once we exceed the limit; small
+    # molecules keep V2000 so existing behavior is unchanged.
+    sdf_string = Chem.MolToMolBlock(mol, forceV3000=mol.GetNumAtoms() > 999)
+
     # Create Open Babel molecule
     ob_mol = ob.OBMol()
     ob_conv = ob.OBConversion()
@@ -979,8 +983,12 @@ def add_hydrogens_with_openbabel(
     if verbose:
         print("\nConverting back to RDKit format...")
     
-    # Convert to SDF string
+    # Convert to SDF string. After AddHydrogens the molecule is larger, so the
+    # V2000 999-atom limit bites here too — force Open Babel to emit V3000 (MDL
+    # output option "3") for big molecules so RDKit can parse it back.
     ob_conv.SetOutFormat("sdf")
+    if ob_mol.NumAtoms() > 999:
+        ob_conv.AddOption("3", ob.OBConversion.OUTOPTIONS)
     sdf_with_h = ob_conv.WriteString(ob_mol)
     
     # Try reading into RDKit
