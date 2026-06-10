@@ -880,7 +880,34 @@ def add_hydrogens_with_openbabel(
     if isinstance(mol, Chem.RWMol):
         mol = mol.GetMol()
 
-    
+    # ------------------------------------------------------------------
+    # Large molecules: skip the OpenBabel MDL round-trip entirely.
+    # V2000 molblocks cap at 999 atoms; a protein like RNAse (~1000 heavy
+    # atoms, ~2000 with H) overflows the format, RDKit fails to parse Open
+    # Babel's output ("bad bond CFG"), and the old code then returned a raw
+    # OBMol that crashed fix_overvalent_carbons. RDKit's own AddHs is
+    # deterministic and needs no text round-trip. The marker print also lets
+    # us confirm at runtime that THIS (fixed) code is the version executing.
+    # ------------------------------------------------------------------
+    if not return_as_openbabel and mol.GetNumAtoms() > 999:
+        print(f"[add_hydrogens_with_openbabel] FIXED PATH: large molecule "
+              f"({mol.GetNumAtoms()} atoms) → RDKit AddHs, skipping OpenBabel")
+        mol_with_h = Chem.AddHs(mol, addCoords=True)
+        try:
+            Chem.SanitizeMol(mol_with_h)
+        except Exception as sanitize_error:
+            print(f"  Warning: sanitize after RDKit AddHs: "
+                  f"{str(sanitize_error)[:100]}")
+        if filename is not None:
+            try:
+                out = filename if filename.endswith(('.sdf', '.mol')) else filename + '.sdf'
+                writer = Chem.SDWriter(out)
+                writer.write(mol_with_h)
+                writer.close()
+            except Exception as save_error:
+                print(f"  Warning: could not save {filename}: {save_error}")
+        return mol_with_h
+
     # V2000 molblocks use fixed 3-char index fields → hard 999-atom limit.
     # Large structures (e.g. RNAse, ~2000 atoms with H) overflow it and produce
     # a corrupt bond block. Use V3000 (no limit) once we exceed the limit; small
