@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 
 
-My first change!
+#My first change!
 # RDKit core
 import rdkit
 from rdkit import Chem, RDConfig
@@ -73,8 +73,6 @@ def identify_aromatic_ring_atoms(mol):
     If they are 2 it does not matter 
     Methoxy carbon we never bond, is free soul
 
-    Numbering for dioxan:
-
     """
     ring_info = mol.GetRingInfo()
     ring_map = {}
@@ -87,6 +85,7 @@ def identify_aromatic_ring_atoms(mol):
         # Must be an all-carbon ring
         if not all(a.GetSymbol() == 'C' for a in atoms):
             continue
+        
         # At least one atom must be flagged aromatic
         if not any(mol.GetAtomWithIdx(idx).GetIsAromatic() for idx in ring):
             continue
@@ -104,16 +103,24 @@ def identify_aromatic_ring_atoms(mol):
                 1 for n in mol.GetAtomWithIdx(idx).GetNeighbors()
                 if n.GetIdx() not in ring_set
             )
+        
+        # Count how many neighbouring ring carbons are also heteroatom substituted
+        def _neighbouring_substituents(idx):
+            return sum(
+                1 for n in mol.GetAtomWithIdx(idx).GetNeighbors()
+                if n.GetIdx() in ring_set and _heteroatom_substituents(n.GetIdx()) > 0
+            )
 
-        # C1 = ring atom with most heteroatom substituents; break ties by total subs
+        # C1 = ring atom with most heteroatom substituents; break ties by neighbouring heteroatom subs, and then total subs
         sorted_ring = sorted(
             ring,
-            key=lambda idx: (_heteroatom_substituents(idx), _total_substituents(idx)),
+            key=lambda idx: (_heteroatom_substituents(idx), _neighbouring_substituents(idx), _total_substituents(idx)),
             reverse=True
         )
         start_idx = sorted_ring[0]
 
         # Walk ring from start_idx to produce a consistent ordering
+        # To-do: Define clockwise vs anticlockwise based on lower cardinal number
         ordered = [start_idx]
         visited = {start_idx}
         current = start_idx
@@ -136,9 +143,79 @@ def identify_aromatic_ring_atoms(mol):
         for i, idx in enumerate(ordered, 1):
             ring_map[f'C{i}'] = idx
 
-        ring_map['all_ring_carbons'] = list(ring)
+        ring_map['all_ring_carbons'] = list(ordered)
         ring_map['ring_type'] = 'aromatic'
         # No ring_oxygen for aromatic rings; downstream code uses .get('ring_oxygen')
+        break
+
+    return ring_map
+
+
+def identify_dioxan_carbons(mol):
+
+    """Numbering for dioxan: Most substituted is C1 and any direction, only count C"""
+
+    ring_info = mol.GetRingInfo()
+    ring_map = {}
+
+    for ring in ring_info.AtomRings():
+        if len(ring) != 6:
+            continue
+
+        atoms = [mol.GetAtomWithIdx(idx) for idx in ring]
+
+        # Must have exactly two oxygens in the ring
+        if sum(1 for a in atoms if a.GetSymbol() == 'O') != 2:
+            continue
+
+        ring_set = set(ring)
+
+        def _heteroatom_substituents(idx):
+            return sum(
+                1 for n in mol.GetAtomWithIdx(idx).GetNeighbors()
+                if n.GetIdx() not in ring_set and n.GetSymbol() not in ('C', 'H')
+            )
+        
+        # C1 = ring atom with most heteroatom substituents; break ties by neighbouring heteroatom subs, and then total subs
+        carbon_ring = [idx for idx in ring if mol.GetAtomWithIdx(idx).GetSymbol() == 'C']
+        if not carbon_ring:
+            continue
+
+        sorted_ring = sorted(
+            carbon_ring,
+            key=lambda idx: (_heteroatom_substituents(idx)),
+            reverse=True
+        )
+
+        start_idx = sorted_ring[0]
+
+        # Walk ring from start_idx to produce a consistent ordering
+        ordered = [start_idx]
+        visited = {start_idx}
+        current = start_idx
+        while len(ordered) < 6:
+            moved = False
+            for neighbor in mol.GetAtomWithIdx(current).GetNeighbors():
+                n_idx = neighbor.GetIdx()
+                if n_idx in ring_set and n_idx not in visited:
+                    if mol.GetAtomWithIdx(n_idx).GetSymbol() == 'C':
+                        ordered.append(n_idx)
+                    visited.add(n_idx)
+                    current = n_idx
+                    moved = True
+                    break
+            if not moved:
+                break
+
+        if len(ordered) != 4:  # Dioxane rings should have 4 carbons
+            continue
+
+        for i, idx in enumerate(ordered, 1):
+            ring_map[f'C{i}'] = idx
+
+        ring_map['all_ring_carbons'] = list(ordered)
+        ring_map['ring_type'] = 'dioxan'
+        # Two ring_oxygen for dioxan rings; downstream code uses .get('ring_oxygen')
         break
 
     return ring_map
