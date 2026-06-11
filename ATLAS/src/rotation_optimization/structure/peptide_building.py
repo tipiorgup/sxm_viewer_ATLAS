@@ -795,9 +795,12 @@ def find_thr_site(romol, residue_index, seq, conf, canonical_name, aa_info):
     }
 
 def find_tyr_site(romol, residue_index, seq, conf, canonical_name, aa_info):
-    """Tyrosine: Find Oη phenolic hydroxyl."""
+    """Tyrosine: Find Oη phenolic hydroxyl (restricted to residue_index)."""
+    allowed = _residue_atom_indices(romol, residue_index)
     for atom in romol.GetAtoms():
         if atom.GetSymbol() == 'O':
+            if allowed is not None and atom.GetIdx() not in allowed:
+                continue
             neighbors = list(atom.GetNeighbors())
             has_aromatic_c = any(
                 n.GetSymbol() == 'C' and n.GetIsAromatic() for n in neighbors
@@ -825,11 +828,14 @@ def find_tyr_site(romol, residue_index, seq, conf, canonical_name, aa_info):
     raise ValueError(f"Could not find {aa_info['atom_name']} in Tyr at residue {residue_index}")
 
 def find_trp_site(romol, residue_index, seq, conf, canonical_name, aa_info):
-    """Tryptophan: Find C2 in indole ring."""
+    """Tryptophan: Find C2 in indole ring (restricted to residue_index)."""
+    allowed = _residue_atom_indices(romol, residue_index)
     # Find indole nitrogen in 5-membered ring
     indole_n = None
     for atom in romol.GetAtoms():
         if atom.GetSymbol() == 'N' and atom.GetIsAromatic():
+            if allowed is not None and atom.GetIdx() not in allowed:
+                continue
             rings = atom.GetOwningMol().GetRingInfo()
             for ring in rings.AtomRings():
                 if atom.GetIdx() in ring and len(ring) == 5:
@@ -1027,13 +1033,36 @@ def create_n_glycosidic_direct(mol_data, sugar_carbon, target_n_delta,
         'h_to_remove_peptide': ['Asn-Nδ-H1']
     }
 
+def _residue_atom_indices(romol, residue_index):
+    """Atom indices tagged with residue_id == residue_index.
+
+    Returns None when the molecule carries no residue_id tags at all (older
+    embed paths / reloaded mols) so callers can fall back to an unrestricted
+    scan. The tag is set per atom during build_peptide_with_rdkit_ca, so for a
+    normally-built peptide this confines the functional-group search to the
+    requested residue — without it the finders return the first matching atom
+    in the whole chain (wrong residue on any multi-site peptide).
+    """
+    ids = set()
+    tagged = False
+    for atom in romol.GetAtoms():
+        if atom.HasProp('residue_id'):
+            tagged = True
+            if atom.GetIntProp('residue_id') == residue_index:
+                ids.add(atom.GetIdx())
+    return ids if tagged else None
+
+
 def find_asn_n_delta(romol, residue_index, aa_sequence):  # Changed parameter
-    """Find Nδ atom in Asparagine side chain."""
-    
+    """Find Nδ atom in Asparagine side chain (restricted to residue_index)."""
+    allowed = _residue_atom_indices(romol, residue_index)
+
     for atom in romol.GetAtoms():
         if atom.GetSymbol() == 'N':
+            if allowed is not None and atom.GetIdx() not in allowed:
+                continue
             neighbors = list(atom.GetNeighbors())
-            
+
             for neighbor in neighbors:
                 if neighbor.GetSymbol() == 'C':
                     c_neighbors = list(neighbor.GetNeighbors())
@@ -1060,11 +1089,14 @@ def find_asn_n_delta(romol, residue_index, aa_sequence):  # Changed parameter
     raise ValueError(f"Could not find Nδ in Asn at residue {residue_index}")
 
 def find_ser_o_gamma(romol, residue_index, seq):
-    """Find Oγ atom in Serine side chain."""
+    """Find Oγ atom in Serine side chain (restricted to residue_index)."""
+    allowed = _residue_atom_indices(romol, residue_index)
     for atom in romol.GetAtoms():
         if atom.GetSymbol() == 'O':
+            if allowed is not None and atom.GetIdx() not in allowed:
+                continue
             neighbors = list(atom.GetNeighbors())
-            
+
             if len(neighbors) == 2:
                 has_c = any(n.GetSymbol() == 'C' for n in neighbors)
                 has_h = any(n.GetSymbol() == 'H' for n in neighbors)
