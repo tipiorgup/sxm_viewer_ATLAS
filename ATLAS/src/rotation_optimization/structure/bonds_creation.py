@@ -29,6 +29,59 @@ def _compute_ring_normal(mol_data, coords):
     _, _, vh = np.linalg.svd(ring_pos - centroid)
     return vh[-1], centroid  # unit normal (SVD guarantees unit length), centroid
 
+
+def _scan_oh_by_distance(mol_data, coords, c_pos):
+    """LEGACY coordinate-based hydroxyl detection — fallback only.
+
+    Finds the first non-ring oxygen within 1.6 A of ``c_pos`` and that oxygen's
+    hydrogen within 1.2 A, returning ``[O_idx, H_idx]`` (H omitted if none).
+    Kept as a fallback for molecule_data that predates ``oh_map`` (e.g. old
+    .pkl files) or lacks bond-graph connectivity. New data uses the bond graph
+    via ``_resolve_oh_to_remove``.
+    """
+    atoms_to_remove = []
+    ring_o_idx = mol_data['carbon_map'].get('ring_oxygen')
+    atom_types = mol_data['atom_types']
+
+    for i, atom_type in enumerate(atom_types):
+        if i >= len(coords):
+            break
+        if atom_type == 'O':
+            if ring_o_idx is not None and i == ring_o_idx:
+                continue
+            if np.linalg.norm(coords[i] - c_pos) < 1.6:
+                atoms_to_remove.append(i)
+                o_pos = coords[i]
+                for j, at in enumerate(atom_types):
+                    if at == 'H' and np.linalg.norm(coords[j] - o_pos) < 1.2:
+                        atoms_to_remove.append(j)
+                        break
+                break
+    return atoms_to_remove
+
+
+def _resolve_oh_to_remove(mol_data, carbon_name, coords, c_pos):
+    """Return [O_idx, H_idx] hydroxyl atoms to remove at ``carbon_name``.
+
+    Prefers the precomputed bond-graph ``oh_map``; falls back to the legacy
+    coordinate scan when ``oh_map`` is absent (old data) or has no entry for
+    this carbon. This is the safety net that keeps existing inputs working.
+    """
+    oh_map = mol_data.get('oh_map')
+    if oh_map and carbon_name in oh_map:
+        o_idx, h_idx = oh_map[carbon_name]
+        result = [o_idx]
+        if h_idx is not None:
+            result.append(h_idx)
+            print(f"  oh_map: remove O{o_idx} and H{h_idx} at {carbon_name}")
+        else:
+            print(f"  oh_map: remove O{o_idx} at {carbon_name} (no explicit H)")
+        return result
+
+    print(f"  oh_map miss at {carbon_name} - using legacy distance scan")
+    return _scan_oh_by_distance(mol_data, coords, c_pos)
+
+
 def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, anomeric='beta', linkage_name='1-6'):
 
     """
@@ -173,71 +226,15 @@ def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, ano
                 print(f"  Will remove O{o_idx} and H{h_idx} from KDO C1 (OH part of COOH)")
                 break  # Only remove the OH, not the C=O
     else:
-        oxygen_found = False
-        ring_o_idx = mol1_data['carbon_map'].get('ring_oxygen')  # ← NEW
-        
-        for i, atom_type in enumerate(mol1_data['atom_types']):
-            if i >= len(coords1):
-                break
-            if atom_type == 'O':
-                # NEW: Skip ring oxygen by index
-                if ring_o_idx is not None and i == ring_o_idx:
-                    print(f"  Skipping O{i} - ring oxygen")
-                    continue
-                
-                # Check if bonded to carbon1
-                dist = np.linalg.norm(coords1[i] - c1_pos)
-                if dist < 1.6:
-                    oxygen_found = True
-                    atoms_to_remove_mol1.append(i)
-        # for i, atom_type in enumerate(mol1_data['atom_types']):
-        #     if atom_type == 'O':
-        #         # Check if bonded to carbon1
-        #         dist = np.linalg.norm(coords1[i] - c1_pos)
-        #         if dist < 1.6:  # C-O bond is ~1.43Å
-        #             atoms_to_remove_mol1.append(i)
-                    o_pos = coords1[i]
-                    for j, at in enumerate(mol1_data['atom_types']):
-                        if at == 'H':
-                            if np.linalg.norm(coords1[j] - o_pos) < 1.2:
-                                atoms_to_remove_mol1.append(j)
-                                print(f"  Will remove O{i} and H{j} from donor")
-                                break
-                    break
-    
-    # For C2 (acceptor carbon) - remove its OH (always)
-    atoms_to_remove_mol2 = []
-    oxygen_found = False
-    ring_o_idx = mol2_data['carbon_map'].get('ring_oxygen')  # ← NEW
+        # Bond-graph hydroxyl lookup (falls back to legacy distance scan for
+        # old data without oh_map). mol1 is the donor at carbon1_name.
+        atoms_to_remove_mol1 = _resolve_oh_to_remove(
+            mol1_data, carbon1_name, coords1, c1_pos)
 
-    for i, atom_type in enumerate(mol2_data['atom_types']):
-        if i >= len(coords2):
-            break
-        if atom_type == 'O':
-            # NEW: Skip ring oxygen by index
-            if ring_o_idx is not None and i == ring_o_idx:
-                print(f"  Skipping O{i} - ring oxygen")
-                continue
-            
-            dist = np.linalg.norm(coords2[i] - c2_pos)
-            if dist < 1.6:
-                oxygen_found = True
-                atoms_to_remove_mol2.append(i)
-    # for i, atom_type in enumerate(mol2_data['atom_types']):
-    #     if atom_type == 'O':
-    #         dist = np.linalg.norm(coords2[i] - c2_pos)
-    #         if dist < 1.6:
-    #             atoms_to_remove_mol2.append(i)
-                
-                # Find and remove attached hydrogen
-                o_pos = coords2[i]
-                for j, at in enumerate(mol2_data['atom_types']):
-                    if at == 'H':
-                        if np.linalg.norm(coords2[j] - o_pos) < 1.2:
-                            atoms_to_remove_mol2.append(j)
-                            print(f"  Will remove O{i} and H{j} from acceptor")
-                            break
-                break
+    # For C2 (acceptor carbon) - remove its OH (always)
+    atoms_to_remove_mol2 = _resolve_oh_to_remove(
+        mol2_data, carbon2_name, coords2, c2_pos)
+
     return {
         'linkage': f"{anomeric} {linkage_name}",
         'oxygen_position': oxygen_pos.tolist(),
