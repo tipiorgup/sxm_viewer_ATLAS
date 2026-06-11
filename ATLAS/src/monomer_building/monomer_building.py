@@ -304,6 +304,68 @@ def find_anomeric_oxygen(mol, carbon_map):
 
     return anomeric_oxygen
 
+def compute_oh_map(mol, carbon_map):
+    """Bond-graph hydroxyl lookup: carbon name -> (oxygen_idx, hydrogen_idx).
+
+    For each mapped ring carbon ('C1', 'C2', ...) this finds the exocyclic
+    hydroxyl oxygen bonded to it (using RDKit connectivity, not coordinates)
+    and that oxygen's hydrogen. Ring oxygens and carbonyl (C=O double-bond)
+    oxygens are excluded; when a carbon has several candidate oxygens the one
+    with the fewest heavy neighbours (a free OH over an ether/ester) is chosen.
+
+    Returns:
+        dict mapping carbon name -> (oxygen_idx, hydrogen_idx). hydrogen_idx is
+        None when no explicit H is present. Carbons with no exocyclic OH are
+        omitted. Returns {} when carbon_map has no usable carbon entries.
+
+    These indices are stable across the rigid-body pipeline (atom order is
+    preserved by extract_rigid_monomer_data and translate_to_experimental_com),
+    so the same map is valid against 'absolute_coordinates' downstream.
+    """
+    oh_map = {}
+    ring_oxygen_idx = carbon_map.get('ring_oxygen')
+    ring_atoms = set(carbon_map.get('all_ring_carbons', []))
+    if ring_oxygen_idx is not None:
+        ring_atoms.add(ring_oxygen_idx)
+
+    for key, c_idx in carbon_map.items():
+        # Only real carbon entries like 'C1', 'C5' — skip 'ring_oxygen',
+        # 'all_ring_carbons', 'ring_type', etc.
+        if not (key.startswith('C') and key[1:].isdigit()):
+            continue
+
+        c_atom = mol.GetAtomWithIdx(c_idx)
+        best = None  # (n_heavy_neighbours, o_idx, h_idx)
+
+        for neighbor in c_atom.GetNeighbors():
+            if neighbor.GetSymbol() != 'O':
+                continue
+            o_idx = neighbor.GetIdx()
+            if o_idx == ring_oxygen_idx or o_idx in ring_atoms:
+                continue
+
+            bond = mol.GetBondBetweenAtoms(c_idx, o_idx)
+            if bond is not None and bond.GetBondType() == Chem.BondType.DOUBLE:
+                continue  # carbonyl oxygen, not a hydroxyl
+
+            h_idx = None
+            n_heavy = 0
+            for o_nbr in neighbor.GetNeighbors():
+                if o_nbr.GetSymbol() == 'H':
+                    if h_idx is None:
+                        h_idx = o_nbr.GetIdx()
+                else:
+                    n_heavy += 1
+
+            candidate = (n_heavy, o_idx, h_idx)
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+
+        if best is not None:
+            oh_map[key] = (best[1], best[2])
+
+    return oh_map
+
 def classify_anomeric_configuration(mol, conf_id, carbon_map, ring_normal, ring_centroid):
     """
     Classify the anomeric configuration as alpha or beta from 3D coordinates.
@@ -981,6 +1043,10 @@ def extract_rigid_monomer_data(conformers):
             'quaternion': quaternion.tolist(),
             'carbon_map': conf_data.get('carbon_map', {}),
             'anomer': conf_data.get('anomer', 'unknown'),
+            # Bond-graph hydroxyl lookup computed while the RDKit mol is still
+            # in hand; consumed by bonds_creation instead of distance-guessing.
+            'oh_map': compute_oh_map(mol, conf_data.get('carbon_map', {})),
+            'anomeric_oxygen_idx': conf_data.get('anomeric_oxygen_idx'),
         }
 
     return monomer_data
@@ -1024,6 +1090,8 @@ def translate_to_experimental_com(rigid_body_data, experimental_com):
             'quaternion': data['quaternion'],
             'translation_vector': translation_vector.tolist(),
             'anomer': data.get('anomer', 'unknown'),
+            'oh_map': data.get('oh_map', {}),
+            'anomeric_oxygen_idx': data.get('anomeric_oxygen_idx'),
         }
 
     return translated_data
