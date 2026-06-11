@@ -1918,26 +1918,37 @@ def is_sugar_ring_carbon(mol, atom_idx):
     return False
 
 def find_peptide_ca_atoms(mol):
-    """Find Cα atoms (chiral carbons bonded to N and C=O)"""
+    """Find Cα atoms: carbons bonded to a backbone N and a carbonyl C.
+
+    The backbone-Cα signature is being bonded to an amide N *and* to a
+    carbonyl carbon (C=O). Chirality is NOT required: glycine's Cα carries
+    two hydrogens and is not a chiral centre, so a chirality gate silently
+    drops every glycine and misaligns the sequential residue restoration
+    downstream. The N + carbonyl pattern alone is specific to backbone Cα
+    (side-chain amide/guanidinium carbons fail one of the two tests).
+    """
     ca_indices = []
     for atom in mol.GetAtoms():
-        if atom.GetSymbol() == 'C':
-            if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED:
-                neighbors = list(atom.GetNeighbors())
-                has_n = any(n.GetSymbol() == 'N' for n in neighbors)
-                has_carbonyl = False
-                
-                for n in neighbors:
-                    if n.GetSymbol() == 'C':
-                        for nn in n.GetNeighbors():
-                            if nn.GetSymbol() == 'O':
-                                bond = mol.GetBondBetweenAtoms(n.GetIdx(), nn.GetIdx())
-                                if bond and bond.GetBondType() == Chem.BondType.DOUBLE:
-                                    has_carbonyl = True
-                                    break
-                
-                if has_n and has_carbonyl:
-                    ca_indices.append(atom.GetIdx())
+        if atom.GetSymbol() != 'C':
+            continue
+
+        neighbors = list(atom.GetNeighbors())
+        has_n = any(n.GetSymbol() == 'N' for n in neighbors)
+        has_carbonyl = False
+
+        for n in neighbors:
+            if n.GetSymbol() == 'C':
+                for nn in n.GetNeighbors():
+                    if nn.GetSymbol() == 'O':
+                        bond = mol.GetBondBetweenAtoms(n.GetIdx(), nn.GetIdx())
+                        if bond and bond.GetBondType() == Chem.BondType.DOUBLE:
+                            has_carbonyl = True
+                            break
+            if has_carbonyl:
+                break
+
+        if has_n and has_carbonyl:
+            ca_indices.append(atom.GetIdx())
     return ca_indices
 
 def find_peptide_atom_range(mol, ca_indices):
