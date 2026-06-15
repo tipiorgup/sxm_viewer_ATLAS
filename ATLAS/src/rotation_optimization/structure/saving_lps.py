@@ -1480,8 +1480,15 @@ def snapshot_peptide_linker_positions(peptide_data):
 
     phenyl_match    = mol.GetSubstructMatch(_smarts('c1ccccc1'))
     oxadiazole_match = mol.GetSubstructMatch(_smarts('c1nnco1'))
-    linker_indices  = list(phenyl_match) + list(oxadiazole_match)
 
+    # The oxadiazole is the linker's unique fingerprint. Phe/Tyr/Trp aromatic
+    # side chains also match c1ccccc1, so without this gate a linker-less
+    # peptide snapshots a Phe ring here and later _restore_linker_by_smarts
+    # teleports a (different) aromatic ring onto it. Require the oxadiazole.
+    if not oxadiazole_match:
+        return {}
+
+    linker_indices  = list(phenyl_match) + list(oxadiazole_match)
     if not linker_indices:
         return {}
 
@@ -1513,6 +1520,11 @@ def _find_linker_ring_atoms(mol):
         elif (len(ring) == 5 and
               syms.count('N') == 2 and syms.count('O') == 1 and syms.count('C') == 2):
             oxadiazole = list(ring)
+
+    # No oxadiazole ⇒ no real linker. Any 6-C ring found here is a Phe/Tyr/Trp
+    # side chain; returning it causes restore/flatten/freeze to grab side chains.
+    if not oxadiazole:
+        return [], []
 
     return phenyl, oxadiazole
 

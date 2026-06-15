@@ -1141,6 +1141,11 @@ def _find_linker_ring_atoms(mol):
         elif (len(ring) == 5 and
               syms.count('N') == 2 and syms.count('O') == 1 and syms.count('C') == 2):
             oxadiazole = list(ring)
+    # No oxadiazole ⇒ no real linker. A linker-less peptide (e.g. a real protein
+    # like RNAse) only has Phe/Tyr/Trp 6-C rings here — freezing one pins a side
+    # chain during MD. Require the linker's unique oxadiazole fingerprint.
+    if not oxadiazole:
+        return [], []
     return phenyl, oxadiazole
 
 
