@@ -176,6 +176,14 @@ class OptimizationConfig:
     fixed_atoms: Optional[List[int]] = None
     reference_normals: Optional[Dict[int, np.ndarray]] = None
 
+    # Glycosidic trans restraint: list of (i, j, k, l) heavy-atom dihedrals held
+    # near 180° during phases 2 & 3 (instead of freezing these atoms in place,
+    # which would pin the bond length and prevent a stretched bond from relaxing).
+    torsion_constraints: Optional[List[tuple]] = None
+    torsion_min_deg: float = 175.0       # window keeps trans but lets phase 3 settle
+    torsion_max_deg: float = 185.0
+    torsion_force_constant: float = 1.0e4    # stiff enough to dominate MMFF torsion
+
     # Ring rotation
     enable_ring_rotation: bool = True
     ring_rotation_friction: float = DEFAULT_RING_ROTATION_FRICTION

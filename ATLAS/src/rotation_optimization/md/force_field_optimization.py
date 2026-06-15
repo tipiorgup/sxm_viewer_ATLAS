@@ -41,7 +41,20 @@ def setup_force_field(mol):
     
     return props, use_mmff
 
-def get_ff_forces(mol, props, use_mmff, n_atoms, max_force):
+def _apply_torsion_constraints(ff, torsion_constraints):
+    """Add 180° trans dihedral restraints to an MMFF force field (no-op if empty).
+
+    Each entry is (i, j, k, l, min_deg, max_deg, force_constant). Used instead of
+    freezing the glycosidic atoms in place so the bond can relax to length while
+    the dihedral is held trans.
+    """
+    if not torsion_constraints:
+        return
+    for (i, j, k, l, dmin, dmax, fk) in torsion_constraints:
+        ff.MMFFAddTorsionConstraint(i, j, k, l, False, dmin, dmax, fk)
+
+
+def get_ff_forces(mol, props, use_mmff, n_atoms, max_force, torsion_constraints=None):
     """
     Get forces from force field.
     
@@ -60,6 +73,7 @@ def get_ff_forces(mol, props, use_mmff, n_atoms, max_force):
         if ff is None:
             return np.zeros((n_atoms, 3))
 
+        _apply_torsion_constraints(ff, torsion_constraints)
         ff.Initialize()
         grad = np.array([ff.CalcGrad()[i] for i in range(n_atoms * 3)])
         forces = -grad.reshape((n_atoms, 3))
@@ -372,7 +386,7 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
                           pyranose_rings=None,
                           initial_ring_coms=None,
                           molecule_data_dict=None, stm_data=None,
-                          trajectory_path=None):
+                          trajectory_path=None, torsion_constraints=None):
     """
     Phase 2: Compression with rising slab using FULL MD.
 
@@ -443,13 +457,15 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
             t0 = time.perf_counter()
             minimize_with_constraint_no_com(
                 mol_copy, props, use_mmff, fixed_atoms,
-                n_atoms, config.minimize_iterations)
+                n_atoms, config.minimize_iterations,
+                torsion_constraints=torsion_constraints)
             t_minimize += time.perf_counter() - t0
             velocities = np.random.randn(n_atoms, 3) * 0.01
             positions = get_positions(conf, n_atoms)
 
         t0 = time.perf_counter()
-        ff_forces = get_ff_forces(mol_copy, props, use_mmff, n_atoms, config.max_force)
+        ff_forces = get_ff_forces(mol_copy, props, use_mmff, n_atoms, config.max_force,
+                                  torsion_constraints=torsion_constraints)
         t_ff_forces += time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -593,8 +609,8 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
 
     return slab_z, fixed_atoms, last_valid_mol
 
-def minimize_with_constraint_no_com(mol, props, use_mmff, fixed_atoms, 
-                              n_atoms, max_iterations):
+def minimize_with_constraint_no_com(mol, props, use_mmff, fixed_atoms,
+                              n_atoms, max_iterations, torsion_constraints=None):
     """
     Perform energy minimization with position constraints.
     """
@@ -609,7 +625,10 @@ def minimize_with_constraint_no_com(mol, props, use_mmff, fixed_atoms,
             for atom_idx in fixed_atoms:
                 if 0 <= atom_idx < n_atoms:
                     ff.MMFFAddPositionConstraint(atom_idx, 0.0, 1e15)
-        
+
+        # Hold glycosidic bonds trans (180°) without pinning their positions
+        _apply_torsion_constraints(ff, torsion_constraints)
+
         conf = mol.GetConformer()
         
         # Find pairs of atoms that are far apart (>10 Å)
@@ -1004,14 +1023,29 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     fixed_atoms = config.fixed_atoms.copy() if config.fixed_atoms else []
     from .utils import save_molecule
 
-    if fixed_atoms:
-        print(f"\n  Fixed atoms from config: {len(fixed_atoms)}")
+    # Glycosidic trans dihedrals: frozen rigid (positions) in phase 1 as an anchor,
+    # then held as a 180° torsion restraint in phases 2 & 3 so the bond can relax
+    # to length while staying trans. fixed_atoms (linker + PEtN) stay position-
+    # frozen in ALL phases; lipids are free.
+    torsion_constraints = [
+        (i, j, k, l, config.torsion_min_deg, config.torsion_max_deg,
+         config.torsion_force_constant)
+        for (i, j, k, l) in (config.torsion_constraints or [])
+    ]
+    glyco_atoms = sorted({a for t in torsion_constraints for a in t[:4]})
 
-    # PHASE 1: CONSTRAINED MINIMIZATION
+    if fixed_atoms:
+        print(f"\n  Fixed atoms from config: {len(fixed_atoms)} (frozen all phases)")
+    if torsion_constraints:
+        print(f"  Trans torsion restraints: {len(torsion_constraints)} "
+              f"(phase 1 freezes {len(glyco_atoms)} atoms; phases 2-3 restrain @180°)")
+
+    # PHASE 1: CONSTRAINED MINIMIZATION (glycosidic atoms frozen as trans anchor)
+    phase1_fixed = list(dict.fromkeys(fixed_atoms + glyco_atoms))
     t0 = time.perf_counter()
     mol_copy = run_minimization_phase_no_cog(
         mol_copy, props, use_mmff,
-        fixed_atoms,
+        phase1_fixed,
         n_atoms, config,
         trajectory_path=trajectory_path
     )
@@ -1030,7 +1064,8 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         xy_constrained_atoms=lipid_tail_indices or [],
         molecule_data_dict=molecule_data_dict,
         stm_data=stm_data,
-        trajectory_path=trajectory_path
+        trajectory_path=trajectory_path,
+        torsion_constraints=torsion_constraints
     )
     t_phase2 = time.perf_counter() - t0
 
@@ -1041,10 +1076,13 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     # PHASE 3: FINAL MINIMIZATION WITH LINKER STILL FROZEN
 
     t0 = time.perf_counter()
+    # Phase 3: linker + PEtN stay frozen (fixed_atoms); glycosidic held trans;
+    # everything else (incl. lipids, ring COMs) free to relax the whole structure.
     mol_copy = run_final_minimization_phase(
         mol_copy, props, use_mmff, config,
         fixed_atoms=fixed_atoms,
-        trajectory_path=trajectory_path
+        trajectory_path=trajectory_path,
+        torsion_constraints=torsion_constraints
     )
     t_phase3 = time.perf_counter() - t0
 
@@ -1169,7 +1207,8 @@ def fix_overvalent_carbons(mol):
 def run_final_minimization_phase(mol_copy, props, use_mmff,
                                  config: OptimizationConfig,
                                  fixed_atoms=None,
-                                 trajectory_path=None):
+                                 trajectory_path=None,
+                                 torsion_constraints=None):
     """
     Phase 4: Final gentle minimization without constraints.
     fixed_atoms: list of atom indices to pin (e.g. linker ring atoms).
@@ -1187,6 +1226,8 @@ def run_final_minimization_phase(mol_copy, props, use_mmff,
                 for atom_idx in fixed_atoms:
                     if 0 <= atom_idx < mol_copy.GetNumAtoms():
                         ff.MMFFAddPositionConstraint(atom_idx, 0.0, 1e15)
+                # Linker/PEtN stay frozen above; glycosidic bonds held trans here
+                _apply_torsion_constraints(ff, torsion_constraints)
                 ff.Initialize()
                 ff.Minimize(maxIts=steps_per_update)  # Only 4 steps at a time
             else:

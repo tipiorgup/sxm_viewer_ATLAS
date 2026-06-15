@@ -1174,13 +1174,14 @@ def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices,
     print("="*70)
 
     fixed_atoms = []
+    torsion_constraints = []
 
     if peptide_data is not None:
         # ====================================================================
-        # GLYCOPEPTIDE PATH: Fix trans bond dihedrals
+        # GLYCOPEPTIDE PATH: glycosidic bonds → trans torsion restraints
         # ====================================================================
         print("\n→ Structure type: GLYCOPEPTIDE")
-        print("→ Constraint mode: Trans bond dihedral atoms")
+        print("→ Constraint mode: trans torsion restraints (glyco) + linker freeze")
         print("-" * 60)
 
         for bond_info in enforced_atoms:
@@ -1188,10 +1189,13 @@ def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices,
             aa_type = bond_info.get('aa_type', 'Unknown')
             glyc_type = bond_info.get('glycosylation_type', 'Unknown')
 
-            fixed_atoms.extend(dihedral_atoms)
-            print(f"  {aa_type} ({glyc_type}): atoms {dihedral_atoms}")
+            # Hold trans via a 180° dihedral restraint (phases 2-3), NOT by
+            # freezing these atoms — freezing both bonded atoms pins the bond
+            # length so a stretched bond could never relax.
+            torsion_constraints.append(tuple(dihedral_atoms))
+            print(f"  {aa_type} ({glyc_type}): trans dihedral {dihedral_atoms} → torsion restraint")
 
-        print(f"\n  ✓ Collected {len(fixed_atoms)} trans bond constraint atoms")
+        print(f"\n  ✓ Collected {len(torsion_constraints)} trans torsion restraints")
 
         # Freeze linker ring atoms so they stay flat (Z=0) during all MD phases
         if mol is not None:
@@ -1217,10 +1221,11 @@ def gather_fixed_atoms(peptide_data, enforced_atoms, lipid_tail_indices,
     fixed_atoms = list(set(fixed_atoms))
 
     print("\n" + "="*70)
-    print(f"TOTAL FIXED ATOMS: {len(fixed_atoms)}")
+    print(f"TOTAL FIXED ATOMS: {len(fixed_atoms)}  |  "
+          f"TORSION RESTRAINTS: {len(torsion_constraints)}")
     print("="*70)
 
-    return fixed_atoms
+    return fixed_atoms, torsion_constraints
 
 # ============================================================================
 # FORCE FIELD OPTIMIZATION
@@ -1294,7 +1299,7 @@ def check_and_fix_geometry(final_with_h):
 def run_optimization(final_with_h, fixed_atoms, reference_normals,
                     name, conformers_selection, molecule_data_dict, lipid_tail_indices,
                     stm_npy_path=None, pyranose_rings_no_h=None, initial_ring_coms=None,
-                    enable_phase1_kicks=False):
+                    enable_phase1_kicks=False, torsion_constraints=None):
     """
     Run force field optimization using constants.
     
@@ -1339,6 +1344,7 @@ def run_optimization(final_with_h, fixed_atoms, reference_normals,
         
         # Constraints
         fixed_atoms=fixed_atoms,
+        torsion_constraints=torsion_constraints,
         reference_normals=reference_normals,
         enable_ring_rotation=True,
         ring_rotation_friction=constants.DEFAULT_RING_ROTATION_FRICTION,

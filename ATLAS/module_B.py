@@ -331,10 +331,14 @@ def main():
                             print(f"  Freezing {len(lipid_tail_indices)} linker ring atoms (phenyl + oxadiazole)")
 
                     with timer.section(f"{tag}   Gather fixed atoms", level=3):
-                        fixed_atoms = lpf.gather_fixed_atoms(
+                        fixed_atoms, torsion_constraints = lpf.gather_fixed_atoms(
                             peptide_data, enforced_atoms, lipid_tail_indices,
                             mol=final_with_h
                         )
+                        # PEtN nitrogens stay fixed in ALL phases (linker freeze is
+                        # handled inside gather_fixed_atoms; lipids remain free).
+                        if petn_n_indices:
+                            fixed_atoms = list(set(fixed_atoms + petn_n_indices))
                         reference_normals = None
 
                     with timer.section(f"{tag}   Geometry check/fix", level=3):
@@ -355,7 +359,8 @@ def main():
                             pyranose_rings_no_h=pyranose_rings_no_h,
                             initial_ring_coms=initial_ring_coms,
                             stm_npy_path=stm_npz_path,
-                            enable_phase1_kicks=args.phase1_kicks
+                            enable_phase1_kicks=args.phase1_kicks,
+                            torsion_constraints=torsion_constraints
                         )
 
                     with timer.section(f"{tag}   Save results", level=3):
