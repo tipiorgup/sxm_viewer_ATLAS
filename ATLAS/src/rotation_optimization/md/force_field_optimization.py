@@ -473,10 +473,6 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
             gravity_forces = calculate_stm_surface_forces(
                 positions, masses, config.gravity, stm_data
             )
-        elif molecule_data_dict is not None:
-            gravity_forces = calculate_gravity_forces_with_multipliers(
-                positions, masses, config.gravity, molecule_data_dict
-            )
         else:
             gravity_forces = calculate_gravity_forces(
                 positions, masses, config.gravity
@@ -579,9 +575,7 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
     total_phase = time.perf_counter() - phase_start
     n_min_calls = max(1, n_steps // max(1, config.minimize_interval))
 
-    gravity_label = ('STM'        if stm_data         is not None else
-                     'multiplier' if molecule_data_dict is not None else
-                     'uniform')
+    gravity_label = 'STM' if stm_data is not None else 'uniform'
 
     unaccounted = total_phase - (t_ff_forces + t_gravity_forces +
                                  t_slab_forces + t_velocity_update + t_minimize)
