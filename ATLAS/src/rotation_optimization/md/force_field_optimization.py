@@ -1594,11 +1594,13 @@ def build_stm_interpolator(stm_npz_path):
     print(f"  Y range: [{y_unique[0]:.2f}, {y_unique[-1]:.2f}] Å")
     print(f"  Z range: [{z_grid.min():.4f}, {z_grid.max():.4f}] (raw units)")
 
-    # Normalize z to [0, 1]
+    # Normalize z to [1, 2] — INVERTED mapping:
+    #   darkest pixel  (z_min) -> 2.0  (most compression)
+    #   brightest pixel (z_max) -> 1.0  (least compression)
     z_min  = z_grid.min()
     z_max  = z_grid.max()
-    z_norm = 1.0 + (z_grid - z_min) / (z_max - z_min)
-    print(f"  Normalized z to [0, 1]")
+    z_norm = 2.0 - (z_grid - z_min) / (z_max - z_min)
+    print(f"  Normalized z to [1, 2] (inverted: dark=2, bright=1)")
 
     # Gaussian smoothing to suppress noise
     # sigma in pixels derived from grid spacing
@@ -1643,7 +1645,7 @@ def calculate_stm_surface_forces(positions, masses, gravity, stm_data):
     Notes:
         - Atoms below z=0: no force
         - Atoms outside STM scan area: fall back to uniform gravity
-        - h_norm in [1, 2]: dark regions = 1× gravity, bright = 2× gravity
+        - h_norm in [1, 2] (INVERTED): bright regions = 1× gravity, dark = 2× gravity
         - h_norm clamped to [1, 2] to handle spline overshoot
     """
     LAMBDA_DECAY = 1.0
