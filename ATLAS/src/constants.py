@@ -68,12 +68,14 @@ def get_env_int(var_name, default):
 # Geometry tolerances
 # ============================================================================
 
-DEFAULT_BOND_TOLERANCE = get_env_float('DEFAULT_BOND_TOLERANCE', 0.00015)
+DEFAULT_BOND_TOLERANCE = get_env_float('DEFAULT_BOND_TOLERANCE', 0.10)
 """Å — maximum allowed deviation in ring bond length before a ring is
-considered deformed and its atoms are frozen."""
+considered deformed and Phase 2 reverts it to the last valid geometry.
+Overridable via the DEFAULT_BOND_TOLERANCE env var (e.g. in the job script)."""
 
-DEFAULT_ANGLE_TOLERANCE = get_env_float('DEFAULT_ANGLE_TOLERANCE', 1)
-"""degrees — maximum allowed deviation in ring bond angle."""
+DEFAULT_ANGLE_TOLERANCE = get_env_float('DEFAULT_ANGLE_TOLERANCE', 10)
+"""degrees — maximum allowed deviation in ring bond angle before a ring is
+considered deformed. Overridable via the DEFAULT_ANGLE_TOLERANCE env var."""
 
 EPSILON = get_env_float('EPSILON', 1e-8)
 """Small number used to guard against division by zero in vector operations."""
