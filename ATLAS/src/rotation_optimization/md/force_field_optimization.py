@@ -10,7 +10,7 @@ from ..geometry.geometry_utils import (
 )
 from .ring_functions import (
     detect_pyranose_rings, get_ring_reference_geometry,
-    check_and_update_rings,
+    check_and_update_rings, check_ring_integrity,
     apply_ring_constraints_dual_mode,
 )
 from .config import OptimizationConfig, RingConstraintConfig, RingRotationUnit
@@ -413,6 +413,15 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
     slab_z = np.min(positions[:, 2]) - 2.0
     print(f"  Initial slab position: z = {slab_z:.2f} Å")
 
+    # Ring-integrity safeguard baseline: the geometry leaving Phase 1 is the last
+    # KNOWN-GOOD state. (The last_valid_mol passed in is pre-Phase-1 and stale.)
+    last_valid_mol = Chem.Mol(mol_copy)
+    if ring_references:
+        print(f"  Ring safeguard active: {len(ring_references)} rings, "
+              f"check every {config.check_rings_interval} steps "
+              f"(bond<{config.ring_tolerance_bond:.3f} Å, "
+              f"angle<{config.ring_tolerance_angle:.1f}°)")
+
     initial_xy = None
     if xy_constrained_atoms:
         initial_xy = positions[xy_constrained_atoms, :2].copy()
@@ -525,6 +534,27 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
         set_positions(conf, new_positions, n_atoms)
         t_velocity_update += time.perf_counter() - t0
 
+        # --- Ring-integrity safeguard ---------------------------------------
+        # Every check_rings_interval steps, compare each pyranose ring's internal
+        # geometry (bonds/angles) to its as-placed chair reference. If all rings
+        # are within tolerance, snapshot the current state as the new "last valid".
+        # If any ring has distorted past tolerance, revert to that last-valid
+        # geometry and kill the kinetic energy so the slab can't keep crushing it.
+        if (ring_references and config.check_rings_interval > 0
+                and step > 0 and step % config.check_rings_interval == 0):
+            rings_ok, _ = check_ring_integrity(
+                mol_copy, ring_references,
+                config.ring_tolerance_bond, config.ring_tolerance_angle
+            )
+            if rings_ok:
+                last_valid_mol = Chem.Mol(mol_copy)
+            else:
+                lv_positions = get_positions(last_valid_mol.GetConformer(), n_atoms)
+                set_positions(conf, lv_positions, n_atoms)
+                velocities = np.random.randn(n_atoms, 3) * 0.01
+                print(f"  ⟲ Step {step}: ring distortion beyond tolerance "
+                      f"→ reverted to last valid ring geometry")
+
         step_times.append(time.perf_counter() - step_start)
 
         if step % config.slab_step_interval == 0 and step > 0:
@@ -624,7 +654,7 @@ def minimize_with_constraint_no_com(mol, props, use_mmff, fixed_atoms,
         _apply_torsion_constraints(ff, torsion_constraints)
 
         conf = mol.GetConformer()
-        
+
         # Find pairs of atoms that are far apart (>10 Å)
         for i in range(0, n_atoms, 20):  # Sample every 20th atom
             for j in range(i+20, n_atoms, 20):
@@ -883,10 +913,11 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     print(f"  Ring rotation: {'enabled' if config.enable_ring_rotation else 'disabled'}")
     print(f"  Save images: {config.save_images}")
     
-    trajectory_path = f"{config.output_name}_trajectory.sdf"
-    if os.path.exists(trajectory_path):
-        os.remove(trajectory_path)
-    print(f"\n Trajectory will be saved to: {trajectory_path}")
+    # trajectory_path = f"{config.output_name}_trajectory.sdf"
+    # if os.path.exists(trajectory_path):
+    #     os.remove(trajectory_path)
+    # print(f"\n Trajectory will be saved to: {trajectory_path}")
+    trajectory_path = None  # intermediate trajectory disabled (None -> appends are no-op)
 
     # Setup output directory
     if config.save_images:
@@ -1045,8 +1076,8 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     )
     t_phase1 = time.perf_counter() - t0
 
-    save_molecule(mol_copy, f"{config.output_name}_phase1_minimized", file_format='sdf')
-    print(f"  💾 Saved: {config.output_name}_phase1_minimized.sdf")
+    # save_molecule(mol_copy, f"{config.output_name}_phase1_minimized", file_format='sdf')
+    # print(f"  💾 Saved: {config.output_name}_phase1_minimized.sdf")
 
     # PHASE 2: COMPRESSION
 
@@ -1064,8 +1095,8 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     t_phase2 = time.perf_counter() - t0
 
 
-    save_molecule(mol_copy, f"{config.output_name}_phase2_compressed", file_format='sdf')
-    print(f"  💾 Saved: {config.output_name}_phase2_compressed.sdf")
+    # save_molecule(mol_copy, f"{config.output_name}_phase2_compressed", file_format='sdf')
+    # print(f"  💾 Saved: {config.output_name}_phase2_compressed.sdf")
 
     # PHASE 3: FINAL MINIMIZATION WITH LINKER STILL FROZEN
 
@@ -1476,7 +1507,7 @@ def run_minimization_phase(mol_copy, props, use_mmff, fixed_atoms,
 
     return mol_copy
 
-def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms, 
+def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
                            n_atoms, config: OptimizationConfig,trajectory_path=None):
     """
     Phase 2: Energy minimization with ring constraints (Avogadro style).
