@@ -34,11 +34,9 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
 
         self.yaml_le, yaml_row = self._file_row("Browse…", "YAML files (*.yml *.yaml);;All files (*)")
         self.csv_le,  csv_row  = self._file_row("Browse…", "CSV files (*.csv);;All files (*)")
-        self.npz_le,  npz_row  = self._file_row("Browse…", "NPZ files (*.npz);;All files (*)")
 
         form.addRow("Config YAML:", yaml_row)
         form.addRow("Positions CSV:", csv_row)
-        form.addRow("STM grid NPZ (optional):", npz_row)
         root.addLayout(form)
 
         # Parameters
@@ -122,11 +120,8 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
                 stem = Path(self.viewer.last_preview[0]).stem
             if stem:
                 csv_guess = Path(stem + "_positions.csv")
-                npz_guess = Path(stem + "_positions.npz")
                 if csv_guess.exists():
                     self.csv_le.setText(str(csv_guess.resolve()))
-                if npz_guess.exists():
-                    self.npz_le.setText(str(npz_guess.resolve()))
         except Exception:
             pass
 
@@ -137,7 +132,6 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
     def _run(self):
         yaml_path = self.yaml_le.text().strip()
         csv_path  = self.csv_le.text().strip()
-        npz_path  = self.npz_le.text().strip()
 
         missing = []
         if not yaml_path:
@@ -149,9 +143,6 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
             missing.append("Positions CSV not selected.")
         elif not Path(csv_path).is_file():
             missing.append(f"Positions CSV not found:\n  {csv_path}")
-
-        if npz_path and not Path(npz_path).is_file():
-            missing.append(f"STM grid NPZ not found:\n  {npz_path}")
 
         if missing:
             QtWidgets.QMessageBox.warning(
@@ -177,10 +168,7 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
             return
 
         cfg["circle_input_path"] = csv_path
-        if npz_path:
-            cfg["stm_grid_path"] = npz_path
-        else:
-            cfg.pop("stm_grid_path", None)
+        cfg.pop("stm_grid_path", None)
 
         results_dir = Path(csv_path).parent / "results"
         results_dir.mkdir(exist_ok=True)
@@ -197,7 +185,6 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
         self._append(f"[ATLAS] Results dir: {results_dir}")
         self._append(f"[ATLAS] Config:      {yaml_path}")
         self._append(f"[ATLAS] CSV:         {csv_path}")
-        self._append(f"[ATLAS] NPZ:         {npz_path}")
         self._append("-" * 60)
 
         self._process = QtCore.QProcess(self)
