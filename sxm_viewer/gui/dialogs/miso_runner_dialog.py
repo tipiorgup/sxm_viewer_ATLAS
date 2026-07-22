@@ -6,15 +6,15 @@ from pathlib import Path
 from ..._shared import QtCore, QtWidgets, QtGui
 
 
-class ATLASRunnerDialog(QtWidgets.QDialog):
-    """Run the ATLAS pipeline (module_B.py) with a YAML config + CSV + NPZ."""
+class MISORunnerDialog(QtWidgets.QDialog):
+    """Run the MISO pipeline (module_B.py) with a YAML config + CSV + NPZ."""
 
-    _ATLAS_DIR = Path(__file__).resolve().parents[3] / "ATLAS"
+    _MISO_DIR = Path(__file__).resolve().parents[3] / "MISO"
 
     def __init__(self, viewer, parent=None):
         super().__init__(parent or viewer)
         self.viewer = viewer
-        self.setWindowTitle("ATLAS Runner")
+        self.setWindowTitle("MISO Runner")
         self.setMinimumWidth(620)
         self._process = None
         self._tmp_yaml = None
@@ -74,7 +74,7 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
 
         # Run / Stop
         btn_row = QtWidgets.QHBoxLayout()
-        self.run_btn = QtWidgets.QPushButton("Run ATLAS")
+        self.run_btn = QtWidgets.QPushButton("Run MISO")
         self.run_btn.clicked.connect(self._run)
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.stop_btn.setEnabled(False)
@@ -147,7 +147,7 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
         if missing:
             QtWidgets.QMessageBox.warning(
                 self, "Missing files",
-                "Cannot run ATLAS — please fix the following:\n\n" + "\n\n".join(missing)
+                "Cannot run MISO — please fix the following:\n\n" + "\n\n".join(missing)
             )
             return
 
@@ -182,9 +182,9 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
         self._tmp_yaml.close()
 
         self.log.clear()
-        self._append(f"[ATLAS] Results dir: {results_dir}")
-        self._append(f"[ATLAS] Config:      {yaml_path}")
-        self._append(f"[ATLAS] CSV:         {csv_path}")
+        self._append(f"[MISO] Results dir: {results_dir}")
+        self._append(f"[MISO] Config:      {yaml_path}")
+        self._append(f"[MISO] CSV:         {csv_path}")
         self._append("-" * 60)
 
         self._process = QtCore.QProcess(self)
@@ -196,15 +196,15 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
         env = QtCore.QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUTF8", "1")
         existing_pp = env.value("PYTHONPATH", "")
-        atlas_str = str(self._ATLAS_DIR)
-        env.insert("PYTHONPATH", f"{atlas_str};{existing_pp}" if existing_pp else atlas_str)
+        miso_str = str(self._MISO_DIR)
+        env.insert("PYTHONPATH", f"{miso_str};{existing_pp}" if existing_pp else miso_str)
         env.insert("DEFAULT_COMPRESSION_STEPS", str(self.comp_spin.value()))
         env.insert("DEFAULT_GRAVITY", str(self.gravity_spin.value()))
         self._process.setProcessEnvironment(env)
 
         args = [
             "-X", "utf8",
-            str(self._ATLAS_DIR / "module_B.py"),
+            str(self._MISO_DIR / "module_B.py"),
             "--input_file", self._tmp_yaml.name,
             "--iterations", str(self.iter_spin.value()),
             "--n_polymers", str(self.poly_spin.value()),
@@ -218,7 +218,7 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
     def _stop(self):
         if self._process and self._process.state() != QtCore.QProcess.NotRunning:
             self._process.kill()
-            self._append("[ATLAS] Stopped by user.")
+            self._append("[MISO] Stopped by user.")
 
     def _on_stdout(self):
         data = self._process.readAllStandardOutput().data().decode(errors="replace")
@@ -230,7 +230,7 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
 
     def _on_finished(self, exit_code, exit_status):
         self._append("-" * 60)
-        self._append(f"[ATLAS] Finished (exit code {exit_code})")
+        self._append(f"[MISO] Finished (exit code {exit_code})")
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._cleanup_tmp()
@@ -244,7 +244,7 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
         try:
             from rdkit import Chem
         except ImportError:
-            self._append("[ATLAS] RDKit not available — skipping mol/mol2 export.")
+            self._append("[MISO] RDKit not available — skipping mol/mol2 export.")
             return
         sdf_files = list(results_dir.glob("*.sdf"))
         converted = 0
@@ -259,9 +259,9 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
                 Chem.MolToMol2File(mol, str(results_dir / f"{stem}.mol2"))
                 converted += 1
             except Exception as e:
-                self._append(f"[ATLAS] Could not convert {sdf_path.name}: {e}")
+                self._append(f"[MISO] Could not convert {sdf_path.name}: {e}")
         if converted:
-            self._append(f"[ATLAS] Converted {converted} SDF → mol + mol2")
+            self._append(f"[MISO] Converted {converted} SDF → mol + mol2")
 
     def _cleanup_tmp(self):
         if self._tmp_yaml:

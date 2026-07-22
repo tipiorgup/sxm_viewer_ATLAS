@@ -1,4 +1,4 @@
-# ATLAS
+# MISO
 
 **Author:** CLGF  
 **Journal:** Journal of Chemical Information and Modeling (JCIM)  

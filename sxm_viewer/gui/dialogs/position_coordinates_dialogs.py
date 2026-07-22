@@ -5,7 +5,7 @@ from ..._shared import QtCore, QtWidgets
 
 
 class PositionCoordinatesDialog(QtWidgets.QDialog):
-    """Pick XY positions and heights exactly as the ATLAS demo (stream.py).
+    """Pick XY positions and heights exactly as the MISO demo (stream.py).
 
     The image, pixel size and coordinate formula are taken from the demo's
     ``load_sxm_file`` + ``calculate_coordinates`` so the CSV/NPZ produced here
@@ -38,9 +38,9 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
 
     # ------------------------------------------------------------------ loading
     def _demo_loader_dir(self):
-        """Directory holding the ATLAS demo ``sxm_loader.py``."""
+        """Directory holding the MISO demo ``sxm_loader.py``."""
         repo = Path(__file__).resolve().parents[3]
-        for rel in (("ATLAS_demo", "app", "src"), ("ATLAS", "src", "src_stm")):
+        for rel in (("MISO_demo", "app", "src"), ("MISO", "src", "src_stm")):
             cand = repo.joinpath(*rel)
             if (cand / "sxm_loader.py").exists():
                 return cand
@@ -98,7 +98,7 @@ class PositionCoordinatesDialog(QtWidgets.QDialog):
             return
         loader_dir = self._demo_loader_dir()
         if loader_dir is None:
-            self._load_error = "ATLAS demo sxm_loader.py not found."
+            self._load_error = "MISO demo sxm_loader.py not found."
             return
         if str(loader_dir) not in sys.path:
             sys.path.insert(0, str(loader_dir))

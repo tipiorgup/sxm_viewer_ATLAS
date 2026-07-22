@@ -7,7 +7,7 @@ pywin32>=306; platform_system == "Windows"
 # For loading .env automatically in the launcher
 python-dotenv==1.0.1
 
-# ATLAS pipeline dependencies
+# MISO pipeline dependencies
 rdkit>=2024.0
 openbabel-wheel>=3.1.1
 PyYAML>=6.0

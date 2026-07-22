@@ -6109,9 +6109,9 @@ QLabel:hover {{
         dlg = PositionCoordinatesDialog(self, parent=self)
         dlg.show()
 
-    def on_run_atlas(self):
-        from .dialogs.atlas_runner_dialog import ATLASRunnerDialog
-        dlg = ATLASRunnerDialog(self, parent=self)
+    def on_run_miso(self):
+        from .dialogs.miso_runner_dialog import MISORunnerDialog
+        dlg = MISORunnerDialog(self, parent=self)
         dlg.show()
 
     def on_open_avogadro(self):

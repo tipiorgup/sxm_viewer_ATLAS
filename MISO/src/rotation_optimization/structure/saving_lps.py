@@ -1257,32 +1257,32 @@ def export_complete_structure_with_petn_and_lipids(
     restore_ring_positions_from_snapshot(final_mol, ring_snapshot)
 
     if filename is not None:
-        # Write SDF using manual approach to preserve ALL bonds
-        print(f"\nWriting to {filename}.sdf...")
-        
-        # Method 1: Try standard writer first
-        writer = Chem.SDWriter(f"{filename}.sdf")
-        writer.SetKekulize(False)
-        
-        # Write without any modifications
-        try:
-            writer.write(final_mol)
-            writer.close()
-            print(f"  ✓ Standard SDF write successful")
-        except Exception as e:
-            print(f"  ✗ Standard write failed: {e}")
-            writer.close()
-        
-        # Method 2: Also write as MOL block (raw format)
-        try:
-            mol_block = Chem.MolToMolBlock(final_mol, kekulize=False)
-            with open(f"{filename}_raw.mol", 'w') as f:
-                f.write(mol_block)
-            print(f"  ✓ Raw MOL file written to {filename}_raw.mol")
-        except Exception as e:
-            print(f"  ✗ MOL block write failed: {e}")
-    
-        
+        # Built-structure artifacts disabled: only the final *_optimized.sdf is kept.
+        # # Write SDF using manual approach to preserve ALL bonds
+        # print(f"\nWriting to {filename}.sdf...")
+        #
+        # # Method 1: Try standard writer first
+        # writer = Chem.SDWriter(f"{filename}.sdf")
+        # writer.SetKekulize(False)
+        #
+        # # Write without any modifications
+        # try:
+        #     writer.write(final_mol)
+        #     writer.close()
+        #     print(f"  ✓ Standard SDF write successful")
+        # except Exception as e:
+        #     print(f"  ✗ Standard write failed: {e}")
+        #     writer.close()
+        #
+        # # Method 2: Also write as MOL block (raw format)
+        # try:
+        #     mol_block = Chem.MolToMolBlock(final_mol, kekulize=False)
+        #     with open(f"{filename}_raw.mol", 'w') as f:
+        #         f.write(mol_block)
+        #     print(f"  ✓ Raw MOL file written to {filename}_raw.mol")
+        # except Exception as e:
+        #     print(f"  ✗ MOL block write failed: {e}")
+
         print(f"\nFinal molecule statistics:")
         print(f"  Total atoms: {final_mol.GetNumAtoms()}")
         print(f"  Total bonds: {final_mol.GetNumBonds()}")
@@ -1418,14 +1418,14 @@ def export_complete_glycopeptide(
     
     print("="*70)
     
-    # Write file
+    # Write file  (disabled: only the final *_optimized.sdf is kept)
     if filename:
-        writer = Chem.SDWriter(f"{filename}.sdf")
-        writer.SetKekulize(False)
-        writer.write(final_mol)
-        writer.close()
-        
-        print(f"\n✓ Saved to {filename}.sdf")
+        # writer = Chem.SDWriter(f"{filename}.sdf")
+        # writer.SetKekulize(False)
+        # writer.write(final_mol)
+        # writer.close()
+        #
+        # print(f"\n✓ Saved to {filename}.sdf")
         print(f"  Total atoms: {final_mol.GetNumAtoms()}")
         print(f"  Total bonds: {final_mol.GetNumBonds()}")
     
