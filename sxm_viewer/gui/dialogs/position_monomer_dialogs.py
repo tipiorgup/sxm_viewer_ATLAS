@@ -179,6 +179,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
 
         self._updating = False
         self._place_cid = None
+        self._func_cid = None     # canvas pick for amino-acid functional point
         self._templates = {}      # row index -> template dict
         self._instances = []      # list of instance dicts
         self._overlay_artists = []
@@ -290,6 +291,20 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self.place_btn.setEnabled(loaded)
         self.place_btn.toggled.connect(self._on_place_toggled)
         form_box.addWidget(self.place_btn)
+
+        # Amino-acid only: a second point for the side-chain functional group
+        # (exported as functional_position for the peptide residue).
+        self.func_btn = QtWidgets.QPushButton("Set functional pt: OFF")
+        self.func_btn.setCheckable(True)
+        self.func_btn.setEnabled(False)
+        self.func_btn.setToolTip("Click the image to set the side-chain functional-group "
+                                 "point for the selected amino acid (functional_position).")
+        self.func_btn.toggled.connect(self._on_func_toggled)
+        form_box.addWidget(self.func_btn)
+        self.clear_func_btn = QtWidgets.QPushButton("Clear functional pt")
+        self.clear_func_btn.setEnabled(False)
+        self.clear_func_btn.clicked.connect(self._clear_func_point)
+        form_box.addWidget(self.clear_func_btn)
 
         grid = QtWidgets.QGridLayout()
         self.spin = {}
@@ -719,6 +734,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                         "bonds": tmpl["bonds"],
                         "rigid": tmpl.get("rigid"),      # exact MISO monomer data (sugars)
                         "com": [cx, cy, 0.0], "euler": [0.0, 0.0, 0.0],
+                        "func_pos": None,                # AA functional_position (x, y)
                     })
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
@@ -842,6 +858,8 @@ class PositionMonomerDialog(QtWidgets.QDialog):
     def _on_instance_selected(self, _row):
         inst = self._active_instance()
         if inst is None:
+            self.func_btn.setEnabled(False)
+            self.clear_func_btn.setEnabled(False)
             return
         self._updating = True
         self.spin["com_x"].setValue(inst["com"][0])
@@ -850,6 +868,12 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self.spin["ry"].setValue(inst["euler"][1])
         self.spin["rz"].setValue(inst["euler"][2])
         self._updating = False
+        # Functional-point controls apply to amino acids only.
+        is_aa = inst.get("kind") == "aa"
+        self.func_btn.setEnabled(is_aa and self._img is not None)
+        self.clear_func_btn.setEnabled(is_aa and inst.get("func_pos") is not None)
+        if not is_aa and self.func_btn.isChecked():
+            self.func_btn.setChecked(False)
         self._redraw_overlay()
 
     def _on_spin_changed(self, _val):
@@ -873,6 +897,8 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         if active:
             if getattr(self, "lipid_pick_btn", None) is not None and self.lipid_pick_btn.isChecked():
                 self.lipid_pick_btn.setChecked(False)
+            if self.func_btn.isChecked():
+                self.func_btn.setChecked(False)
             self._place_cid = canvas.mpl_connect("button_press_event", self._on_canvas_click)
             self.place_btn.setText("Place: ON (click image)")
         else:
@@ -880,6 +906,46 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                 canvas.mpl_disconnect(self._place_cid)
                 self._place_cid = None
             self.place_btn.setText("Place: OFF")
+
+    def _on_func_toggled(self, active):
+        canvas = getattr(self, "_canvas", None)
+        if canvas is None:
+            self.func_btn.setChecked(False)
+            return
+        if active:
+            if self.place_btn.isChecked():
+                self.place_btn.setChecked(False)
+            if getattr(self, "lipid_pick_btn", None) is not None and self.lipid_pick_btn.isChecked():
+                self.lipid_pick_btn.setChecked(False)
+            self._func_cid = canvas.mpl_connect("button_press_event", self._on_func_canvas_click)
+            self.func_btn.setText("Set functional pt: ON (click image)")
+        else:
+            if self._func_cid is not None:
+                canvas.mpl_disconnect(self._func_cid)
+                self._func_cid = None
+            self.func_btn.setText("Set functional pt: OFF")
+
+    def _on_func_canvas_click(self, event):
+        if event.inaxes is None or event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        inst = self._active_instance()
+        if inst is None or inst.get("kind") != "aa":
+            return
+        x_ang, y_ang, _h = self._pixel_to_ang(event.xdata, event.ydata)
+        inst["func_pos"] = [x_ang, y_ang]
+        self.clear_func_btn.setEnabled(True)
+        self.func_btn.setChecked(False)   # one click sets it
+        self._redraw_overlay()
+
+    def _clear_func_point(self):
+        inst = self._active_instance()
+        if inst is None:
+            return
+        inst["func_pos"] = None
+        self.clear_func_btn.setEnabled(False)
+        self._redraw_overlay()
 
     def _on_canvas_click(self, event):
         if event.inaxes is None or event.button != 1:
@@ -946,6 +1012,17 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                               textcoords="offset points", color="#ffee00",
                               fontsize=8, zorder=23)
             self._overlay_artists.extend([star, lbl])
+            # Amino-acid functional-group point (functional_position).
+            fp = inst.get("func_pos")
+            if fp is not None:
+                fc, fr = self._ang_to_pixel(fp[0], fp[1])
+                line, = ax.plot([comc, fc], [comr, fr], "--",
+                                color="#00e5ff" if is_active else "#4dd0e1",
+                                lw=1.0, zorder=21, alpha=0.9)
+                fm, = ax.plot([fc], [fr], marker="^",
+                              color="#00e5ff" if is_active else "#4dd0e1",
+                              ms=10 if is_active else 8, mec="black", mew=0.5, zorder=22)
+                self._overlay_artists.extend([line, fm])
         self._draw_lipids(ax)
         canvas.draw_idle()
 
@@ -1062,16 +1139,35 @@ class PositionMonomerDialog(QtWidgets.QDialog):
 
         with open(pos_path, "w", newline="") as f:
             w = csv.writer(f)
-            # Name/Instance are extra reference columns; MISO's load_circle_data
-            # reads only the "(Angstrom)"/Height columns, so they are ignored there.
-            w.writerow(["Point", "Name", "Instance", "Original_X", "Original_Y",
+            # Name/Instance/Role are extra reference columns; MISO's
+            # load_circle_data reads only the "(Angstrom)"/Height columns, so
+            # they are ignored there. Point index = row order.
+            #   Role=COM        -> the subunit centre (sugar experimental_positions
+            #                       / amino-acid ca_position)
+            #   Role=functional -> an amino-acid side-chain point
+            #                       (peptide residue functional_position)
+            w.writerow(["Point", "Name", "Instance", "Role", "Original_X", "Original_Y",
                         "X (Angstrom)", "Y (Angstrom)", "Height", "Z (Angstrom)"])
-            for i, inst in enumerate(self._instances):
+            idx = 0
+            # First: one COM point per placed subunit (indices 0..N-1) so these
+            # line up with the orientations CSV, which is keyed by the same index.
+            for inst in self._instances:
                 cx, cy, cz = inst["com"][0], inst["com"][1], inst["com"][2]
                 col, row = self._ang_to_pixel(cx, cy)
-                w.writerow([i, inst.get("name", ""), inst["label"],
+                w.writerow([idx, inst.get("name", ""), inst["label"], "COM",
                             int(round(col)), int(round(row)),
                             f"{cx:.6f}", f"{cy:.6f}", f"{cz:.6f}", 0.0])
+                idx += 1
+            # Then: amino-acid functional-group points, appended after all COMs.
+            for inst in self._instances:
+                fp = inst.get("func_pos")
+                if inst.get("kind") != "aa" or fp is None:
+                    continue
+                col, row = self._ang_to_pixel(fp[0], fp[1])
+                w.writerow([idx, inst.get("name", ""), inst["label"], "functional",
+                            int(round(col)), int(round(row)),
+                            f"{fp[0]:.6f}", f"{fp[1]:.6f}", "0.000000", 0.0])
+                idx += 1
 
         with open(ori_path, "w", newline="") as f:
             w = csv.writer(f)
@@ -1081,7 +1177,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             for i, inst in enumerate(self._instances):
                 Rm = euler_to_matrix(*inst["euler"])
                 q = matrix_to_quaternion(Rm)
-                kind = "aa" if inst["ring"] == "n/a" else "sugar"
+                kind = inst.get("kind", "sugar")
                 row = [i, inst["label"], kind, inst["conf_name"],
                        f"{q[0]:.8f}", f"{q[1]:.8f}", f"{q[2]:.8f}", f"{q[3]:.8f}"]
                 row += [f"{v:.8f}" for v in Rm.flatten()]
@@ -1167,6 +1263,11 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             ax.plot(comc, comr, marker="*", color="#ffd600", ms=10, mec="black", mew=0.5, zorder=22)
             ax.annotate(inst["label"], xy=(comc, comr), xytext=(4, 4),
                         textcoords="offset points", color="#ffee00", fontsize=7, zorder=23)
+            fp = inst.get("func_pos")
+            if fp is not None:
+                fc, fr = self._ang_to_pixel(fp[0], fp[1])
+                ax.plot([comc, fc], [comr, fr], "--", color="#00bcd4", lw=0.8, zorder=21)
+                ax.plot(fc, fr, marker="^", color="#00bcd4", ms=7, mec="black", mew=0.4, zorder=22)
         for lip in self._lipids:
             atoms = lip.get("atoms")
             if atoms is None or len(atoms) == 0:
@@ -1213,6 +1314,8 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         if canvas is not None:
             if self._place_cid is not None:
                 canvas.mpl_disconnect(self._place_cid)
+            if self._func_cid is not None:
+                canvas.mpl_disconnect(self._func_cid)
             if self._lipid_cid is not None:
                 canvas.mpl_disconnect(self._lipid_cid)
         super().closeEvent(event)
