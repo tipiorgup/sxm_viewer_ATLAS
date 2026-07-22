@@ -279,6 +279,8 @@ def _ensure_tools_menu(viewer):
     viewer.tools_load_molecule_act.triggered.connect(viewer.on_load_molecule)
     viewer.tools_pipeline_act = viewer.tools_menu.addAction("Position coordinates...")
     viewer.tools_pipeline_act.triggered.connect(viewer.on_position_coordinates)
+    viewer.tools_monomer_act = viewer.tools_menu.addAction("Position monomer...")
+    viewer.tools_monomer_act.triggered.connect(viewer.on_position_monomer)
     viewer.tools_miso_act = viewer.tools_menu.addAction("Run MISO...")
     viewer.tools_miso_act.triggered.connect(viewer.on_run_miso)
     viewer.tools_avogadro_act = viewer.tools_menu.addAction("Open in Avogadro...")

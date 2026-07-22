@@ -6109,6 +6109,11 @@ QLabel:hover {{
         dlg = PositionCoordinatesDialog(self, parent=self)
         dlg.show()
 
+    def on_position_monomer(self):
+        from .dialogs.position_monomer_dialogs import PositionMonomerDialog
+        dlg = PositionMonomerDialog(self, parent=self)
+        dlg.show()
+
     def on_run_miso(self):
         from .dialogs.miso_runner_dialog import MISORunnerDialog
         dlg = MISORunnerDialog(self, parent=self)
