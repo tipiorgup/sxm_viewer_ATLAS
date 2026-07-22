@@ -13,6 +13,7 @@ from rdkit import Chem
 from src.monomer_building import monomer_building
 
 from src.rotation_optimization.structure import building_chain
+from src.rotation_optimization.geometry import geometry_utils
 from src.rotation_optimization.structure import petn_building
 from src.rotation_optimization.structure import lipid_building
 from src.rotation_optimization.structure import saving_lps
@@ -46,6 +47,43 @@ def load_circle_data(circle_path):
     circles = df[["X (Angstrom)", "Y (Angstrom)", "Height"]].to_numpy()
     brightness = df["Z (Angstrom)"].to_numpy()
     return circles, brightness
+
+def load_orientations(orientation_path):
+    """Load fixed per-point rotation matrices from a CSV keyed by point index.
+
+    Produced by the SXM-viewer 'Position monomer' tool in fixed-orientation
+    mode. Expected columns: a point-index column ('Point' or the first column)
+    plus the row-major 3x3 rotation R00..R22. Returns {point_index: (3,3) array}.
+    The matrix is applied to a monomer after it is translated onto its
+    experimental circle (see translate_conformers_to_positions).
+    """
+    df = pd.read_csv(orientation_path)
+    key = 'Point' if 'Point' in df.columns else df.columns[0]
+    rcols = [f'R{i}{j}' for i in range(3) for j in range(3)]
+    missing = [c for c in rcols if c not in df.columns]
+    if missing:
+        raise ValueError(f"orientation CSV {orientation_path} missing columns: {missing}")
+    orientations = {}
+    for _, row in df.iterrows():
+        idx = int(row[key])
+        orientations[idx] = np.array([row[c] for c in rcols], dtype=float).reshape(3, 3)
+    return orientations
+
+
+def _apply_fixed_orientation(trans, orientations, pos):
+    """Rotate every conformer in a translated-instance dict by orientations[pos].
+
+    ``trans`` is {conformer_name: molecule_data}. Rotation is about each
+    conformer's COM (which was just placed on the circle), so the COM is
+    preserved and only the pose changes. No-op when no orientation is provided
+    for this point, keeping the normal pipeline unchanged.
+    """
+    if not orientations or pos not in orientations:
+        return trans
+    R = orientations[pos]
+    return {cn: geometry_utils.rotate_molecule_around_com(cd, R)
+            for cn, cd in trans.items()}
+
 
 def resolve_coordinates(coord_value, circles):
     """
@@ -131,32 +169,41 @@ def extract_monomer_data(conformers):
 # MOLECULE POSITIONING
 # ============================================================================
 
-def translate_conformers_to_positions(monomer_data, experimental_positions, circles):
+def translate_conformers_to_positions(monomer_data, experimental_positions, circles,
+                                      orientations=None):
     """
     Translate conformers to experimental positions.
-    
+
+    When ``orientations`` is provided (a {point_index: 3x3 matrix} dict from
+    load_orientations), each instance is additionally rotated to the fixed pose
+    for its point after translation. Omitting it leaves the normal pipeline
+    behaviour unchanged.
+
     Returns:
         tuple: (translated_conformers, carbon_vectors)
     """
     print("\n" + "="*70)
     print("TRANSLATING CONFORMERS TO EXPERIMENTAL POSITIONS")
+    if orientations:
+        print("(applying fixed per-point orientations)")
     print("="*70)
-    
+
     translated_conformers = {}
     carbon_vectors = {}
-    
+
     for sugar, positions in experimental_positions.items():
         mol_data = monomer_data[sugar]
-        
+
         if isinstance(positions, list):
             # Multiple positions for this sugar type
             translated_conformers[sugar] = {}
             carbon_vectors[sugar] = {}
-            
+
             for pos in positions:
                 trans = monomer_building.translate_to_experimental_com(
                     mol_data, circles[pos]
                 )
+                trans = _apply_fixed_orientation(trans, orientations, pos)
                 translated_conformers[sugar][pos] = trans
                 carbon_vectors[sugar][pos] = monomer_building.construct_com_to_carbon_vectors(trans)
                 print(f"  ✓ {sugar} at circle {pos}")
@@ -165,10 +212,11 @@ def translate_conformers_to_positions(monomer_data, experimental_positions, circ
             trans = monomer_building.translate_to_experimental_com(
                 mol_data, circles[positions]
             )
+            trans = _apply_fixed_orientation(trans, orientations, positions)
             translated_conformers[sugar] = trans
             carbon_vectors[sugar] = monomer_building.construct_com_to_carbon_vectors(trans)
             print(f"  ✓ {sugar} at circle {positions}")
-    
+
     return translated_conformers, carbon_vectors
 
 def build_molecule_dict(translated_conformers, experimental_positions, 
@@ -290,50 +338,62 @@ def extract_initial_ring_coms_from_monomers(molecule_data_dict, final_no_h, pyra
 # CHAIN BUILDING
 # ============================================================================
 
-def build_glycan_chain(molecule_data_dict, config, iterations):
+def build_glycan_chain(molecule_data_dict, config, iterations,
+                       use_fixed_orientation=False):
     """
     Align molecules and create glycosidic bonds.
-    
+
+    With ``use_fixed_orientation`` the per-molecule rotation search is skipped:
+    the molecules keep the fixed poses already applied during translation
+    (from the GUI orientation CSV) and only the glycosidic bonds are created.
+    ``config['direction']`` is then optional. The default path is unchanged.
+
     Returns:
         tuple: (chain_dict, bonds_glyco, sorted_linkages)
     """
     print("\n" + "="*70)
     print("BUILDING GLYCAN CHAIN - DEBUG")
     print("="*70)
-    
+
     print(f"\nmolecule_data_dict keys: {list(molecule_data_dict.keys())}")
     print(f"root_mol: {config['root_mol']}")
-    
+
     print(f"\nexperimental_positions:")
     for mol, pos in config['experimental_positions'].items():
         print(f"  {mol}: {pos}")
-    
-    print(f"\ndirection (raw):")
-    for d in config['direction']:
-        print(f"  {d}")
-    
-    linkage_definitions = [tuple(link) for link in config['glycosidic_bonds']]
-    rotation_definitions = [tuple(link) for link in config['direction']]
-    orientation_constraints = config.get('orientation_constraints', False)
 
-    print(f"\nrotation_definitions (after tuple conversion):")
-    for r in rotation_definitions:
-        print(f"  {r}")
-    
-    print(f"\nAligning molecules (iterations: {iterations})...")
-    chain_dict, sorted_linkages = building_chain.align_and_position_molecules(
-        molecule_data_dict, 
-        rotation_definitions,
-        root_mol=config['root_mol'],
-        iterations=iterations,
-        orientation_constraints=None
-    )
-    
+    linkage_definitions = [tuple(link) for link in config['glycosidic_bonds']]
+
+    if use_fixed_orientation:
+        print("\nFIXED ORIENTATION: skipping rotation alignment; "
+              "using GUI-provided poses as-is.")
+        chain_dict = molecule_data_dict
+        sorted_linkages = linkage_definitions
+    else:
+        print(f"\ndirection (raw):")
+        for d in config['direction']:
+            print(f"  {d}")
+
+        rotation_definitions = [tuple(link) for link in config['direction']]
+
+        print(f"\nrotation_definitions (after tuple conversion):")
+        for r in rotation_definitions:
+            print(f"  {r}")
+
+        print(f"\nAligning molecules (iterations: {iterations})...")
+        chain_dict, sorted_linkages = building_chain.align_and_position_molecules(
+            molecule_data_dict,
+            rotation_definitions,
+            root_mol=config['root_mol'],
+            iterations=iterations,
+            orientation_constraints=None
+        )
+
     print("\nCreating glycosidic bonds...")
     bonds_glyco = building_chain.create_glycosidic_bonds_in_chain(
         chain_dict, linkage_definitions
     )
-    
+
     print(f"\n✓ Built chain with {len(chain_dict)} molecules")
     print(f"✓ Created {len(bonds_glyco)} glycosidic bonds")
     

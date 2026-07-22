@@ -246,12 +246,12 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         # --- subunit table (sugars + amino acids can be mixed) ---
         col.addWidget(QtWidgets.QLabel(
             "Subunits to build (mix for glycopeptides):"))
-        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table = QtWidgets.QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Type", "SMILES / Residue", "Ring type", "Anomer", "Copies"])
+            ["Type", "Name", "SMILES / Residue", "Ring type", "Anomer", "Copies"])
         hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        for c in (0, 2, 3, 4):
+        hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        for c in (0, 1, 3, 4, 5):
             hdr.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
         self.table.setFixedHeight(150)
         col.addWidget(self.table)
@@ -591,32 +591,43 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         type_item.setFlags(type_item.flags() & ~QtCore.Qt.ItemIsEditable)
         self.table.setItem(r, 0, type_item)
 
-        # Column 1: SMILES (sugar) or residue code (amino acid).
+        # Column 1: MISO name. For sugars this is the key used in the YAML
+        # (sugars:/experimental_positions:), so it must be user-set (e.g. GlcN).
+        # For amino acids it is filled from the residue code at build time.
+        name_item = QtWidgets.QTableWidgetItem("")
+        if kind == "Sugar":
+            name_item.setToolTip("MISO monomer name used in the YAML, e.g. GlcN, Gal, KDO")
+        else:
+            name_item.setFlags(name_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            name_item.setText("—")
+        self.table.setItem(r, 1, name_item)
+
+        # Column 2: SMILES (sugar) or residue code (amino acid).
         item = QtWidgets.QTableWidgetItem(text)
         if kind == "Amino acid":
             item.setToolTip("1- or 3-letter residue code, e.g. N / Asn")
-        self.table.setItem(r, 1, item)
+        self.table.setItem(r, 2, item)
 
-        # Columns 2-3: ring type / anomer — only meaningful for sugars.
+        # Columns 3-4: ring type / anomer — only meaningful for sugars.
         if kind == "Sugar":
             ring = QtWidgets.QComboBox()
             ring.addItems(RING_TYPES)
-            self.table.setCellWidget(r, 2, ring)
+            self.table.setCellWidget(r, 3, ring)
             anom = QtWidgets.QComboBox()
             anom.addItems(ANOMERS)
-            self.table.setCellWidget(r, 3, anom)
+            self.table.setCellWidget(r, 4, anom)
         else:
-            for c in (2, 3):
+            for c in (3, 4):
                 dash = QtWidgets.QTableWidgetItem("—")
                 dash.setFlags(dash.flags() & ~QtCore.Qt.ItemIsEditable)
                 dash.setTextAlignment(QtCore.Qt.AlignCenter)
                 self.table.setItem(r, c, dash)
 
-        # Column 4: copies.
+        # Column 5: copies.
         copies = QtWidgets.QSpinBox()
         copies.setRange(1, 999)
         copies.setValue(1)
-        self.table.setCellWidget(r, 4, copies)
+        self.table.setCellWidget(r, 5, copies)
 
     def _remove_table_row(self):
         r = self.table.currentRow()
@@ -630,21 +641,25 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         for r in range(self.table.rowCount()):
             type_item = self.table.item(r, 0)
             kind = (type_item.text().strip() if type_item else "Sugar")
-            text_item = self.table.item(r, 1)
+            name_item = self.table.item(r, 1)
+            name_text = (name_item.text().strip() if name_item else "")
+            text_item = self.table.item(r, 2)
             text = (text_item.text().strip() if text_item else "")
             if not text:
                 continue
-            copies = self.table.cellWidget(r, 4).value()
+            copies = self.table.cellWidget(r, 5).value()
             if kind == "Sugar":
-                ring = self.table.cellWidget(r, 2).currentText()
-                anom = self.table.cellWidget(r, 3).currentText()
-                defs.append({"row": r, "kind": "sugar", "smiles": text,
+                ring = self.table.cellWidget(r, 3).currentText()
+                anom = self.table.cellWidget(r, 4).currentText()
+                # Name is the MISO key; fall back to an auto name if left blank.
+                name = name_text or f"Sugar{r+1}"
+                defs.append({"row": r, "kind": "sugar", "name": name, "smiles": text,
                              "ring": ring, "anomer": anom, "copies": copies,
                              "conf_name_hint": None,
-                             "desc": f"{text} ({ring}/{anom})"})
+                             "desc": f"{name}: {text} ({ring}/{anom})"})
             else:
                 name, smiles = resolve_aa(text)
-                defs.append({"row": r, "kind": "aa", "smiles": smiles,
+                defs.append({"row": r, "kind": "aa", "name": name, "smiles": smiles,
                              "ring": "n/a", "anomer": "n/a", "copies": copies,
                              "conf_name_hint": name,
                              "desc": name or f"'{text}' (unknown residue)"})
@@ -686,6 +701,10 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                     tmpl = self._build_sugar_template(engine, d["smiles"], d["ring"], d["anomer"])
                 else:
                     tmpl = self._build_aa_template(d["smiles"], d["conf_name_hint"])
+                    # Reflect the resolved residue name back into the Name column.
+                    nm = self.table.item(r, 1)
+                    if nm is not None:
+                        nm.setText(d["name"] or "")
                 if tmpl is None:
                     failures.append(f"row {r+1}: {d['desc']}")
                     continue
@@ -693,10 +712,12 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                 for c in range(d["copies"]):
                     self._instances.append({
                         "label": f"M{r+1}.{c+1}",
+                        "name": d["name"], "kind": d["kind"],
                         "smiles": d["smiles"], "ring": d["ring"], "anomer": d["anomer"],
                         "conf_name": tmpl["conf_name"],
                         "rel": tmpl["rel"], "atom_types": tmpl["atom_types"],
                         "bonds": tmpl["bonds"],
+                        "rigid": tmpl.get("rigid"),      # exact MISO monomer data (sugars)
                         "com": [cx, cy, 0.0], "euler": [0.0, 0.0, 0.0],
                     })
         finally:
@@ -753,8 +774,17 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         if mol is not None:
             for b in mol.GetBonds():
                 bonds.append((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
+        # Capture the EXACT rigid monomer data MISO would otherwise regenerate
+        # (relative_coordinates, atom_types, carbon_map, oh_map, anomer,
+        # anomeric_oxygen_idx, quaternion) for this single chosen conformer, so a
+        # fixed-orientation run reuses this geometry instead of re-embedding.
+        rigid = None
+        try:
+            rigid = engine.extract_rigid_monomer_data({conf_name: data})
+        except Exception as exc:
+            print(f"extract_rigid_monomer_data failed for {smiles}: {exc}")
         return {"conf_name": conf_name, "rel": coords - com,
-                "atom_types": atom_types, "bonds": bonds}
+                "atom_types": atom_types, "bonds": bonds, "rigid": rigid}
 
     def _build_aa_template(self, smiles, name):
         """Single lowest-energy conformer for an amino acid (embed + MMFF)."""
@@ -994,6 +1024,8 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                     row += [f"{v:.8f}" for v in Rm.flatten()]
                     w.writerow(row)
             written.append(Path(out_path).name)
+            written += [Path(p).name for p in self._export_miso_inputs(out_path)]
+            written += [Path(p).name for p in self._export_monomer_pickle(out_path)]
 
         if placed_lipids:
             written += [Path(p).name for p in self._export_lipids_csv(out_path, placed_lipids)]
@@ -1003,7 +1035,82 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         QtWidgets.QMessageBox.information(
             self, "Done",
             f"Saved {len(self._instances)} subunit(s) and {len(placed_lipids)} lipid(s):\n  "
-            + "\n  ".join(written))
+            + "\n  ".join(written)
+            + "\n\nMISO fixed-orientation run — in the YAML set:\n"
+              "  circle_input_path: *_positions.csv\n"
+              "  orientation_csv_path: *_orientations.csv\n"
+              "  monomer_data_path: *_monomer_data.pkl   (reuse exact geometry)\n"
+              "  use_fixed_orientation: true\n"
+              "then write your connectivity, referencing the point indices (row order) "
+              "and the sugar Names.")
+
+    def _export_miso_inputs(self, out_path):
+        """Write MISO-ready positions (circle_input) + orientations (by point index).
+
+        <stem>_positions.csv    -> drop-in ``circle_input_path``; one row per placed
+                                   subunit, point index = row order (the value used
+                                   in ``experimental_positions``).
+        <stem>_orientations.csv -> ``orientation_csv_path``; ``Point`` + row-major
+                                   3x3 rotation R00..R22 (+quaternion) consumed by
+                                   MISO's fixed-orientation mode. Columns match
+                                   pipeline.load_orientations.
+        """
+        import csv
+        stem = Path(out_path).with_suffix("")
+        pos_path = f"{stem}_positions.csv"
+        ori_path = f"{stem}_orientations.csv"
+
+        with open(pos_path, "w", newline="") as f:
+            w = csv.writer(f)
+            # Name/Instance are extra reference columns; MISO's load_circle_data
+            # reads only the "(Angstrom)"/Height columns, so they are ignored there.
+            w.writerow(["Point", "Name", "Instance", "Original_X", "Original_Y",
+                        "X (Angstrom)", "Y (Angstrom)", "Height", "Z (Angstrom)"])
+            for i, inst in enumerate(self._instances):
+                cx, cy, cz = inst["com"][0], inst["com"][1], inst["com"][2]
+                col, row = self._ang_to_pixel(cx, cy)
+                w.writerow([i, inst.get("name", ""), inst["label"],
+                            int(round(col)), int(round(row)),
+                            f"{cx:.6f}", f"{cy:.6f}", f"{cz:.6f}", 0.0])
+
+        with open(ori_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Point", "Instance", "Type", "Conformer",
+                        "quat_x", "quat_y", "quat_z", "quat_w",
+                        "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"])
+            for i, inst in enumerate(self._instances):
+                Rm = euler_to_matrix(*inst["euler"])
+                q = matrix_to_quaternion(Rm)
+                kind = "aa" if inst["ring"] == "n/a" else "sugar"
+                row = [i, inst["label"], kind, inst["conf_name"],
+                       f"{q[0]:.8f}", f"{q[1]:.8f}", f"{q[2]:.8f}", f"{q[3]:.8f}"]
+                row += [f"{v:.8f}" for v in Rm.flatten()]
+                w.writerow(row)
+        return [pos_path, ori_path]
+
+    def _export_monomer_pickle(self, out_path):
+        """Pickle exact per-sugar rigid monomer data so MISO reuses this geometry.
+
+        Produces {name: rigid_body_data} matching pipeline.extract_monomer_data
+        output (each rigid_body_data is {conformer_name: {COM, relative_coordinates,
+        atom_types, quaternion, carbon_map, oh_map, anomer, anomeric_oxygen_idx}}).
+        MISO loads this via monomer_data_path and skips conformer regeneration, so
+        the placed geometry is reproduced exactly. Amino acids are omitted (MISO
+        builds those from the peptide sequence, not from this table).
+        """
+        import pickle
+        monomer_data = {}
+        for inst in self._instances:
+            if inst.get("kind") != "sugar" or inst.get("rigid") is None:
+                continue
+            # Instances of the same Name share geometry; first one wins.
+            monomer_data.setdefault(inst["name"], inst["rigid"])
+        if not monomer_data:
+            return []
+        pkl_path = f"{Path(out_path).with_suffix('')}_monomer_data.pkl"
+        with open(pkl_path, "wb") as f:
+            pickle.dump(monomer_data, f)
+        return [pkl_path]
 
     def _export_lipids_csv(self, out_path, placed_lipids):
         """Write MISO-shaped lipid params + a companion per-atom coordinate file."""

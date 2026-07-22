@@ -149,6 +149,22 @@ def main():
     base_name = os.path.splitext(os.path.basename(config['sxm_file']))[0]
     circles, brightness = lpf.load_circle_data(config['circle_input_path'])
 
+    # Optional fixed-orientation mode: use manually-placed COM + rotation from
+    # the SXM-viewer 'Position monomer' tool instead of MISO's rotation search.
+    use_fixed_orientation = bool(config.get('use_fixed_orientation', False))
+    orientations = None
+    orientation_csv_path = config.get('orientation_csv_path', None)
+    if orientation_csv_path:
+        orientations = lpf.load_orientations(orientation_csv_path)
+        print(f"\n✓ Loaded {len(orientations)} fixed orientations from {orientation_csv_path}")
+    if use_fixed_orientation and not orientations:
+        print("\n⚠ use_fixed_orientation is set but no orientation_csv_path was loaded; "
+              "monomers keep their default pose.")
+
+    # Optional: reuse exact monomer geometry exported by the GUI instead of
+    # regenerating conformers (keeps the placed conformer identical).
+    monomer_data_path = config.get('monomer_data_path', None)
+
     stm_npz_path = config.get('stm_grid_path', None)
     if stm_npz_path is not None and os.path.exists(stm_npz_path):
         print(f"\n✓ Found STM grid: {stm_npz_path}")
@@ -180,15 +196,26 @@ def main():
 
     if sugars:
         with timer.section("Phase 1: Monomer Building (shared)", level=0):
-            with timer.section("  Conformer generation", level=1):
-                conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
-            with timer.section("  Conformer analysis", level=1):
-                lpf.analyze_conformers(conformers)
-            with timer.section("  Monomer data extraction", level=1):
-                monomer_data = lpf.extract_monomer_data(conformers)
+            if monomer_data_path:
+                # Reuse exact per-sugar geometry from the SXM-viewer export instead
+                # of regenerating conformers, so the placed pose is reproduced.
+                with timer.section("  Load monomer data (skip regeneration)", level=1):
+                    with open(monomer_data_path, 'rb') as f:
+                        monomer_data = pickle.load(f)
+                    print(f"\n✓ Loaded monomer geometry for {len(monomer_data)} "
+                          f"monomer(s) from {monomer_data_path} (conformer "
+                          f"regeneration skipped)")
+            else:
+                with timer.section("  Conformer generation", level=1):
+                    conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
+                with timer.section("  Conformer analysis", level=1):
+                    lpf.analyze_conformers(conformers)
+                with timer.section("  Monomer data extraction", level=1):
+                    monomer_data = lpf.extract_monomer_data(conformers)
             with timer.section("  Translation to experimental positions", level=1):
                 translated_conformers, carbon_vectors = lpf.translate_conformers_to_positions(
-                    monomer_data, config['experimental_positions'], circles
+                    monomer_data, config['experimental_positions'], circles,
+                    orientations=orientations
                 )
             with timer.section("  Build molecule dict", level=1):
                 molecule_data_dict, mol_name_to_conformer = lpf.build_molecule_dict(
@@ -236,7 +263,8 @@ def main():
                     if sugars:
                         with timer.section(f"{tag}   Chain building (rotation/alignment)", level=3):
                             chain_dict, bonds_glyco, sorted_linkages = lpf.build_glycan_chain(
-                                molecule_data_dict, config, args.iterations
+                                molecule_data_dict, config, args.iterations,
+                                use_fixed_orientation=use_fixed_orientation
                             )
                         with timer.section(f"{tag}   Phosphate linkages", level=3):
                             phosphate_bonds_with_names, unbonded_monomers = lpf.add_phosphate_linkages(
