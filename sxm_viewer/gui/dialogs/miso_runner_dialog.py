@@ -34,16 +34,27 @@ class MISORunnerDialog(QtWidgets.QDialog):
 
         self.yaml_le, yaml_row = self._file_row("Browse…", "YAML files (*.yml *.yaml);;All files (*)")
         self.csv_le,  csv_row  = self._file_row("Browse…", "CSV files (*.csv);;All files (*)")
-        self.ori_le,  ori_row  = self._file_row("Browse…", "CSV files (*.csv);;All files (*)")
 
         form.addRow("Config YAML:", yaml_row)
         form.addRow("Positions CSV:", csv_row)
-        form.addRow("Orientations CSV (optional):", ori_row)
         root.addLayout(form)
 
         self.fixed_ori_chk = QtWidgets.QCheckBox(
             "Use fixed orientation (skip QUEST alignment for placed monomers)")
+        self.fixed_ori_chk.toggled.connect(self._on_fixed_ori_toggled)
         root.addWidget(self.fixed_ori_chk)
+
+        # Only relevant once fixed orientation is on, so hidden until checked.
+        self._fixed_ori_group = QtWidgets.QWidget()
+        fixed_ori_form = QtWidgets.QFormLayout(self._fixed_ori_group)
+        fixed_ori_form.setContentsMargins(0, 0, 0, 0)
+        fixed_ori_form.setLabelAlignment(QtCore.Qt.AlignRight)
+        self.ori_le, ori_row = self._file_row("Browse…", "CSV files (*.csv);;All files (*)")
+        self.monomer_le, monomer_row = self._file_row("Browse…", "Pickle files (*.pkl);;All files (*)")
+        fixed_ori_form.addRow("Orientations CSV:", ori_row)
+        fixed_ori_form.addRow("Monomer data (.pkl, optional):", monomer_row)
+        self._fixed_ori_group.setVisible(False)
+        root.addWidget(self._fixed_ori_group)
 
         # Parameters
         param_row = QtWidgets.QHBoxLayout()
@@ -100,6 +111,9 @@ class MISORunnerDialog(QtWidgets.QDialog):
         # Pre-fill CSV/NPZ from last position-coordinates export
         self._prefill_from_viewer()
 
+    def _on_fixed_ori_toggled(self, checked):
+        self._fixed_ori_group.setVisible(checked)
+
     def _file_row(self, label: str, filt: str):
         le = QtWidgets.QLineEdit()
         le.setPlaceholderText("(not selected)")
@@ -131,6 +145,9 @@ class MISORunnerDialog(QtWidgets.QDialog):
                 ori_guess = Path(stem + "_orientations.csv")
                 if ori_guess.exists():
                     self.ori_le.setText(str(ori_guess.resolve()))
+                monomer_guess = Path(stem + "_monomer_data.pkl")
+                if monomer_guess.exists():
+                    self.monomer_le.setText(str(monomer_guess.resolve()))
         except Exception:
             pass
 
@@ -179,15 +196,27 @@ class MISORunnerDialog(QtWidgets.QDialog):
         cfg["circle_input_path"] = csv_path
         cfg.pop("stm_grid_path", None)
 
-        # Orientations CSV / fixed-orientation flag: only touch these when the
-        # dialog actually supplies something, so a yaml that already has them
-        # set (circle_input_path is always overridden above, these are not)
-        # is left alone instead of being silently wiped by an empty field.
-        ori_path = self.ori_le.text().strip()
-        if ori_path:
-            cfg["orientation_csv_path"] = ori_path
+        # Orientations CSV / monomer pkl / fixed-orientation flag: these only
+        # come from the dialog when the checkbox is on and a field is filled,
+        # so a yaml that already has them set (circle_input_path is always
+        # overridden above, these are not) is left alone otherwise instead of
+        # being silently wiped by a hidden, empty field.
         if self.fixed_ori_chk.isChecked():
             cfg["use_fixed_orientation"] = True
+            ori_path = self.ori_le.text().strip()
+            if ori_path:
+                cfg["orientation_csv_path"] = ori_path
+            monomer_le_path = self.monomer_le.text().strip()
+            if monomer_le_path:
+                cfg["monomer_data_path"] = monomer_le_path
+
+        # A relative monomer_data_path in the yaml is written by the user
+        # relative to the yaml's own folder, but module_B.py runs with its
+        # working directory set to results_dir below, so resolve it here
+        # instead of letting it fail to open once the process starts.
+        monomer_data_path = cfg.get("monomer_data_path")
+        if monomer_data_path and not Path(monomer_data_path).is_absolute():
+            cfg["monomer_data_path"] = str((Path(yaml_path).resolve().parent / monomer_data_path).resolve())
 
         results_dir = Path(csv_path).parent / "results"
         results_dir.mkdir(exist_ok=True)
@@ -206,6 +235,7 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self._append(f"[MISO] circle_input_path:  {cfg.get('circle_input_path')}")
         self._append(f"[MISO] orientation_csv_path: {cfg.get('orientation_csv_path')}")
         self._append(f"[MISO] use_fixed_orientation: {cfg.get('use_fixed_orientation', False)}")
+        self._append(f"[MISO] monomer_data_path:  {cfg.get('monomer_data_path')}")
         self._append("-" * 60)
 
         self._process = QtCore.QProcess(self)
