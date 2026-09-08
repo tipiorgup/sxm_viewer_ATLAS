@@ -123,6 +123,13 @@ def parse_arguments():
         default=False,
         help="Enable stochastic kicks during phase 1 minimization to escape torsional local minima"
     )
+    parser.add_argument(
+        "--debug_checkpoints",
+        action="store_true",
+        default=False,
+        help="Save intermediate SDF structures (pre-opt, post-phase1, post-phase2) "
+             "in addition to the final optimized structure, for debugging"
+    )
     args = parser.parse_args()
     return args
 
@@ -400,13 +407,15 @@ def main():
                             initial_ring_coms=initial_ring_coms,
                             stm_npy_path=stm_npz_path,
                             enable_phase1_kicks=args.phase1_kicks,
-                            torsion_constraints=torsion_constraints
+                            torsion_constraints=torsion_constraints,
+                            save_debug_checkpoints=args.debug_checkpoints
                         )
 
                     with timer.section(f"{tag}   Save results", level=3):
                         lpf.save_optimization_results(
                             final_with_h, optimized_mol, success,
-                            name, conformers_selection
+                            name, conformers_selection,
+                            save_debug_checkpoints=args.debug_checkpoints
                         )
 
             # Store results

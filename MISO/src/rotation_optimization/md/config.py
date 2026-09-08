@@ -210,6 +210,11 @@ class OptimizationConfig:
     image_interval: int = DEFAULT_IMAGE_INTERVAL
     output_name: str = "optimization"
 
+    # Debugging: save an SDF at the end of each optimization phase (phase1
+    # relaxation, phase2 compression) in addition to the final structure, so
+    # ring/geometry issues can be traced to the phase that introduced them.
+    save_debug_checkpoints: bool = False
+
 
 @dataclass
 class RingConstraintConfig:
