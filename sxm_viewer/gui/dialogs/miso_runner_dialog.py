@@ -201,11 +201,16 @@ class MISORunnerDialog(QtWidgets.QDialog):
         cfg["circle_input_path"] = csv_path
         cfg.pop("stm_grid_path", None)
 
-        # Orientations CSV / monomer pkl / fixed-orientation flag: these only
-        # come from the dialog when the checkbox is on and a field is filled,
-        # so a yaml that already has them set (circle_input_path is always
-        # overridden above, these are not) is left alone otherwise instead of
-        # being silently wiped by a hidden, empty field.
+        # Orientations CSV / fixed-orientation flag: when the checkbox is on,
+        # take these from the dialog fields (only overriding a field that's
+        # actually filled, so a yaml value isn't wiped by an empty one).
+        # When off, actively clear orientation_csv_path/use_fixed_orientation
+        # instead of leaving a stale value from the yaml, module_B.py loads
+        # orientation_csv_path whenever it's present regardless of the
+        # use_fixed_orientation flag, so an unchecked box has to mean "not
+        # used at all", not just "not overridden here". monomer_data_path is
+        # independent (reuse exact placed geometry vs regenerate) and is
+        # never touched by this checkbox either way.
         if self.fixed_ori_chk.isChecked():
             cfg["use_fixed_orientation"] = True
             ori_path = self.ori_le.text().strip()
@@ -214,6 +219,9 @@ class MISORunnerDialog(QtWidgets.QDialog):
             monomer_le_path = self.monomer_le.text().strip()
             if monomer_le_path:
                 cfg["monomer_data_path"] = monomer_le_path
+        else:
+            cfg["use_fixed_orientation"] = False
+            cfg.pop("orientation_csv_path", None)
 
         # A relative monomer_data_path in the yaml is written by the user
         # relative to the yaml's own folder, but module_B.py runs with its
