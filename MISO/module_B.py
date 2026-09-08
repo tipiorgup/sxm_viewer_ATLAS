@@ -4,6 +4,8 @@ import argparse
 import pickle
 from contextlib import contextmanager
 import pipeline as lpf
+from rdkit import Chem
+from rdkit.Chem import AllChem
 from rdkit.Geometry import rdGeometry
 import numpy as np
 
@@ -205,6 +207,17 @@ def main():
                     print(f"\n✓ Loaded monomer geometry for {len(monomer_data)} "
                           f"monomer(s) from {monomer_data_path} (conformer "
                           f"regeneration skipped)")
+                    # Export (collect_molecules) still needs an RDKit Mol per
+                    # sugar type for topology/bonds; the pickle only carries
+                    # positions, so embed one cheap conformer per sugar here
+                    # instead of the full multi-conformer search skipped above.
+                    # Atom order matches monomer_data (same SMILES, no AddHs,
+                    # deterministic parsing), positions get overwritten later.
+                    conformers = {}
+                    for sugar_name, smiles in sugars.items():
+                        template_mol = Chem.MolFromSmiles(smiles)
+                        AllChem.EmbedMolecule(template_mol, randomSeed=42)
+                        conformers[sugar_name] = {'_template': {'molecule': template_mol}}
             else:
                 with timer.section("  Conformer generation", level=1):
                     conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
