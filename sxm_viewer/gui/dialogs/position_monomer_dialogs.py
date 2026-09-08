@@ -64,6 +64,95 @@ def resolve_aa(code):
         return None, None
     return name, AA_SMILES[name]
 
+
+# Side-chain functional-group type per residue, mirrored from MISO
+# peptide_building.AA_FUNCTIONAL_GROUPS. Used to auto-locate the functional
+# point instead of requiring a manual click; residues mapped to None have no
+# side-chain functional group (functional_position stays unset for them).
+AA_FUNCTIONAL_GROUPS = {
+    'Ala': None, 'Val': None, 'Leu': None, 'Ile': None, 'Met': None, 'Gly': None,
+    'Pro': 'ring_centroid', 'Phe': 'ring_centroid', 'Trp': 'ring_centroid', 'His': 'ring_centroid',
+    'Ser': 'hydroxyl_o', 'Thr': 'hydroxyl_o', 'Tyr': 'hydroxyl_o',
+    'Cys': 'thiol_s',
+    'Asn': 'amide_n', 'Gln': 'amide_n',
+    'Asp': 'carboxyl_c', 'Glu': 'carboxyl_c',
+    'Lys': 'amine_n',
+    # 'Arg': 'guanidinium_c' has no matching finder in MISO peptide_building
+    # either (find_functional_group_atom has no branch for it), so it is
+    # left out here too rather than silently returning a wrong atom.
+}
+
+
+def _find_functional_group_atom(mol, functional_type):
+    """Locate the side-chain functional-group atom on an explicit-H RDKit
+    mol, mirroring MISO peptide_building.find_functional_group_atom exactly
+    (same heuristics, same SMILES source, so atom order matches). Returns an
+    atom index, or None if not found.
+    """
+    from rdkit import Chem
+
+    if functional_type == 'hydroxyl_o':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'O':
+                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+                if 'H' in neighbors and 'C' in neighbors:
+                    return atom.GetIdx()
+
+    elif functional_type == 'amide_n':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'N':
+                for n in atom.GetNeighbors():
+                    if n.GetSymbol() != 'C':
+                        continue
+                    has_double_o = any(
+                        nn.GetSymbol() == 'O' and
+                        mol.GetBondBetweenAtoms(n.GetIdx(), nn.GetIdx()).GetBondType() == Chem.BondType.DOUBLE
+                        for nn in n.GetNeighbors()
+                    )
+                    if has_double_o:
+                        h_count = sum(1 for nn in atom.GetNeighbors() if nn.GetSymbol() == 'H')
+                        if h_count >= 1:
+                            return atom.GetIdx()
+
+    elif functional_type == 'thiol_s':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'S':
+                return atom.GetIdx()
+
+    elif functional_type == 'carboxyl_c':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'C':
+                neighbors = list(atom.GetNeighbors())
+                o_count = sum(1 for n in neighbors if n.GetSymbol() == 'O')
+                if o_count == 2 and not any(n.GetSymbol() == 'N' for n in neighbors):
+                    return atom.GetIdx()
+
+    elif functional_type == 'amine_n':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'N':
+                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+                if neighbors.count('H') >= 2 and 'C' in neighbors:
+                    return atom.GetIdx()
+
+    return None
+
+
+def _find_functional_atom_indices(mol_with_h, aa_name):
+    """Atom indices (in mol_with_h) whose centroid is the side-chain
+    functional point for aa_name, or None if the residue has no side-chain
+    functional group or it could not be located.
+    """
+    functional_type = AA_FUNCTIONAL_GROUPS.get(aa_name)
+    if functional_type is None:
+        return None
+    if functional_type == 'ring_centroid':
+        rings = mol_with_h.GetRingInfo().AtomRings()
+        if not rings:
+            return None
+        return list(max(rings, key=len))
+    idx = _find_functional_group_atom(mol_with_h, functional_type)
+    return [idx] if idx is not None else None
+
 # Element colors for the 2D overlay (top-down projection onto the STM image).
 ATOM_COLORS = {"C": "#222222", "O": "#e53935", "N": "#1e88e5",
                "H": "#bbbbbb", "S": "#fdd835", "P": "#fb8c00"}
@@ -733,8 +822,9 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                         "rel": tmpl["rel"], "atom_types": tmpl["atom_types"],
                         "bonds": tmpl["bonds"],
                         "rigid": tmpl.get("rigid"),      # exact MISO monomer data (sugars)
+                        "functional_rel": tmpl.get("functional_rel"),  # AA auto functional-group offset from COM
                         "com": [cx, cy, 0.0], "euler": [0.0, 0.0, 0.0],
-                        "func_pos": None,                # AA functional_position (x, y)
+                        "func_pos": None,                # AA functional_position (x, y) — manual override; falls back to functional_rel (auto) when None
                     })
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
@@ -751,9 +841,21 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         QtWidgets.QMessageBox.information(self, "Build", msg)
 
     @staticmethod
-    def _template_from_mol(mol, conf_name):
-        """Heavy-atom coordinates/bonds/COM from an embedded RDKit mol."""
+    def _template_from_mol(mol, conf_name, functional_atom_indices=None):
+        """Heavy-atom coordinates/bonds/COM from an embedded RDKit mol.
+
+        functional_atom_indices, if given, are atom indices in `mol` (still
+        with explicit H at this point) whose centroid is the amino acid's
+        side-chain functional point; it is returned as functional_rel,
+        relative to COM in the same frame as `rel`, for automatic
+        functional-position placement without a manual click.
+        """
         from rdkit.Chem import RemoveHs
+        functional_abs = None
+        if functional_atom_indices:
+            conf_before = mol.GetConformer()
+            pts = np.array([[*conf_before.GetAtomPosition(i)] for i in functional_atom_indices])
+            functional_abs = pts.mean(axis=0)
         mol = RemoveHs(mol)                       # H are added at the very end
         conf = mol.GetConformer()
         coords, atom_types, masses = [], [], []
@@ -765,8 +867,10 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         coords = np.asarray(coords, dtype=float)
         com = np.average(coords, weights=np.asarray(masses), axis=0)
         bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds()]
+        functional_rel = (functional_abs - com).tolist() if functional_abs is not None else None
         return {"conf_name": conf_name, "rel": coords - com,
-                "atom_types": atom_types, "bonds": bonds}
+                "atom_types": atom_types, "bonds": bonds,
+                "functional_rel": functional_rel}
 
     def _build_sugar_template(self, engine, smiles, ring, anom):
         known_ring = None if ring == "Any" else ring
@@ -817,7 +921,12 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                 AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
             except Exception:
                 AllChem.UFFOptimizeMolecule(mol, maxIters=500)
-            return self._template_from_mol(mol, name)
+            # Locate the side-chain functional group (e.g. the ring in Phe)
+            # on the explicit-H mol before RemoveHs strips them, so the
+            # functional point can be placed automatically instead of
+            # requiring a manual click.
+            functional_atom_indices = _find_functional_atom_indices(mol, name)
+            return self._template_from_mol(mol, name, functional_atom_indices)
         except Exception as exc:
             print(f"amino-acid build failed for {name} ({smiles}): {exc}")
             return None
@@ -847,6 +956,28 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         Rm = euler_to_matrix(*inst["euler"])
         rotated = inst["rel"] @ Rm.T
         return rotated + np.asarray(inst["com"], dtype=float)
+
+    def _auto_func_pos(self, inst):
+        """Absolute (x, y) for the amino acid's automatically-identified
+        side-chain functional point, rotated/translated with the instance's
+        current pose. None when the residue has no defined functional group
+        (e.g. Ala, Gly) or isn't an amino acid.
+        """
+        rel = inst.get("functional_rel")
+        if rel is None:
+            return None
+        Rm = euler_to_matrix(*inst["euler"])
+        abs_pos = np.asarray(rel, dtype=float) @ Rm.T + np.asarray(inst["com"], dtype=float)
+        return [abs_pos[0], abs_pos[1]]
+
+    def _effective_func_pos(self, inst):
+        """Manual functional-point override if the user set one (via "Set
+        functional pt"), else the automatically-identified functional point,
+        else None.
+        """
+        if inst.get("func_pos") is not None:
+            return inst["func_pos"]
+        return self._auto_func_pos(inst)
 
     # ------------------------------------------------------------------ selection
     def _active_instance(self):
@@ -1012,8 +1143,9 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                               textcoords="offset points", color="#ffee00",
                               fontsize=8, zorder=23)
             self._overlay_artists.extend([star, lbl])
-            # Amino-acid functional-group point (functional_position).
-            fp = inst.get("func_pos")
+            # Amino-acid functional-group point (functional_position):
+            # manual override if set, else the automatically-identified one.
+            fp = self._effective_func_pos(inst)
             if fp is not None:
                 fc, fr = self._ang_to_pixel(fp[0], fp[1])
                 line, = ax.plot([comc, fc], [comr, fr], "--",
@@ -1158,10 +1290,14 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                             int(round(col)), int(round(row)),
                             f"{cx:.6f}", f"{cy:.6f}", f"{cz:.6f}", 0.0])
                 idx += 1
-            # Then: amino-acid functional-group points, appended after all COMs.
+            # Then: amino-acid functional-group points (manual override, or
+            # auto-identified when the residue has a known one), appended
+            # after all COMs.
             for inst in self._instances:
-                fp = inst.get("func_pos")
-                if inst.get("kind") != "aa" or fp is None:
+                if inst.get("kind") != "aa":
+                    continue
+                fp = self._effective_func_pos(inst)
+                if fp is None:
                     continue
                 col, row = self._ang_to_pixel(fp[0], fp[1])
                 w.writerow([idx, inst.get("name", ""), inst["label"], "functional",
@@ -1263,7 +1399,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             ax.plot(comc, comr, marker="*", color="#ffd600", ms=10, mec="black", mew=0.5, zorder=22)
             ax.annotate(inst["label"], xy=(comc, comr), xytext=(4, 4),
                         textcoords="offset points", color="#ffee00", fontsize=7, zorder=23)
-            fp = inst.get("func_pos")
+            fp = self._effective_func_pos(inst)
             if fp is not None:
                 fc, fr = self._ang_to_pixel(fp[0], fp[1])
                 ax.plot([comc, fc], [comr, fr], "--", color="#00bcd4", lw=0.8, zorder=21)
