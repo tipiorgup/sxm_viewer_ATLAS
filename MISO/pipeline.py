@@ -1370,7 +1370,8 @@ def check_and_fix_geometry(final_with_h):
 def run_optimization(final_with_h, fixed_atoms, reference_normals,
                     name, conformers_selection, molecule_data_dict, lipid_tail_indices,
                     stm_npy_path=None, pyranose_rings_no_h=None, initial_ring_coms=None,
-                    enable_phase1_kicks=False, torsion_constraints=None):
+                    enable_phase1_kicks=False, torsion_constraints=None,
+                    save_debug_checkpoints=False):
     """
     Run force field optimization using constants.
     
@@ -1433,7 +1434,8 @@ def run_optimization(final_with_h, fixed_atoms, reference_normals,
         # Output
         save_images=False,  # Set to True for animation frames
         image_interval=constants.DEFAULT_IMAGE_INTERVAL,
-        output_name=f"{name}_{conformers_selection}_optimization"
+        output_name=f"{name}_{conformers_selection}_optimization",
+        save_debug_checkpoints=save_debug_checkpoints
     )
     
     print("\nConfiguration (from constants):")
@@ -1459,20 +1461,21 @@ def run_optimization(final_with_h, fixed_atoms, reference_normals,
     
     return optimized_mol, success
 
-def save_optimization_results(final_with_h, optimized_mol, success, 
-                              name, conformers_selection):
+def save_optimization_results(final_with_h, optimized_mol, success,
+                              name, conformers_selection, save_debug_checkpoints=False):
     """Save pre- and post-optimization structures."""
     print("\n" + "="*70)
     print("SAVING RESULTS")
     print("="*70)
-    
+
     # Save pre-optimization (structure right after bonding, before any MD)
-    utils.save_molecule(
-        final_with_h,
-        f"{name}_{conformers_selection}_pre_opt",
-        file_format='sdf'
-    )
-    print(f"  Saved: {name}_{conformers_selection}_pre_opt.sdf")
+    if save_debug_checkpoints:
+        utils.save_molecule(
+            final_with_h,
+            f"{name}_{conformers_selection}_pre_opt",
+            file_format='sdf'
+        )
+        print(f"  Saved: {name}_{conformers_selection}_pre_opt.sdf")
 
     # Save optimized
     if success:

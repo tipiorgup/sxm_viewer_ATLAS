@@ -56,6 +56,11 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self._fixed_ori_group.setVisible(False)
         root.addWidget(self._fixed_ori_group)
 
+        self.debug_chk = QtWidgets.QCheckBox(
+            "Debugging option (save intermediate structures: pre-opt, "
+            "post-phase1, post-phase2)")
+        root.addWidget(self.debug_chk)
+
         # Parameters
         param_row = QtWidgets.QHBoxLayout()
         param_row.addWidget(QtWidgets.QLabel("Iterations:"))
@@ -261,6 +266,8 @@ class MISORunnerDialog(QtWidgets.QDialog):
             "--n_polymers", str(self.poly_spin.value()),
             "--phase1_kicks",
         ]
+        if self.debug_chk.isChecked():
+            args.append("--debug_checkpoints")
         self._process.start(sys.executable, args)
 
         self.run_btn.setEnabled(False)
