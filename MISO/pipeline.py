@@ -1466,12 +1466,13 @@ def save_optimization_results(final_with_h, optimized_mol, success,
     print("SAVING RESULTS")
     print("="*70)
     
-    # Save pre-optimization  (disabled: only the final *_optimized.sdf is kept)
-    # utils.save_molecule(
-    #     final_with_h,
-    #     f"{name}_{conformers_selection}_pre_opt",
-    #     file_format='sdf'
-    # )
+    # Save pre-optimization (structure right after bonding, before any MD)
+    utils.save_molecule(
+        final_with_h,
+        f"{name}_{conformers_selection}_pre_opt",
+        file_format='sdf'
+    )
+    print(f"  Saved: {name}_{conformers_selection}_pre_opt.sdf")
 
     # Save optimized
     if success:
