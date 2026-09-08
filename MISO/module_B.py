@@ -284,7 +284,7 @@ def main():
                         all_lipids = []
 
                     with timer.section(f"{tag}   Peptide building", level=3):
-                        peptide_data = lpf.build_peptide(config, circles)
+                        peptide_data = lpf.build_peptide(config, circles, orientations=orientations)
                         print(f"DEBUG peptide_data: {peptide_data}")
 
                     with timer.section(f"{tag}   Peptide linkages", level=3):

@@ -962,10 +962,15 @@ def extract_lipid_tail_indices_3_points(final_no_h, molecule_data_dict):
 # PEPTIDE BUILDING
 # ============================================================================
 
-def build_peptide(config, circles):
+def build_peptide(config, circles, orientations=None):
     """
     Build peptide from configuration.
-    
+
+    ``orientations`` (optional {point_index: 3x3 matrix} from load_orientations)
+    supplies a fixed side-chain pose per residue, keyed by the residue's
+    ca_position index. When present for a residue, it is applied directly
+    instead of rotating the side chain toward functional_position.
+
     Returns:
         peptide_data or None
     """
@@ -997,9 +1002,15 @@ def build_peptide(config, circles):
             res_data['functional_position'] = circles[func_pos_idx].tolist()
         else:
             res_data['functional_position'] = None
-        
+
+        if orientations and ca_pos_idx in orientations:
+            res_data['fixed_rotation'] = orientations[ca_pos_idx].tolist()
+        else:
+            res_data['fixed_rotation'] = None
+
         residue_data.append(res_data)
-        print(f"  {res_config['aa']}: Cα={ca_pos_idx}, Func={func_pos_idx}")
+        print(f"  {res_config['aa']}: Cα={ca_pos_idx}, Func={func_pos_idx}, "
+              f"FixedR={'yes' if res_data['fixed_rotation'] else 'no'}")
 
     cyclic = config['peptide'].get('cyclic', False)
 

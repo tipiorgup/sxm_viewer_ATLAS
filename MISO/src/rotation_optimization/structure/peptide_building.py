@@ -609,6 +609,20 @@ def _rotate_side_chain_toward(conf, side_atoms, ca_xy, target_xy):
     return float(np.degrees(angle))
 
 
+def _rotate_side_chain_by_matrix(conf, side_atoms, ca_pos, R):
+    """Rotate side_atoms around ca_pos using a fixed 3x3 rotation matrix
+    (from the GUI orientation CSV), then flatten back to the surface (z=0).
+    """
+    if not side_atoms:
+        return
+    ca = np.array(ca_pos, dtype=float)
+    for atom_idx in side_atoms:
+        pos = np.array([*conf.GetAtomPosition(atom_idx)], dtype=float)
+        new_pos = R @ (pos - ca) + ca
+        new_pos[2] = 0.0
+        conf.SetAtomPosition(atom_idx, new_pos.tolist())
+
+
 def position_peptide_at_experimental_positions(peptide, residue_info, residue_data):
     """
     Position peptide backbone via global Kabsch alignment on Cα positions,
@@ -645,20 +659,34 @@ def position_peptide_at_experimental_positions(peptide, residue_info, residue_da
 
 
 def _orient_all_side_chains(peptide, conf, residue_info, residue_data):
-    """Rotate each residue's side chain in XY toward its functional_position."""
+    """Orient each residue's side chain.
+
+    When ``fixed_rotation`` (a 3x3 matrix from the GUI orientation CSV) is
+    present for a residue, it is applied directly around the Cα, no runtime
+    alignment. Otherwise the side chain is rotated in XY toward the
+    residue's functional_position, as before.
+    """
     print(f"Orienting side chains:")
     for res_idx, (res_info, res_data) in enumerate(zip(residue_info, residue_data)):
+        ca_idx = res_info['ca_idx']
+        side_atoms = _get_side_chain_atoms_linear(peptide, ca_idx)
+
+        fixed_rotation = res_data.get('fixed_rotation')
+        if fixed_rotation is not None:
+            ca_pos = [*conf.GetAtomPosition(ca_idx)]
+            _rotate_side_chain_by_matrix(conf, side_atoms, ca_pos, np.array(fixed_rotation))
+            print(f"  Residue {res_idx} ({res_info['aa']}): fixed orientation applied from GUI CSV")
+            continue
+
         func_pos = res_data.get('functional_position')
         if func_pos is None:
             print(f"  Residue {res_idx} ({res_info['aa']}): no functional_position, skipped")
             continue
 
-        ca_idx = res_info['ca_idx']
         pos = conf.GetAtomPosition(ca_idx)
         ca_xy = np.array([pos.x, pos.y])
         target_xy = np.array(func_pos[:2])
 
-        side_atoms = _get_side_chain_atoms_linear(peptide, ca_idx)
         deg = _rotate_side_chain_toward(conf, side_atoms, ca_xy, target_xy)
         print(f"  Residue {res_idx} ({res_info['aa']}): side chain rotated {deg:.1f}°")
 
