@@ -314,12 +314,11 @@ class MISORunnerDialog(QtWidgets.QDialog):
                     continue
                 stem = sdf_path.stem
                 Chem.MolToMolFile(mol, str(results_dir / f"{stem}.mol"))
-                Chem.MolToMol2File(mol, str(results_dir / f"{stem}.mol2"))
                 converted += 1
             except Exception as e:
                 self._append(f"[MISO] Could not convert {sdf_path.name}: {e}")
         if converted:
-            self._append(f"[MISO] Converted {converted} SDF → mol + mol2")
+            self._append(f"[MISO] Converted {converted} SDF → mol")
 
     def _cleanup_tmp(self):
         if self._tmp_yaml:
