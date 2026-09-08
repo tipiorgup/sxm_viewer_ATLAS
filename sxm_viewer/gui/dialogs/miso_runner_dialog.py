@@ -34,10 +34,16 @@ class MISORunnerDialog(QtWidgets.QDialog):
 
         self.yaml_le, yaml_row = self._file_row("Browse…", "YAML files (*.yml *.yaml);;All files (*)")
         self.csv_le,  csv_row  = self._file_row("Browse…", "CSV files (*.csv);;All files (*)")
+        self.ori_le,  ori_row  = self._file_row("Browse…", "CSV files (*.csv);;All files (*)")
 
         form.addRow("Config YAML:", yaml_row)
         form.addRow("Positions CSV:", csv_row)
+        form.addRow("Orientations CSV (optional):", ori_row)
         root.addLayout(form)
+
+        self.fixed_ori_chk = QtWidgets.QCheckBox(
+            "Use fixed orientation (skip QUEST alignment for placed monomers)")
+        root.addWidget(self.fixed_ori_chk)
 
         # Parameters
         param_row = QtWidgets.QHBoxLayout()
@@ -122,6 +128,9 @@ class MISORunnerDialog(QtWidgets.QDialog):
                 csv_guess = Path(stem + "_positions.csv")
                 if csv_guess.exists():
                     self.csv_le.setText(str(csv_guess.resolve()))
+                ori_guess = Path(stem + "_orientations.csv")
+                if ori_guess.exists():
+                    self.ori_le.setText(str(ori_guess.resolve()))
         except Exception:
             pass
 
@@ -170,6 +179,16 @@ class MISORunnerDialog(QtWidgets.QDialog):
         cfg["circle_input_path"] = csv_path
         cfg.pop("stm_grid_path", None)
 
+        # Orientations CSV / fixed-orientation flag: only touch these when the
+        # dialog actually supplies something, so a yaml that already has them
+        # set (circle_input_path is always overridden above, these are not)
+        # is left alone instead of being silently wiped by an empty field.
+        ori_path = self.ori_le.text().strip()
+        if ori_path:
+            cfg["orientation_csv_path"] = ori_path
+        if self.fixed_ori_chk.isChecked():
+            cfg["use_fixed_orientation"] = True
+
         results_dir = Path(csv_path).parent / "results"
         results_dir.mkdir(exist_ok=True)
         self._results_dir = results_dir
@@ -182,9 +201,11 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self._tmp_yaml.close()
 
         self.log.clear()
-        self._append(f"[MISO] Results dir: {results_dir}")
-        self._append(f"[MISO] Config:      {yaml_path}")
-        self._append(f"[MISO] CSV:         {csv_path}")
+        self._append(f"[MISO] Results dir:        {results_dir}")
+        self._append(f"[MISO] Config:             {yaml_path}")
+        self._append(f"[MISO] circle_input_path:  {cfg.get('circle_input_path')}")
+        self._append(f"[MISO] orientation_csv_path: {cfg.get('orientation_csv_path')}")
+        self._append(f"[MISO] use_fixed_orientation: {cfg.get('use_fixed_orientation', False)}")
         self._append("-" * 60)
 
         self._process = QtCore.QProcess(self)
