@@ -335,7 +335,6 @@ def main():
                                 enforced_atoms = []
                         else:
                             # pure cyclic peptide, no sugars
-                            from rdkit import Chem
                             final_no_h = peptide_data['rdkit_mol']
                             enforced_atoms = []
                             Chem.MolToPDBFile(final_no_h, f"{name}_cyclic_peptide.pdb")
