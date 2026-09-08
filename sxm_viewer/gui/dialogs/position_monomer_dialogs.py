@@ -153,6 +153,25 @@ def _find_functional_atom_indices(mol_with_h, aa_name):
     idx = _find_functional_group_atom(mol_with_h, functional_type)
     return [idx] if idx is not None else None
 
+
+def _find_ca_atom(mol, aa_name):
+    """Locate the Cα atom, mirroring MISO peptide_building.find_ca_in_aa
+    (same heuristics, same SMILES source, so atom order matches). Returns
+    an atom index, or None if not found.
+    """
+    from rdkit import Chem
+    if aa_name == 'Gly':
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'C':
+                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+                if 'N' in neighbors and neighbors.count('C') == 1:
+                    return atom.GetIdx()
+        return None
+    for atom in mol.GetAtoms():
+        if atom.GetSymbol() == 'C' and atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED:
+            return atom.GetIdx()
+    return None
+
 # Element colors for the 2D overlay (top-down projection onto the STM image).
 ATOM_COLORS = {"C": "#222222", "O": "#e53935", "N": "#1e88e5",
                "H": "#bbbbbb", "S": "#fdd835", "P": "#fb8c00"}
@@ -841,21 +860,30 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         QtWidgets.QMessageBox.information(self, "Build", msg)
 
     @staticmethod
-    def _template_from_mol(mol, conf_name, functional_atom_indices=None):
-        """Heavy-atom coordinates/bonds/COM from an embedded RDKit mol.
+    def _template_from_mol(mol, conf_name, functional_atom_indices=None, ca_atom_index=None):
+        """Heavy-atom coordinates/bonds/anchor from an embedded RDKit mol.
 
         functional_atom_indices, if given, are atom indices in `mol` (still
         with explicit H at this point) whose centroid is the amino acid's
         side-chain functional point; it is returned as functional_rel,
-        relative to COM in the same frame as `rel`, for automatic
+        relative to the anchor in the same frame as `rel`, for automatic
         functional-position placement without a manual click.
+
+        ca_atom_index, if given, is the Cα atom's index in `mol`: it becomes
+        the anchor (COM), since MISO places/rotates each residue by treating
+        this point as the Cα, not as the molecule's actual center of mass.
+        Without it (e.g. sugars, called separately, never pass this), the
+        anchor falls back to the mass-weighted centroid of all heavy atoms.
         """
         from rdkit.Chem import RemoveHs
+        conf_before = mol.GetConformer()
         functional_abs = None
         if functional_atom_indices:
-            conf_before = mol.GetConformer()
             pts = np.array([[*conf_before.GetAtomPosition(i)] for i in functional_atom_indices])
             functional_abs = pts.mean(axis=0)
+        ca_abs = None
+        if ca_atom_index is not None:
+            ca_abs = np.array([*conf_before.GetAtomPosition(ca_atom_index)], dtype=float)
         mol = RemoveHs(mol)                       # H are added at the very end
         conf = mol.GetConformer()
         coords, atom_types, masses = [], [], []
@@ -865,7 +893,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             atom_types.append(atom.GetSymbol())
             masses.append(atom.GetMass())
         coords = np.asarray(coords, dtype=float)
-        com = np.average(coords, weights=np.asarray(masses), axis=0)
+        com = ca_abs if ca_abs is not None else np.average(coords, weights=np.asarray(masses), axis=0)
         bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds()]
         functional_rel = (functional_abs - com).tolist() if functional_abs is not None else None
         return {"conf_name": conf_name, "rel": coords - com,
@@ -922,11 +950,18 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             except Exception:
                 AllChem.UFFOptimizeMolecule(mol, maxIters=500)
             # Locate the side-chain functional group (e.g. the ring in Phe)
-            # on the explicit-H mol before RemoveHs strips them, so the
-            # functional point can be placed automatically instead of
-            # requiring a manual click.
+            # and the Cα atom on the explicit-H mol before RemoveHs strips
+            # them. The Cα becomes the template's anchor (COM) instead of
+            # the whole residue's mass centroid, since MISO places/rotates
+            # the residue by treating this point as Cα; for an asymmetric
+            # residue like Phe the two differ enough to visibly displace the
+            # ring if the mass centroid were used instead.
             functional_atom_indices = _find_functional_atom_indices(mol, name)
-            return self._template_from_mol(mol, name, functional_atom_indices)
+            ca_atom_index = _find_ca_atom(mol, name)
+            if ca_atom_index is None:
+                print(f"amino-acid build warning for {name}: Cα not found, "
+                      f"falling back to whole-residue mass centroid as anchor")
+            return self._template_from_mol(mol, name, functional_atom_indices, ca_atom_index)
         except Exception as exc:
             print(f"amino-acid build failed for {name} ({smiles}): {exc}")
             return None
