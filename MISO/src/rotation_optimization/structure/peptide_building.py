@@ -236,6 +236,15 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
         aa_mol = Chem.MolFromSmiles(aa_smiles[aa])
         aa_mol = Chem.AddHs(aa_mol)
         AllChem.EmbedMolecule(aa_mol, randomSeed=42)
+        # Raw ETKDG embed gives plausible bond lengths but leaves steric
+        # clashes (side chain vs backbone) unresolved; relax them here so
+        # Phase 1 optimization starts from a sane geometry instead of one it
+        # has to fight through. Mirrors what sugars already get via
+        # generate_monomer_conformers / the GUI's _build_aa_template.
+        try:
+            AllChem.MMFFOptimizeMolecule(aa_mol, maxIters=500)
+        except Exception:
+            AllChem.UFFOptimizeMolecule(aa_mol, maxIters=500)
 
         # Tag every atom with its residue index so the per-residue placement
         # path can recover membership after CombineMols/RemoveAtom shuffles
@@ -291,6 +300,14 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
                 # Kabsch positioning has distinct, globally-consistent Cα coords.
                 peptide = Chem.AddHs(peptide)
                 AllChem.EmbedMolecule(peptide, randomSeed=42)
+                # Same relaxation as the per-residue embed above: the raw
+                # re-embed has unresolved clashes at the new peptide bond and
+                # anywhere else strain accumulated; relax before this becomes
+                # Phase 1's starting structure.
+                try:
+                    AllChem.MMFFOptimizeMolecule(peptide, maxIters=500)
+                except Exception:
+                    AllChem.UFFOptimizeMolecule(peptide, maxIters=500)
             # Big path: skip the whole-peptide embed. The combined conformer
             # carries each residue's individually-embedded coordinates through
             # CombineMols; per-residue placement re-positions them afterwards.
