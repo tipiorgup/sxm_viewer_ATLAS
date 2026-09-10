@@ -1728,35 +1728,63 @@ def restore_glycopeptide_positions(final_mol, molecule_data_dict, peptide_data, 
     # Match by ORDER, not proximity (peptide built sequentially)
     # Cα index i in molecule corresponds to residue i in sequence
     matched_pairs = [(i, i) for i in range(len(ca_indices))]
-    
-    # Restore each residue
+
+    # STEP 1: Rigidly align the WHOLE peptide fragment (all residues at
+    # once, one Kabsch fit) onto the target Cα positions, instead of
+    # translating each residue independently. build_peptide_with_rdkit_ca
+    # already places each residue correctly before bonding; what disturbs
+    # that here is the trans-dihedral enforcement on the glycosidic bond
+    # (elsewhere in this export step), which rotates the whole attached
+    # peptide fragment as one rigid body around an axis anchored to the
+    # sugar's own (not perfectly flat) ring geometry. A single rigid fit
+    # of the fragment corrects that without breaking the peptide bonds
+    # between residues, which independent per-residue translation would
+    # (find_residue_atoms stops exactly at those bonds, so two residues
+    # translated by different vectors stretch the bond between them).
+    current_ca_all = np.array(
+        [[*conf.GetAtomPosition(ca_indices[i])] for i in range(len(ca_indices))],
+        dtype=float
+    )
+    target_ca_all = np.array(
+        [exp_residues[i]['ca_position'] for i in range(len(ca_indices))],
+        dtype=float
+    )
+    cur_center = current_ca_all.mean(axis=0)
+    tgt_center = target_ca_all.mean(axis=0)
+    H = (current_ca_all - cur_center).T @ (target_ca_all - tgt_center)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    rot = Vt.T @ np.diag([1, 1, d]) @ U.T
+
+    peptide_atoms = set()
+    for ca_idx in ca_indices:
+        peptide_atoms.update(find_residue_atoms(final_mol, ca_idx))
+    for atom_idx in peptide_atoms:
+        pos = conf.GetAtomPosition(atom_idx)
+        pos_arr = np.array([pos.x, pos.y, pos.z])
+        new_pos = rot @ (pos_arr - cur_center) + tgt_center
+        conf.SetAtomPosition(atom_idx, tuple(new_pos))
+
+    rmsd = np.sqrt(np.mean(np.sum(
+        ((rot @ (current_ca_all - cur_center).T).T + tgt_center - target_ca_all) ** 2, axis=1)))
+    print(f"\n  Rigid whole-peptide alignment applied ({len(ca_indices)} Cα, RMSD: {rmsd:.3f} Å)")
+
+    # Restore each residue's side-chain orientation (safe per-residue: only
+    # moves side-chain atoms relative to their own, now-aligned Cα)
     for curr_idx, exp_idx in matched_pairs:
         ca_idx = ca_indices[curr_idx]
         residue_aa = exp_residues[exp_idx]['aa']
-        
-        # Get current and target Cα positions
+
         pos = conf.GetAtomPosition(ca_idx)
         current_ca = np.array([pos.x, pos.y, pos.z])
         target_ca = np.array(exp_residues[exp_idx]['ca_position'])
-        
+
         print(f"\n  Residue {exp_idx} ({residue_aa}):")
-        print(f"    Current Cα: [{current_ca[0]:.3f}, {current_ca[1]:.3f}, {current_ca[2]:.3f}]")
+        print(f"    Aligned Cα: [{current_ca[0]:.3f}, {current_ca[1]:.3f}, {current_ca[2]:.3f}]")
         print(f"    Target Cα:  [{target_ca[0]:.3f}, {target_ca[1]:.3f}, {target_ca[2]:.3f}]")
-        
-        # Find all atoms in this residue
+
         residue_atoms = find_residue_atoms(final_mol, ca_idx)
-        
-        # STEP 1: Translate so Cα is at target position
-        translation = target_ca - current_ca
-        
-        for atom_idx in residue_atoms:
-            pos = conf.GetAtomPosition(atom_idx)
-            pos_arr = np.array([pos.x, pos.y, pos.z])
-            new_pos = pos_arr + translation
-            conf.SetAtomPosition(atom_idx, tuple(new_pos))
-        
-        print(f"    Translation: {np.linalg.norm(translation):.3f} Å")
-        
+
         # STEP 2: Rotate side chain toward functional_position using centroid
         # (func_idx from residue_info is stale after mol combination — use centroid instead)
         target_func = exp_residues[exp_idx].get('functional_position')

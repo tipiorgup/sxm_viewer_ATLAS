@@ -510,27 +510,86 @@ def _resolve_functional_atoms(mol, aa, functional_type):
     return [idx] if idx is not None else None
 
 
+def _backbone_neighbors(mol, ca_idx):
+    """(backbone_n_idx, backbone_c_idx) bonded directly to Ca, or None for
+    either that isn't found. The carbonyl C is identified by its double
+    bonded O so a side-chain root carbon (e.g. Cb) is never mistaken for it.
+    """
+    ca_atom = mol.GetAtomWithIdx(ca_idx)
+    backbone_n, backbone_c = None, None
+    for nb in ca_atom.GetNeighbors():
+        if nb.GetSymbol() == 'N':
+            backbone_n = nb.GetIdx()
+        elif nb.GetSymbol() == 'C':
+            for nn in nb.GetNeighbors():
+                if nn.GetSymbol() == 'O':
+                    bond = mol.GetBondBetweenAtoms(nb.GetIdx(), nn.GetIdx())
+                    if bond and bond.GetBondTypeAsDouble() == 2.0:
+                        backbone_c = nb.GetIdx()
+                        break
+    return backbone_n, backbone_c
+
+
+def _svd_normal(points):
+    """Unit normal of the best-fit plane through points (least squares for
+    >3 points, exact for 3). None if there are too few points or they're
+    collinear/degenerate.
+    """
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 3:
+        return None
+    centered = pts - pts.mean(axis=0)
+    if np.linalg.matrix_rank(centered, tol=1e-6) < 2:
+        return None
+    _, _, vt = np.linalg.svd(centered)
+    normal = vt[-1]
+    norm = np.linalg.norm(normal)
+    return normal / norm if norm > 1e-9 else None
+
+
 def _place_residue_rigid(mol, ca_idx, functional_atom_indices, target_ca, target_func):
     """Rigidly translate+rotate mol (in place) so its Ca lands on target_ca
     and, if target_func is given, the Ca->functional direction aligns with
-    the target direction. A proper rotation only (never a reflection), so
-    the residue's real stereochemistry and internal geometry (bond lengths,
-    angles, side-chain shape) are preserved exactly, only its pose changes.
+    the target direction. Two composed proper rotations only, never a
+    reflection and never an axis-drop projection, so bond lengths, angles
+    and ring pucker are preserved exactly, only the residue's pose changes.
 
-    With only a target Ca and a target direction, the pose has just as much
-    freedom as it needs: 2D position (2 dof) + rotation angle (1 dof) match
     Ca position (2 dof, flattened to the surface) + direction angle (1 dof)
-    exactly, no ambiguity as long as the transform is a proper rotation.
+    pins a flat placement but leaves one more rotational dof undetermined:
+    how the residue's own reference plane (its ring, for ring-bearing side
+    chains, or its N-Ca-C backbone otherwise) is tipped relative to the
+    surface. That's resolved first, by leveling the reference plane's own
+    best-fit normal onto the surface normal (Z), before the remaining
+    in-plane spin is used to match the functional direction. Atoms outside
+    the reference plane keep whatever true out-of-plane offset the relaxed
+    conformer gave them; nothing is forced onto Z=0.
     """
     conf = mol.GetConformer()
     n_atoms = mol.GetNumAtoms()
     ca_pos = np.array([*conf.GetAtomPosition(ca_idx)], dtype=float)
     target_ca_arr = np.array(target_ca, dtype=float)
+    positions = np.array([[*conf.GetAtomPosition(i)] for i in range(n_atoms)], dtype=float)
+
+    if functional_atom_indices and len(functional_atom_indices) >= 3:
+        plane_atoms = list(functional_atom_indices)
+    else:
+        backbone_n, backbone_c = _backbone_neighbors(mol, ca_idx)
+        plane_atoms = [ca_idx] + [i for i in (backbone_n, backbone_c) if i is not None]
+
+    normal = _svd_normal(positions[plane_atoms]) if len(plane_atoms) >= 3 else None
+    if normal is not None:
+        if normal[2] < 0:
+            normal = -normal  # smaller rotation than flipping to the -Z lobe
+        level_rot = R.align_vectors(np.array([[0.0, 0.0, 1.0]]), np.array([normal]))[0]
+        level_mat = level_rot.as_matrix()
+    else:
+        level_mat = np.eye(3)
+
+    leveled = (positions - ca_pos) @ level_mat.T
 
     angle = 0.0
     if target_func is not None and functional_atom_indices:
-        pts = np.array([[*conf.GetAtomPosition(i)] for i in functional_atom_indices])
-        current_vec = (pts.mean(axis=0) - ca_pos)[:2]
+        current_vec = leveled[functional_atom_indices].mean(axis=0)[:2]
         target_vec = (np.array(target_func, dtype=float) - target_ca_arr)[:2]
         if np.linalg.norm(current_vec) > 1e-6 and np.linalg.norm(target_vec) > 1e-6:
             cv = current_vec / np.linalg.norm(current_vec)
@@ -538,13 +597,13 @@ def _place_residue_rigid(mol, ca_idx, functional_atom_indices, target_ca, target
             angle = np.arctan2(np.cross(cv, tv), np.dot(cv, tv))
 
     cos_a, sin_a = np.cos(angle), np.sin(angle)
-    rot2d = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+    spin_mat = np.array([[cos_a, -sin_a, 0.0],
+                          [sin_a, cos_a, 0.0],
+                          [0.0, 0.0, 1.0]])
 
+    final_positions = leveled @ spin_mat.T + target_ca_arr
     for i in range(n_atoms):
-        pos = np.array([*conf.GetAtomPosition(i)], dtype=float)
-        rel_xy = rot2d @ (pos - ca_pos)[:2]
-        conf.SetAtomPosition(i, [rel_xy[0] + target_ca_arr[0],
-                                  rel_xy[1] + target_ca_arr[1], 0.0])
+        conf.SetAtomPosition(i, final_positions[i].tolist())
 
 
 def _collect_hydroxyl(mol, carboxyl_c):
@@ -623,17 +682,7 @@ def _get_side_chain_atoms_linear(mol, ca_idx):
     Stops at backbone N and backbone C=O so only true side-chain atoms are returned.
     """
     ca_atom = mol.GetAtomWithIdx(ca_idx)
-    backbone_n, backbone_c = None, None
-    for nb in ca_atom.GetNeighbors():
-        if nb.GetSymbol() == 'N':
-            backbone_n = nb.GetIdx()
-        elif nb.GetSymbol() == 'C':
-            for nn in nb.GetNeighbors():
-                if nn.GetSymbol() == 'O':
-                    bond = mol.GetBondBetweenAtoms(nb.GetIdx(), nn.GetIdx())
-                    if bond and bond.GetBondTypeAsDouble() == 2.0:
-                        backbone_c = nb.GetIdx()
-                        break
+    backbone_n, backbone_c = _backbone_neighbors(mol, ca_idx)
 
     blocked = {ca_idx}
     if backbone_n is not None:
