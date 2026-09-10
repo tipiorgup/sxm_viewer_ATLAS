@@ -9,7 +9,7 @@ from ...constants import (
     DEFAULT_NORMAL_STIFFNESS, CONSTRAINED_MAX_TRANSLATION,
     CONSTRAINED_TRANSLATION_STIFFNESS, FREE_MAX_TRANSLATION,
     FREE_TRANSLATION_STIFFNESS, PYRANOSE_RING_SIZE,
-    RING_MATCHING_DISTANCE_THRESHOLD,
+    RING_MATCHING_DISTANCE_THRESHOLD, TEMPERATURE_K, BOLTZMANN_KCAL,
 )
 from ..geometry.geometry_utils import (
     get_positions, set_positions, get_atom_position,
@@ -246,6 +246,108 @@ def get_ring_substituents(mol, ring_atoms, all_ring_atoms_global):
                     queue.append(next_idx)
     
     return list(to_rotate)
+
+def calculate_inertia_tensor(atom_indices, positions, masses, com):
+    """Full 3x3 inertia tensor about com, for arbitrary-axis rigid rotation
+    (calculate_moment_of_inertia only gives the fixed Z-axis scalar I_zz).
+    """
+    inertia = np.zeros((3, 3))
+    for idx in atom_indices:
+        r = positions[idx] - com
+        inertia += masses[idx] * (np.dot(r, r) * np.eye(3) - np.outer(r, r))
+    return inertia
+
+
+def build_rigid_ring_units(mol, pyranose_rings, fixed_atoms=None):
+    """One rigid-body unit per pyranose ring: the ring plus every substituent
+    hanging off it (hydroxyls, CH2OH, ring hydrogens, ...), stopped at
+    glycosidic linkages to other rings, exactly the atom set
+    get_ring_substituents already defines. A ring with any atom already in
+    fixed_atoms is skipped (those atoms are frozen elsewhere and pinning them
+    into a rigid body too would over-constrain the minimizer).
+
+    Each unit starts at rest; its own linear/angular velocity accumulates
+    from step_rigid_ring_unit across the MD run.
+    """
+    fixed_set = set(fixed_atoms or [])
+    all_ring_atoms_global = {a for ring in pyranose_rings for a in ring}
+    units = []
+    for ring_atoms in pyranose_rings:
+        atoms = get_ring_substituents(mol, ring_atoms, all_ring_atoms_global)
+        if fixed_set and any(a in fixed_set for a in atoms):
+            continue
+        units.append({
+            'atoms': atoms,
+            'linear_velocity': np.zeros(3),
+            'angular_velocity': np.zeros(3),
+        })
+    return units
+
+
+def step_rigid_ring_unit(positions, forces, unit, masses, timestep, friction,
+                          out_positions):
+    """Advance one ring rigid body by one MD step.
+
+    Net force and net torque about the unit's own center of mass are
+    integrated into a single translation and a single rotation, applied to
+    every atom in the unit together (Rodrigues, vectorized). Internal bond
+    lengths, angles and pucker are therefore mathematically unchanged step
+    to step, only the unit's pose (position + orientation) moves, like a
+    hard sphere on a bond that's free to rotate.
+
+    Reads current geometry/forces from *positions*/*forces* (the state
+    entering this step, still exactly rigid) and writes the result into
+    *out_positions* for this unit's atoms only, leaving every other atom's
+    row untouched. Per-atom thermal noise is drawn the same way
+    calculate_langevin_random_force draws it elsewhere, then summed into
+    the rigid body's net force/torque, so the unit feels the same thermal
+    environment as an ordinary atom, just responds to it as one rigid body
+    instead of len(atoms) independent ones.
+    """
+    atoms = unit['atoms']
+    sub_masses = masses[atoms]
+    total_mass = sub_masses.sum()
+    com = calculate_center_of_mass(positions[atoms], sub_masses)
+
+    random_force = np.random.randn(len(atoms), 3) * np.sqrt(
+        2 * friction * TEMPERATURE_K * BOLTZMANN_KCAL *
+        sub_masses[:, np.newaxis] / timestep
+    )
+    atom_forces = forces[atoms] + random_force
+
+    rel = positions[atoms] - com
+    net_force = atom_forces.sum(axis=0)
+    net_torque = np.sum(np.cross(rel, atom_forces), axis=0)
+
+    inertia = calculate_inertia_tensor(atoms, positions, masses, com)
+    try:
+        angular_accel = np.linalg.solve(inertia, net_torque)
+    except np.linalg.LinAlgError:
+        trace = np.trace(inertia)
+        angular_accel = net_torque / trace if trace > EPSILON else np.zeros(3)
+
+    linear_accel = net_force / total_mass
+
+    unit['linear_velocity'] = (unit['linear_velocity'] * (1 - friction * timestep)
+                                + linear_accel * timestep)
+    unit['angular_velocity'] = (unit['angular_velocity'] * (1 - friction * timestep)
+                                 + angular_accel * timestep)
+
+    new_com = com + unit['linear_velocity'] * timestep
+    omega = unit['angular_velocity']
+    angle = np.linalg.norm(omega) * timestep
+
+    if angle > EPSILON:
+        axis = omega / np.linalg.norm(omega)
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        dot = rel @ axis
+        rotated = (rel * cos_a + np.cross(axis, rel) * sin_a
+                   + np.outer(dot, axis) * (1 - cos_a))
+    else:
+        rotated = rel
+
+    out_positions[atoms] = rotated + new_com
+
 
 def apply_translation_constraint(positions, forces, ring_atoms, ring_masses,
                                  com_current, com_initial, max_translation,

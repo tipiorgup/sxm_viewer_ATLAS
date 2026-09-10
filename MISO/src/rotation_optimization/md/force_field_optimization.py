@@ -12,6 +12,7 @@ from .ring_functions import (
     detect_pyranose_rings, get_ring_reference_geometry,
     check_and_update_rings, check_ring_integrity,
     apply_ring_constraints_dual_mode,
+    build_rigid_ring_units, step_rigid_ring_unit,
 )
 from .config import OptimizationConfig, RingConstraintConfig, RingRotationUnit
 from .utils import (
@@ -422,6 +423,21 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
               f"(bond<{config.ring_tolerance_bond:.3f} Å, "
               f"angle<{config.ring_tolerance_angle:.1f}°)")
 
+    # Hard-sphere pyranose rings: each ring (plus its substituents, stopped at
+    # glycosidic linkages) moves as one rigid body, translation + rotation
+    # only, so its internal geometry can never deform during compression, not
+    # just get caught after the fact by the tolerance safeguard above. See
+    # step_rigid_ring_unit for the mechanics.
+    rigid_ring_units = []
+    rigid_ring_atom_set = set()
+    if pyranose_rings:
+        rigid_ring_units = build_rigid_ring_units(mol_copy, pyranose_rings, fixed_atoms)
+        rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
+        skipped = len(pyranose_rings) - len(rigid_ring_units)
+        print(f"  Rigid ring bodies: {len(rigid_ring_units)} active "
+              f"({sum(len(u['atoms']) for u in rigid_ring_units)} atoms)"
+              + (f", {skipped} skipped (overlap fixed_atoms)" if skipped else ""))
+
     initial_xy = None
     if xy_constrained_atoms:
         initial_xy = positions[xy_constrained_atoms, :2].copy()
@@ -464,8 +480,14 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
 
         if step % config.minimize_interval == 0:
             t0 = time.perf_counter()
+            # Freeze rigid ring atoms for this minimize burst too — this is a
+            # real per-atom MMFF minimize on mol_copy, outside the rigid-body
+            # step below, so without this the ring would be free to deform
+            # here even though the per-step integration never lets it.
+            minimize_fixed = (list(dict.fromkeys(list(fixed_atoms) + list(rigid_ring_atom_set)))
+                               if rigid_ring_atom_set else fixed_atoms)
             minimize_with_constraint_no_com(
-                mol_copy, props, use_mmff, fixed_atoms,
+                mol_copy, props, use_mmff, minimize_fixed,
                 n_atoms, config.minimize_iterations,
                 torsion_constraints=torsion_constraints)
             t_minimize += time.perf_counter() - t0
@@ -530,6 +552,16 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
                 new_positions[atom_idx, 0] = initial_xy[i, 0]
                 new_positions[atom_idx, 1] = initial_xy[i, 1]
                 velocities[atom_idx, :2] = 0
+
+        # Rigid ring bodies: overwrite the naive per-atom step above for these
+        # atoms with one translation + one rotation computed from the same
+        # positions/total_forces this step, so the ring can never deform,
+        # only move and spin as a whole.
+        for unit in rigid_ring_units:
+            step_rigid_ring_unit(positions, total_forces, unit, masses,
+                                  config.timestep, config.friction, new_positions)
+            for atom_idx in unit['atoms']:
+                velocities[atom_idx] = 0
 
         set_positions(conf, new_positions, n_atoms)
         t_velocity_update += time.perf_counter() - t0
@@ -1088,6 +1120,7 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         ring_rotation_units, ring_references,
         config, last_valid_mol, fixed_atoms,
         xy_constrained_atoms=lipid_tail_indices or [],
+        pyranose_rings=pyranose_rings,
         molecule_data_dict=molecule_data_dict,
         stm_data=stm_data,
         trajectory_path=trajectory_path,
