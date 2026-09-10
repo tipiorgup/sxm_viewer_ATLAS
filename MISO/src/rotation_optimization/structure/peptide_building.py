@@ -263,7 +263,19 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
             functional_idx = 'centroid'  # Will calculate after positioning
         elif functional_type:
             functional_idx = find_functional_group_atom(aa_mol, aa, functional_type)
-        
+
+        # Rigidly place this residue (backbone + side chain together, one
+        # rigid body) at its experimental Ca + functional-group direction,
+        # instead of leaving it wherever the embed happened to put it and
+        # relying on a later, independent per-residue translation that
+        # breaks the peptide bond to its neighbor. A proper rotation only,
+        # so internal geometry and stereochemistry are preserved exactly.
+        functional_atom_indices = _resolve_functional_atoms(aa_mol, aa, functional_type)
+        _place_residue_rigid(
+            aa_mol, ca_idx, functional_atom_indices,
+            res_data['ca_position'], res_data.get('functional_position')
+        )
+
         if i == 0:
             peptide = aa_mol
             residue_info.append({
@@ -295,22 +307,16 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
             
             peptide = editable.GetMol()
             Chem.SanitizeMol(peptide)
-            if not big_chain:
-                # Small path (unchanged): re-embed the whole growing peptide so
-                # Kabsch positioning has distinct, globally-consistent Cα coords.
-                peptide = Chem.AddHs(peptide)
-                AllChem.EmbedMolecule(peptide, randomSeed=42)
-                # Same relaxation as the per-residue embed above: the raw
-                # re-embed has unresolved clashes at the new peptide bond and
-                # anywhere else strain accumulated; relax before this becomes
-                # Phase 1's starting structure.
-                try:
-                    AllChem.MMFFOptimizeMolecule(peptide, maxIters=500)
-                except Exception:
-                    AllChem.UFFOptimizeMolecule(peptide, maxIters=500)
-            # Big path: skip the whole-peptide embed. The combined conformer
-            # carries each residue's individually-embedded coordinates through
-            # CombineMols; per-residue placement re-positions them afterwards.
+            # No re-embed here (either path): each residue was already
+            # rigidly placed at its experimental Ca + functional direction
+            # above, CombineMols carries those coordinates through as-is.
+            # Re-embedding the combined molecule would throw that placement
+            # away and replace it with an arbitrary new geometry, exactly
+            # what broke this before. The new peptide bond just formed may
+            # not sit at a perfect 1.33 A (two independently-placed rigid
+            # residues generally won't line up exactly), same situation as
+            # the glycosidic bond elsewhere in this pipeline; Phase 4
+            # optimization reconciles that, it does not need a pre-embed.
 
             # Adjust indices
             if functional_idx != 'centroid' and functional_idx is not None:
@@ -485,6 +491,61 @@ def find_functional_group_atom(mol, aa, functional_type):
                     return atom.GetIdx()
     
     return None
+
+
+def _resolve_functional_atoms(mol, aa, functional_type):
+    """Atom indices whose centroid is the side-chain functional point, or
+    None if the residue has no side-chain functional group or it can't be
+    located. Ring centroid uses the largest ring, mirroring
+    calculate_ring_centroid's convention.
+    """
+    if functional_type is None:
+        return None
+    if functional_type == 'ring_centroid':
+        rings = mol.GetRingInfo().AtomRings()
+        if not rings:
+            return None
+        return list(max(rings, key=len))
+    idx = find_functional_group_atom(mol, aa, functional_type)
+    return [idx] if idx is not None else None
+
+
+def _place_residue_rigid(mol, ca_idx, functional_atom_indices, target_ca, target_func):
+    """Rigidly translate+rotate mol (in place) so its Ca lands on target_ca
+    and, if target_func is given, the Ca->functional direction aligns with
+    the target direction. A proper rotation only (never a reflection), so
+    the residue's real stereochemistry and internal geometry (bond lengths,
+    angles, side-chain shape) are preserved exactly, only its pose changes.
+
+    With only a target Ca and a target direction, the pose has just as much
+    freedom as it needs: 2D position (2 dof) + rotation angle (1 dof) match
+    Ca position (2 dof, flattened to the surface) + direction angle (1 dof)
+    exactly, no ambiguity as long as the transform is a proper rotation.
+    """
+    conf = mol.GetConformer()
+    n_atoms = mol.GetNumAtoms()
+    ca_pos = np.array([*conf.GetAtomPosition(ca_idx)], dtype=float)
+    target_ca_arr = np.array(target_ca, dtype=float)
+
+    angle = 0.0
+    if target_func is not None and functional_atom_indices:
+        pts = np.array([[*conf.GetAtomPosition(i)] for i in functional_atom_indices])
+        current_vec = (pts.mean(axis=0) - ca_pos)[:2]
+        target_vec = (np.array(target_func, dtype=float) - target_ca_arr)[:2]
+        if np.linalg.norm(current_vec) > 1e-6 and np.linalg.norm(target_vec) > 1e-6:
+            cv = current_vec / np.linalg.norm(current_vec)
+            tv = target_vec / np.linalg.norm(target_vec)
+            angle = np.arctan2(np.cross(cv, tv), np.dot(cv, tv))
+
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    rot2d = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+
+    for i in range(n_atoms):
+        pos = np.array([*conf.GetAtomPosition(i)], dtype=float)
+        rel_xy = rot2d @ (pos - ca_pos)[:2]
+        conf.SetAtomPosition(i, [rel_xy[0] + target_ca_arr[0],
+                                  rel_xy[1] + target_ca_arr[1], 0.0])
+
 
 def _collect_hydroxyl(mol, carboxyl_c):
     """Return [O(H) idx, H idx] for the single-bonded -OH on a carboxyl carbon."""
