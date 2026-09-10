@@ -385,6 +385,7 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
                           config: OptimizationConfig,
                           last_valid_mol, fixed_atoms, xy_constrained_atoms=[],
                           pyranose_rings=None,
+                          rigid_ring_units=None,
                           initial_ring_coms=None,
                           molecule_data_dict=None, stm_data=None,
                           trajectory_path=None, torsion_constraints=None):
@@ -426,17 +427,14 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
     # Hard-sphere pyranose rings: each ring (plus its substituents, stopped at
     # glycosidic linkages) moves as one rigid body, translation + rotation
     # only, so its internal geometry can never deform during compression, not
-    # just get caught after the fact by the tolerance safeguard above. See
-    # step_rigid_ring_unit for the mechanics.
-    rigid_ring_units = []
-    rigid_ring_atom_set = set()
-    if pyranose_rings:
-        rigid_ring_units = build_rigid_ring_units(mol_copy, pyranose_rings, fixed_atoms)
-        rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
-        skipped = len(pyranose_rings) - len(rigid_ring_units)
+    # just get caught after the fact by the tolerance safeguard above. Built
+    # once by the caller (shared with phases 1 & 3, which freeze the same
+    # atoms instead). See step_rigid_ring_unit for the mechanics.
+    rigid_ring_units = rigid_ring_units or []
+    rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
+    if rigid_ring_units:
         print(f"  Rigid ring bodies: {len(rigid_ring_units)} active "
-              f"({sum(len(u['atoms']) for u in rigid_ring_units)} atoms)"
-              + (f", {skipped} skipped (overlap fixed_atoms)" if skipped else ""))
+              f"({len(rigid_ring_atom_set)} atoms)")
 
     initial_xy = None
     if xy_constrained_atoms:
@@ -1097,8 +1095,27 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         print(f"  Trans torsion restraints: {len(torsion_constraints)} "
               f"(phase 1 freezes {len(glyco_atoms)} atoms; phases 2-3 restrain @180°)")
 
+    # Hard-sphere pyranose rings, built once so phases 1-3 all agree on the
+    # same atom membership. Phase 2 (run_compression_phase) uses the full
+    # rigid_ring_units (with their own velocity state) to let each ring
+    # translate/rotate as one rigid body every step. Phases 1 and 3 are plain
+    # ff.Minimize() calls with no per-step hook to do that dynamics in, so
+    # there the ring is instead held completely fixed (position constraint,
+    # same mechanism as fixed_atoms) for the duration of that pass — it
+    # already got a good pose from construction (phase 1) or from phase 2's
+    # rigid dynamics (phase 3), and freezing it prevents the plain per-atom
+    # minimize from deforming it while everything else around it still
+    # relaxes.
+    rigid_ring_units = (build_rigid_ring_units(mol_copy, pyranose_rings, fixed_atoms)
+                         if pyranose_rings else [])
+    rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
+    if rigid_ring_units:
+        print(f"  Rigid ring bodies: {len(rigid_ring_units)} rings, "
+              f"{len(rigid_ring_atom_set)} atoms (rigid dynamics in phase 2, "
+              f"frozen in phases 1 & 3)")
+
     # PHASE 1: CONSTRAINED MINIMIZATION (glycosidic atoms frozen as trans anchor)
-    phase1_fixed = list(dict.fromkeys(fixed_atoms + glyco_atoms))
+    phase1_fixed = list(dict.fromkeys(fixed_atoms + glyco_atoms + list(rigid_ring_atom_set)))
     t0 = time.perf_counter()
     mol_copy = run_minimization_phase_no_cog(
         mol_copy, props, use_mmff,
@@ -1121,6 +1138,7 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         config, last_valid_mol, fixed_atoms,
         xy_constrained_atoms=lipid_tail_indices or [],
         pyranose_rings=pyranose_rings,
+        rigid_ring_units=rigid_ring_units,
         molecule_data_dict=molecule_data_dict,
         stm_data=stm_data,
         trajectory_path=trajectory_path,
@@ -1136,11 +1154,14 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     # PHASE 3: FINAL MINIMIZATION WITH LINKER STILL FROZEN
 
     t0 = time.perf_counter()
-    # Phase 3: linker + PEtN stay frozen (fixed_atoms); glycosidic held trans;
-    # everything else (incl. lipids, ring COMs) free to relax the whole structure.
+    # Phase 3: linker + PEtN stay frozen (fixed_atoms), pyranose rings stay
+    # frozen in the pose phase 2's rigid dynamics left them in (same reason
+    # as phase 1: no per-step hook here to keep them rigid while moving, so
+    # they're held fixed instead); glycosidic held trans; everything else
+    # (incl. lipids) free to relax the whole structure.
     mol_copy = run_final_minimization_phase(
         mol_copy, props, use_mmff, config,
-        fixed_atoms=fixed_atoms,
+        fixed_atoms=list(dict.fromkeys(fixed_atoms + list(rigid_ring_atom_set))),
         trajectory_path=trajectory_path,
         torsion_constraints=torsion_constraints
     )
