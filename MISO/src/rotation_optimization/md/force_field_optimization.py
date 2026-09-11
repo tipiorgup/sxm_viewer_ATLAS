@@ -1688,12 +1688,32 @@ def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
     print("="*60)
 
     print(f"  Minimizing with {len(fixed_atoms)} constrained atoms...")
-    print(f"  Using iterative approach: 4 steps per update")
 
-    # Iterative minimization like Avogadro (steps per update = 4)
+    # The published MISO method runs this phase in 375 bursts of 4
+    # iterations to keep the (soft, long-range) monomer-distance restraint
+    # from being blown through in one big jump. That reasoning doesn't
+    # carry over to the tight ring rigidity constraint added since: RDKit's
+    # ff.Minimize() resets its internal line-search state on every call, so
+    # tiny bursts never let the minimizer work all the way through a badly
+    # clashed start against a k=10000 constraint. Verified on a real
+    # tangled structure: 375x4 got permanently stuck with one ring's bond
+    # deviation at 1.41 A (Phase 1 doing nothing, all the untangling left
+    # to compression), while a single continuous call over the same
+    # 1500-iteration budget converged to 0.03 A with the clash resolved
+    # (E 3.26M -> 302). A single call is also a closer read of "within 10%
+    # of initial values" for the monomer restraint, since each burst
+    # otherwise re-measures that distance from the drifted current
+    # position instead of the true starting one. Stochastic kicks need
+    # periodic breaks to interject, so only burst when they're enabled
+    # (off by default); otherwise run the whole budget in one call.
     total_iterations = 1500  # Was 500, now 3x = 1500
-    steps_per_update = 4
-    num_updates = total_iterations // steps_per_update  # 375 updates
+    if config.enable_phase1_kicks:
+        steps_per_update = 4
+        print(f"  Using iterative approach: 4 steps per update (phase1 kicks enabled)")
+    else:
+        steps_per_update = total_iterations
+        print(f"  Using a single continuous minimization ({total_iterations} iterations)")
+    num_updates = total_iterations // steps_per_update
 
     fixed_set = set(fixed_atoms) if fixed_atoms else set()
     conf_p1 = mol_copy.GetConformer()
