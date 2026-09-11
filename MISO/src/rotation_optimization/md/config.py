@@ -177,6 +177,16 @@ class OptimizationConfig:
     ring_rigid_bond_tolerance: float = 0.02
     ring_rigid_angle_tolerance: float = 2.0
     ring_rigid_force_constant: float = 10000.0
+    # Phase 1 chunks the 1500-iteration minimization budget into this many
+    # pieces, recentering every ring's COM back onto its original position
+    # (a hard projection, not a spring -- see recenter_ring_bead) between
+    # each. A ring is free to drift within one chunk, whatever helps the
+    # minimizer resolve strain, but is snapped back exactly once the chunk
+    # ends. More chunks track the reference more tightly at some cost to
+    # convergence quality (RDKit's minimizer resets its line-search state
+    # on every call), fewer chunks converge better but let more drift
+    # accumulate before it's corrected.
+    phase1_recenter_chunks: int = 10
     # Fraction of gravity/slab compression force a ring's own interior atoms
     # feel during phase 2 (0-1). The rest of that weight, by not being
     # applied there, effectively falls on the flexible inter-residue

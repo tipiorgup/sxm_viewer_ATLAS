@@ -247,6 +247,80 @@ def get_ring_substituents(mol, ring_atoms, all_ring_atoms_global):
 
     return list(to_rotate)
 
+def get_ring_bead_atoms(mol, ring_atoms, all_ring_atoms_global, glycosidic_bond_pairs):
+    """
+    All atoms that move rigidly with this ring: the ring itself plus every
+    substituent hanging off it (hydroxyls, CH2OH, ring hydrogens, etc.).
+    BFS outward from the ring, but never crosses into another ring's atoms
+    or across a registered glycosidic bond -- those are the flexible
+    tethers between beads, not part of this one. Without the glycosidic
+    stop, BFS would walk straight through the linkage atom (e.g. an Asn
+    side-chain N) into the entire rest of whatever's attached on the other
+    side.
+
+    Args:
+        mol: RDKit molecule
+        ring_atoms: atoms in THIS ring
+        all_ring_atoms_global: set of every pyranose ring atom in the molecule
+        glycosidic_bond_pairs: set of (a, b) atom-index tuples (both
+            directions) marking each glycosidic bond that must not be
+            crossed
+
+    Returns:
+        List of atom indices making up this ring's rigid bead
+    """
+    bead = set(ring_atoms)
+    queue = list(ring_atoms)
+
+    while queue:
+        current = queue.pop(0)
+        atom = mol.GetAtomWithIdx(current)
+
+        for neighbor in atom.GetNeighbors():
+            nbr_idx = neighbor.GetIdx()
+
+            if nbr_idx in bead:
+                continue
+            if nbr_idx in all_ring_atoms_global:
+                continue
+            if (current, nbr_idx) in glycosidic_bond_pairs:
+                continue
+
+            bead.add(nbr_idx)
+            queue.append(nbr_idx)
+
+    return list(bead)
+
+
+def recenter_ring_bead(conf, n_atoms, bead_atoms, ring_atoms, ring_masses,
+                        reference_com):
+    """
+    Rigidly translate a ring's whole bead (ring + substituents) so the
+    ring's own mass-weighted COM lands exactly back on reference_com.
+
+    A uniform shift of every bead atom by the same vector changes nothing
+    about the bead's internal geometry or orientation -- bond lengths,
+    angles, and whatever rotation the minimizer found are all preserved
+    exactly. Only the bead's position moves. This is a hard (projection)
+    constraint, not a spring: the COM lands exactly on the reference every
+    time this is called, with no residual error to accumulate.
+
+    Returns:
+        Distance the ring's COM had drifted before this correction (Å)
+    """
+    positions = get_positions(conf, n_atoms)
+    ring_positions = positions[ring_atoms]
+    com_current = calculate_center_of_mass(ring_positions, ring_masses)
+
+    delta = reference_com - com_current
+    drift = np.linalg.norm(delta)
+
+    positions[bead_atoms] += delta
+    set_positions(conf, positions, n_atoms)
+
+    return drift
+
+
 def apply_translation_constraint(positions, forces, ring_atoms, ring_masses,
                                  com_current, com_initial, max_translation,
                                  translation_stiffness):
