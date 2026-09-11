@@ -15,7 +15,7 @@ from ..geometry.geometry_utils import (
     get_positions, set_positions, get_atom_position,
     calculate_distance, calculate_angle,
     get_ring_normal_from_positions, calculate_center_of_mass,
-    rodrigues_rotation, calculate_moment_of_inertia,
+    rodrigues_rotation, calculate_moment_of_inertia, cap_vectors,
 )
 from .config import (
     OptimizationConfig, RingConstraintConfig, RingRotationUnit,
@@ -196,55 +196,64 @@ def check_and_update_rings(mol, ring_references, tol_bond, tol_angle,
     
     return True, []
 
-def get_ring_substituents(mol, ring_atoms, all_ring_atoms_global):
+def get_ring_substituents(mol, ring_atoms, all_ring_atoms_global, boundary_atoms=None):
     """
     Get all atoms that should rotate with the ring.
-    Stops at glycosidic linkages (connections to other rings).
-    
+    Stops at glycosidic linkages: to another ring (all_ring_atoms_global) and,
+    since a sugar-to-peptide (or other non-ring) glycosidic bond has no ring
+    atom on its far side to naturally stop at, also at any atom named as a
+    linkage joint in boundary_atoms. Without the latter this BFS has nothing
+    to stop it at a sugar-peptide bond and walks straight across it, pulling
+    the entire attached peptide into "the ring".
+
     Args:
         mol: RDKit molecule
         ring_atoms: Atoms in THIS ring
         all_ring_atoms_global: Set of ALL ring atoms in the molecule
-    
+        boundary_atoms: Extra atom indices to never cross into (e.g. the
+            glycosidic-bond joint atoms from torsion_constraints)
+
     Returns:
         List of atom indices to rotate (includes ring + substituents)
     """
     ring_set = set(ring_atoms)
+    stop_set = set(all_ring_atoms_global) | set(boundary_atoms or [])
     to_rotate = set(ring_atoms)
-    
+
     for ring_idx in ring_atoms:
         atom = mol.GetAtomWithIdx(ring_idx)
-        
+
         for neighbor in atom.GetNeighbors():
             neighbor_idx = neighbor.GetIdx()
-            
+
             # Skip if it's another atom in THIS ring
             if neighbor_idx in ring_set:
                 continue
-            
-            # Stop at glycosidic linkages (connections to other rings)
-            if neighbor_idx in all_ring_atoms_global:
+
+            # Stop at glycosidic linkages (connections to other rings, or to
+            # a non-ring residue such as a peptide)
+            if neighbor_idx in stop_set:
                 continue
-            
+
             # BFS to get all substituents
             queue = [neighbor_idx]
             visited = {neighbor_idx}
             to_rotate.add(neighbor_idx)
-            
+
             while queue:
                 current_idx = queue.pop(0)
                 current_atom = mol.GetAtomWithIdx(current_idx)
-                
+
                 for next_neighbor in current_atom.GetNeighbors():
                     next_idx = next_neighbor.GetIdx()
-                    
-                    if next_idx in visited or next_idx in all_ring_atoms_global:
+
+                    if next_idx in visited or next_idx in stop_set:
                         continue
-                    
+
                     visited.add(next_idx)
                     to_rotate.add(next_idx)
                     queue.append(next_idx)
-    
+
     return list(to_rotate)
 
 def calculate_inertia_tensor(atom_indices, positions, masses, com):
@@ -258,13 +267,27 @@ def calculate_inertia_tensor(atom_indices, positions, masses, com):
     return inertia
 
 
-def build_rigid_ring_units(mol, pyranose_rings, fixed_atoms=None):
+# A decorated pyranose ring (ring + hydroxyls/CH2OH/hydrogens) tops out
+# around 24-30 atoms (e.g. glucose with all H is 24). Anything far past that
+# means get_ring_substituents' BFS crossed a linkage it didn't recognize as a
+# boundary and is absorbing whatever's attached (a whole peptide chain, most
+# dramatically) into "the ring" — silently forcing all of it through one
+# rigid rotation instead of letting it move naturally is far worse than
+# skipping rigid treatment for that ring, so this is a hard skip, not a tuning
+# knob.
+MAX_RIGID_RING_UNIT_ATOMS = 40
+
+
+def build_rigid_ring_units(mol, pyranose_rings, fixed_atoms=None, boundary_atoms=None):
     """One rigid-body unit per pyranose ring: the ring plus every substituent
     hanging off it (hydroxyls, CH2OH, ring hydrogens, ...), stopped at
-    glycosidic linkages to other rings, exactly the atom set
-    get_ring_substituents already defines. A ring with any atom already in
-    fixed_atoms is skipped (those atoms are frozen elsewhere and pinning them
-    into a rigid body too would over-constrain the minimizer).
+    glycosidic linkages to other rings or, via boundary_atoms, to a non-ring
+    residue such as a peptide (get_ring_substituents has no ring atom to stop
+    at on that side otherwise). A ring is skipped if any atom in its expanded
+    set is already in fixed_atoms (frozen elsewhere; pinning it into a rigid
+    body too would over-constrain the minimizer), or if the expansion still
+    comes out larger than MAX_RIGID_RING_UNIT_ATOMS (an unrecognized linkage
+    swallowed something it shouldn't have).
 
     Each unit starts at rest; its own linear/angular velocity accumulates
     from step_rigid_ring_unit across the MD run.
@@ -272,9 +295,15 @@ def build_rigid_ring_units(mol, pyranose_rings, fixed_atoms=None):
     fixed_set = set(fixed_atoms or [])
     all_ring_atoms_global = {a for ring in pyranose_rings for a in ring}
     units = []
-    for ring_atoms in pyranose_rings:
-        atoms = get_ring_substituents(mol, ring_atoms, all_ring_atoms_global)
+    for ring_idx, ring_atoms in enumerate(pyranose_rings):
+        atoms = get_ring_substituents(mol, ring_atoms, all_ring_atoms_global, boundary_atoms)
         if fixed_set and any(a in fixed_set for a in atoms):
+            continue
+        if len(atoms) > MAX_RIGID_RING_UNIT_ATOMS:
+            print(f"  ⚠ Ring {ring_idx}: rigid-body expansion pulled in "
+                  f"{len(atoms)} atoms (> {MAX_RIGID_RING_UNIT_ATOMS}), an "
+                  f"unrecognized linkage likely absorbed attached residues — "
+                  f"skipping rigid treatment for this ring")
             continue
         units.append({
             'atoms': atoms,
@@ -285,7 +314,7 @@ def build_rigid_ring_units(mol, pyranose_rings, fixed_atoms=None):
 
 
 def step_rigid_ring_unit(positions, forces, unit, masses, timestep, friction,
-                          out_positions):
+                          out_positions, max_velocity=None):
     """Advance one ring rigid body by one MD step.
 
     Net force and net torque about the unit's own center of mass are
@@ -303,6 +332,18 @@ def step_rigid_ring_unit(positions, forces, unit, masses, timestep, friction,
     the rigid body's net force/torque, so the unit feels the same thermal
     environment as an ordinary atom, just responds to it as one rigid body
     instead of len(atoms) independent ones.
+
+    max_velocity caps linear speed directly (same cap ordinary atoms get
+    via cap_vectors) and caps angular speed so that no atom in the unit
+    -- checked at its actual distance from the COM, not some fixed radius
+    -- would exceed that same linear speed from rotation alone. Without
+    this, a large or ill-conditioned unit (e.g. one that absorbed atoms it
+    shouldn't have) can pick up an unbounded velocity from a single bad
+    step and go non-finite; MMFF's energy/gradient then reads that
+    non-finite position for every bonded and nearby atom, so the NaN
+    spreads to the whole structure within a few steps. Any non-finite
+    torque/inertia/acceleration is treated as a failed step (velocity
+    left unchanged) rather than propagated.
     """
     atoms = unit['atoms']
     sub_masses = masses[atoms]
@@ -328,10 +369,26 @@ def step_rigid_ring_unit(positions, forces, unit, masses, timestep, friction,
 
     linear_accel = net_force / total_mass
 
+    if not (np.all(np.isfinite(linear_accel)) and np.all(np.isfinite(angular_accel))):
+        print(f"  ⚠ Rigid ring unit ({len(atoms)} atoms): non-finite "
+              f"acceleration this step, holding velocity and skipping move")
+        linear_accel = np.zeros(3)
+        angular_accel = np.zeros(3)
+
     unit['linear_velocity'] = (unit['linear_velocity'] * (1 - friction * timestep)
                                 + linear_accel * timestep)
     unit['angular_velocity'] = (unit['angular_velocity'] * (1 - friction * timestep)
                                  + angular_accel * timestep)
+
+    if max_velocity is not None:
+        unit['linear_velocity'] = cap_vectors(
+            unit['linear_velocity'][np.newaxis, :], max_velocity)[0]
+        max_radius = np.max(np.linalg.norm(rel, axis=1)) if len(atoms) else 0.0
+        if max_radius > EPSILON:
+            omega_max = max_velocity / max_radius
+            omega_norm = np.linalg.norm(unit['angular_velocity'])
+            if omega_norm > omega_max:
+                unit['angular_velocity'] *= omega_max / omega_norm
 
     new_com = com + unit['linear_velocity'] * timestep
     omega = unit['angular_velocity']

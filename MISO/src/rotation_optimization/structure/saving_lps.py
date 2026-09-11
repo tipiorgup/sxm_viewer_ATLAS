@@ -682,10 +682,10 @@ def enforce_trans_configuration(mol_rw, bonds_created, conf):
             
             if c_neighbors and n_neighbors:
                 dihedral_atoms = [c_neighbors[0], sugar_c, peptide_n, n_neighbors[0]]
-                
+
                 # Do the trans enforcement
                 rdMolTransforms.SetDihedralRad(conf, *dihedral_atoms, np.pi)
-                
+
                 # Store the enforced atoms info
                 enforced_atom_sets.append({
                     'bond_type': 'direct_CN',
@@ -696,9 +696,59 @@ def enforce_trans_configuration(mol_rw, bonds_created, conf):
                     'target_angle': 180.0,
                     'atom_labels': [f"atom_{i}" for i in dihedral_atoms]
                 })
-                
+
                 print(f"  ✓ Trans enforced on dihedral: {dihedral_atoms}")
-    
+
+        elif bond_info['type'] == 'CO_linkage':
+            # O-glycosidic bonds were never reported here, so downstream
+            # consumers (the phase 2-3 trans torsion restraint, and the ring
+            # rigid-body boundary that stops a ring's substituent walk at a
+            # glycosidic joint) never saw these atoms at all: an O-glycosidic
+            # bond got no restraint through optimization, and a ring on the
+            # sugar side of one got no boundary to stop its rigid-body
+            # expansion at, letting it absorb whatever's attached. Report
+            # both dihedrals (sugar_c-bridge_o and bridge_o-peptide_o), same
+            # pattern as direct_CN above.
+            sugar_c = bond_info['sugar_c']
+            bridge_o = bond_info['bridge_o']
+            peptide_o = bond_info['peptide_o']
+
+            c_atom = mol_rw.GetAtomWithIdx(sugar_c)
+            peptide_o_atom = mol_rw.GetAtomWithIdx(peptide_o)
+
+            c_neighbors = [n.GetIdx() for n in c_atom.GetNeighbors() if n.GetIdx() != bridge_o]
+            peptide_o_neighbors = [n.GetIdx() for n in peptide_o_atom.GetNeighbors() if n.GetIdx() != bridge_o]
+
+            if c_neighbors:
+                dihedral_atoms = [c_neighbors[0], sugar_c, bridge_o, peptide_o]
+                rdMolTransforms.SetDihedralRad(conf, *dihedral_atoms, np.pi)
+                enforced_atom_sets.append({
+                    'bond_type': 'CO_linkage',
+                    'aa_type': bond_info.get('aa_type', 'Unknown'),
+                    'dihedral_atoms': dihedral_atoms,
+                    'sugar_carbon': sugar_c,
+                    'bridge_oxygen': bridge_o,
+                    'peptide_oxygen': peptide_o,
+                    'target_angle': 180.0,
+                    'atom_labels': [f"atom_{i}" for i in dihedral_atoms]
+                })
+                print(f"  ✓ Trans enforced on dihedral: {dihedral_atoms}")
+
+            if peptide_o_neighbors:
+                dihedral_atoms = [sugar_c, bridge_o, peptide_o, peptide_o_neighbors[0]]
+                rdMolTransforms.SetDihedralRad(conf, *dihedral_atoms, np.pi)
+                enforced_atom_sets.append({
+                    'bond_type': 'CO_linkage',
+                    'aa_type': bond_info.get('aa_type', 'Unknown'),
+                    'dihedral_atoms': dihedral_atoms,
+                    'sugar_carbon': sugar_c,
+                    'bridge_oxygen': bridge_o,
+                    'peptide_oxygen': peptide_o,
+                    'target_angle': 180.0,
+                    'atom_labels': [f"atom_{i}" for i in dihedral_atoms]
+                })
+                print(f"  ✓ Trans enforced on dihedral: {dihedral_atoms}")
+
     return enforced_atom_sets
 
 def set_trans_dihedral_CN_bond(mol_rw, conf, carbon_idx, nitrogen_idx):

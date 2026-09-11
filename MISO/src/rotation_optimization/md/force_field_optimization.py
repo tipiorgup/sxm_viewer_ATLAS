@@ -557,7 +557,8 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
         # only move and spin as a whole.
         for unit in rigid_ring_units:
             step_rigid_ring_unit(positions, total_forces, unit, masses,
-                                  config.timestep, config.friction, new_positions)
+                                  config.timestep, config.friction, new_positions,
+                                  max_velocity=config.max_velocity)
             for atom_idx in unit['atoms']:
                 velocities[atom_idx] = 0
 
@@ -1106,7 +1107,8 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     # rigid dynamics (phase 3), and freezing it prevents the plain per-atom
     # minimize from deforming it while everything else around it still
     # relaxes.
-    rigid_ring_units = (build_rigid_ring_units(mol_copy, pyranose_rings, fixed_atoms)
+    rigid_ring_units = (build_rigid_ring_units(mol_copy, pyranose_rings, fixed_atoms,
+                                                boundary_atoms=glyco_atoms)
                          if pyranose_rings else [])
     rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
     if rigid_ring_units:
