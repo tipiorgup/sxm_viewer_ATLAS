@@ -1135,18 +1135,7 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
 
     # Setup force field
     props, use_mmff = setup_force_field(mol_copy)
-    
-    # Initialize ring rotation units
-    ring_rotation_units = []
-    if config.enable_ring_rotation:
-        ring_rotation_units = initialize_ring_rotation_units(
-            mol_copy, conf, masses, n_atoms,
-            pyranose_rings=pyranose_rings,
-            reference_normals=config.reference_normals
-        )
-    else:
-        print("\nRing rotation disabled - using full constraint")
-    
+
     # Track last valid state
     last_valid_mol = Chem.Mol(mol_copy)
     
@@ -1202,6 +1191,30 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     if config.save_debug_checkpoints:
         save_molecule(mol_copy, f"{config.output_name}_phase1_minimized", file_format='sdf')
         print(f"  Saved: {config.output_name}_phase1_minimized.sdf")
+
+    # Initialize ring rotation units AFTER Phase 1, not before. Each unit's
+    # com_initial/normal_fixed is the reference Phase 2's soft translation
+    # restraint pulls back toward (apply_translation_constraint). Ring
+    # geometry ties in verbatim to the bead picture: each ring is a rigid
+    # bead whose own internal COM never moves relative to its own atoms
+    # (guaranteed by the ring rigidity constraint, unaffected by this).
+    # What's free to move is the bead's position in space, via the
+    # glycosidic bond. If a QUEST alignment leaves that bond tangled, Phase
+    # 1 is what's supposed to resolve it by swinging the bead into place
+    # (verified: up to 6.5 A of translation on a real tangled structure,
+    # ring internal geometry untouched). Capturing the reference here
+    # instead of before Phase 1 means Phase 2 treats that resolved position
+    # as home, instead of spending all of compression fighting to drag the
+    # bead back into the tangle Phase 1 just pulled it out of.
+    ring_rotation_units = []
+    if config.enable_ring_rotation:
+        ring_rotation_units = initialize_ring_rotation_units(
+            mol_copy, mol_copy.GetConformer(), masses, n_atoms,
+            pyranose_rings=pyranose_rings,
+            reference_normals=config.reference_normals
+        )
+    else:
+        print("\nRing rotation disabled - using full constraint")
 
     # PHASE 2: COMPRESSION
 
