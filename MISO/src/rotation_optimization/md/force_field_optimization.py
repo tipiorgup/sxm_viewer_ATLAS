@@ -12,7 +12,7 @@ from .ring_functions import (
     detect_pyranose_rings, get_ring_reference_geometry,
     check_and_update_rings, check_ring_integrity,
     apply_ring_constraints_dual_mode,
-    get_ring_bead_atoms, recenter_ring_bead,
+    get_ring_bead_atoms, recenter_ring_bead, restore_ring_shape,
 )
 from .config import OptimizationConfig, RingConstraintConfig, RingRotationUnit
 from .utils import (
@@ -433,7 +433,8 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
                           pyranose_rings=None,
                           initial_ring_coms=None,
                           molecule_data_dict=None, stm_data=None,
-                          trajectory_path=None, torsion_constraints=None):
+                          trajectory_path=None, torsion_constraints=None,
+                          ring_shape_references=None):
     """
     Phase 2: Compression with rising slab using FULL MD.
 
@@ -634,6 +635,21 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
                 velocities[atom_idx, :2] = 0
 
         set_positions(conf, new_positions, n_atoms)
+
+        # Snap every ring's own atoms back onto its exact reference shape
+        # every step -- a geometric projection (fresh best-fit rotation,
+        # see restore_ring_shape/kabsch_rotation), not a force, so it
+        # can't overshoot or oscillate the way pushing the k=10000
+        # constraint harder did. Whatever MMFF/gravity/slab forces did to
+        # the ring this one step gets corrected before the next force
+        # evaluation ever sees it, so deformation can't accumulate across
+        # steps; only rotation and translation (via the COM restraint
+        # above) survive.
+        if ring_shape_references and pyranose_rings:
+            for ring_idx, ring_atoms in enumerate(pyranose_rings):
+                restore_ring_shape(conf, n_atoms, ring_atoms,
+                                    ring_shape_references[ring_idx])
+
         t_velocity_update += time.perf_counter() - t0
 
         # --- Ring-integrity safeguard ---------------------------------------
@@ -1203,6 +1219,16 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         calculate_center_of_mass(ref_positions[ring_atoms], masses[ring_atoms])
         for ring_atoms in pyranose_rings
     ]
+    # The exact reference shape (bond lengths, angles, puckering) for each
+    # ring, centered on its own geometric centroid -- used by
+    # restore_ring_shape to snap a ring's atoms back onto this shape via a
+    # fresh best-fit rotation each time, rather than relying on a k=10000
+    # MMFF force to resist deformation in real time (which was found to
+    # cause overshoot/oscillation under explicit MD's finite timestep).
+    ring_shape_references = [
+        ref_positions[ring_atoms] - np.mean(ref_positions[ring_atoms], axis=0)
+        for ring_atoms in pyranose_rings
+    ]
 
     # PHASE 1: CONSTRAINED MINIMIZATION (glycosidic bonds held trans, not frozen)
     t0 = time.perf_counter()
@@ -1260,7 +1286,8 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         molecule_data_dict=molecule_data_dict,
         stm_data=stm_data,
         trajectory_path=trajectory_path,
-        torsion_constraints=torsion_constraints
+        torsion_constraints=torsion_constraints,
+        ring_shape_references=ring_shape_references
     )
     t_phase2 = time.perf_counter() - t0
 

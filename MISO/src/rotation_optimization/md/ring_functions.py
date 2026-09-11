@@ -321,6 +321,63 @@ def recenter_ring_bead(conf, n_atoms, bead_atoms, ring_atoms, ring_masses,
     return drift
 
 
+def kabsch_rotation(reference_centered, current_centered):
+    """
+    Optimal proper (no reflection) rotation matrix mapping
+    *reference_centered* onto *current_centered* -- both already centered
+    at their own origin, both shape (N, 3). Same category of problem QUEST
+    itself solves (Wahba's problem / best-fit rotation between two vector
+    sets), via SVD instead of the quaternion eigenvalue route.
+
+    The determinant check is required: an uncorrected SVD solution can be
+    an improper rotation (a reflection) when the point correspondence is
+    degenerate or near-degenerate, which would invert the ring's
+    stereochemistry (alpha/beta) instead of just reorienting it.
+    """
+    H = reference_centered.T @ current_centered
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    correction = np.diag([1.0, 1.0, d])
+    return Vt.T @ correction @ U.T
+
+
+def restore_ring_shape(conf, n_atoms, ring_atoms, shape_reference_centered):
+    """
+    Snap a ring's own atoms back onto its exact reference shape (bond
+    lengths, angles, puckering) via the best-fit rigid rotation, computed
+    fresh against wherever the ring currently is -- not a force, an exact
+    geometric projection, so there is no stiffness/timestep interaction to
+    go unstable. Whatever legitimate translation or rotation the ring has
+    undergone survives untouched; only the internal deformation component
+    is removed, since the reference shape is placed exactly, not pulled
+    toward.
+
+    shape_reference_centered: the ring's reference atom positions (in the
+    same atom order as ring_atoms), already centered on their own
+    centroid, captured once before optimization began.
+
+    Substituent atoms (hydroxyls, CH2OH, ring H's) are deliberately left
+    alone here -- they're bonded to the now-corrected ring atoms and get
+    pulled into a consistent position by ordinary MMFF forces on the next
+    force evaluation, the same way any bonded atom reacts to a moved
+    neighbor. Rigidly dragging them along too would require re-deriving
+    which ones are still legitimately free to rotate (e.g. a hydroxyl's
+    own rotamer) versus which aren't, and risks the same
+    "correction-shoves-a-neighbor" clash recenter_ring_bead can cause for
+    large jumps -- unnecessary here since a ring already close to its
+    reference shape only needs a small correction.
+    """
+    positions = get_positions(conf, n_atoms)
+    current = positions[ring_atoms]
+    centroid = np.mean(current, axis=0)
+    current_centered = current - centroid
+
+    R = kabsch_rotation(shape_reference_centered, current_centered)
+    positions[ring_atoms] = (shape_reference_centered @ R.T) + centroid
+
+    set_positions(conf, positions, n_atoms)
+
+
 def apply_translation_constraint(positions, forces, ring_atoms, ring_masses,
                                  com_current, com_initial, max_translation,
                                  translation_stiffness):
