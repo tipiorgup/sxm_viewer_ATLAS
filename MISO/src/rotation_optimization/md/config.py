@@ -101,6 +101,16 @@ class OptimizationConfig:
     constrained_ring_com_limit : float  (Å)
     free_ring_com_limit : float  (Å)
 
+    Ring rigidity (hard MMFF distance/angle constraints on each ring's own
+    bonds, applied in every optimisation phase; not a separate integrator —
+    ring atoms still move under the same per-atom dynamics as everything
+    else, translation/rotation/center-of-mass motion untouched, only their
+    own bonds are made far stiffer than an unconstrained MMFF bond/angle)
+    ------------------------------------------------------------------
+    ring_rigid_bond_tolerance : float  (Å)
+    ring_rigid_angle_tolerance : float  (degrees)
+    ring_rigid_force_constant : float  (kcal mol⁻¹)
+
     Minimisation
     ------------
     minimize_interval : int
@@ -162,6 +172,11 @@ class OptimizationConfig:
     ring_tolerance_angle: float = DEFAULT_ANGLE_TOLERANCE
     check_rings_interval: int = DEFAULT_CHECK_RINGS_INTERVAL
     constrained_ring_com_limit: float = DEFAULT_CONSTRAINED_RING_COM_LIMIT
+
+    # Ring rigidity (hard bond/angle constraints, not a separate integrator)
+    ring_rigid_bond_tolerance: float = 0.02
+    ring_rigid_angle_tolerance: float = 2.0
+    ring_rigid_force_constant: float = 10000.0
     free_ring_com_limit: float = DEFAULT_FREE_RING_COM_LIMIT
 
     # Minimisation
