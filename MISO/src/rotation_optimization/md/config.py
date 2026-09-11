@@ -177,6 +177,12 @@ class OptimizationConfig:
     ring_rigid_bond_tolerance: float = 0.02
     ring_rigid_angle_tolerance: float = 2.0
     ring_rigid_force_constant: float = 10000.0
+    # Fraction of gravity/slab compression force a ring's own interior atoms
+    # feel during phase 2 (0-1). The rest of that weight, by not being
+    # applied there, effectively falls on the flexible inter-residue
+    # linkages instead, so compression flattens the structure by bending
+    # those joints rather than pushing on the now-rigid ring interiors.
+    ring_compression_weight_scale: float = 0.1
     free_ring_com_limit: float = DEFAULT_FREE_RING_COM_LIMIT
 
     # Minimisation

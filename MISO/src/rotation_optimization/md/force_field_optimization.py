@@ -479,6 +479,22 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
               f"soft pull back past {ring_constraint_config.free_max_translation:.1f} Å drift, "
               f"rotation left free")
 
+    # Compression weight mostly on the inter-sugar/glycosidic bonds, not the
+    # rigid ring interiors: pushing a chain of stiff rings flat should bend
+    # the flexible joints between them, not squash the rings themselves. A
+    # ring still gets dragged down by its neighbors through the ordinary
+    # bonded forces (including the stiff internal constraints propagating
+    # through it as one unit), it just doesn't take the direct gravity/slab
+    # push on its own interior atoms. Substituents (hydroxyls, CH2OH, H)
+    # aren't in ring_references[i].atoms, so they keep full weight, giving a
+    # smooth transition rather than a hard boundary at the ring edge.
+    ring_atom_indices = ([a for ref in ring_references for a in ref.atoms]
+                          if ring_references else [])
+    if ring_atom_indices:
+        print(f"  Ring compression weight scaled to "
+              f"{config.ring_compression_weight_scale:.0%} on {len(ring_atom_indices)} "
+              f"ring atoms — flattening happens at the flexible linkages instead")
+
     initial_xy = None
     if xy_constrained_atoms:
         initial_xy = positions[xy_constrained_atoms, :2].copy()
@@ -558,6 +574,10 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
             positions, masses, slab_z, config.slab_force_scale
         )
         t_slab_forces += time.perf_counter() - t0
+
+        if ring_atom_indices:
+            gravity_forces[ring_atom_indices] *= config.ring_compression_weight_scale
+            slab_forces[ring_atom_indices] *= config.ring_compression_weight_scale
 
         t0 = time.perf_counter()
         total_forces = ff_forces + gravity_forces + slab_forces
