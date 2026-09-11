@@ -111,7 +111,20 @@ def get_ff_forces(mol, props, use_mmff, n_atoms, max_force, torsion_constraints=
         grad = np.array([ff.CalcGrad()[i] for i in range(n_atoms * 3)])
         forces = -grad.reshape((n_atoms, 3))
 
-        return cap_vectors(forces, max_force)
+        capped = cap_vectors(forces, max_force)
+        if ring_references:
+            # A k=10000 restoring force is many times max_force for anything
+            # but a tiny deviation, so the general cap (meant for runaway
+            # instabilities elsewhere, e.g. steric clashes) was silently
+            # flattening the ring constraint down to an ordinary force,
+            # defeating the whole point of making it stiff. Ring atoms don't
+            # need that cap: their downstream velocity is still bounded by
+            # max_velocity regardless of force size, so letting the full
+            # restoring force through here can't blow anything up, it just
+            # lets the correction actually act at full strength.
+            ring_atom_indices = [a for ref in ring_references for a in ref.atoms]
+            capped[ring_atom_indices] = forces[ring_atom_indices]
+        return capped
     else:
         return np.zeros((n_atoms, 3))
 
@@ -458,6 +471,14 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
               f"angle±{config.ring_rigid_angle_tolerance:.1f}°, k={config.ring_rigid_force_constant:.0f} "
               f"kcal/mol — ordinary per-atom dynamics, ring bonds just very stiff")
 
+    ring_constraint_config = RingConstraintConfig()
+    if ring_rotation_units:
+        n_constrained = sum(1 for u in ring_rotation_units if u.get('is_constrained'))
+        print(f"  Ring COM restraint active: {len(ring_rotation_units)} rings "
+              f"({n_constrained} constrained, {len(ring_rotation_units) - n_constrained} free) — "
+              f"soft pull back past {ring_constraint_config.free_max_translation:.1f} Å drift, "
+              f"rotation left free")
+
     initial_xy = None
     if xy_constrained_atoms:
         initial_xy = positions[xy_constrained_atoms, :2].copy()
@@ -540,6 +561,22 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
 
         t0 = time.perf_counter()
         total_forces = ff_forces + gravity_forces + slab_forces
+
+        # Gentle COM restraint (minimal drift) + free rotation, exactly how
+        # sugars were handled before the internal-rigidity work started:
+        # a soft force pulling each ring's center of mass back if it strays
+        # past free_max_translation from its starting position, folded into
+        # the same total_forces the ordinary per-atom Langevin step below
+        # uses — no separate integrator, rotation is never touched so it
+        # stays fully free. (Constrained-mode rings, if any are configured
+        # via reference_normals, also get a direct small rotation update
+        # here, hence the positions re-fetch right after.)
+        if ring_rotation_units:
+            apply_ring_constraints_dual_mode(
+                conf, total_forces, ring_rotation_units, masses,
+                config.timestep, n_atoms, ring_constraint_config
+            )
+            positions = get_positions(conf, n_atoms)
 
         if config.enable_convergence:
             try:
