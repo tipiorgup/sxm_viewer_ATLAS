@@ -1154,22 +1154,26 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     fixed_atoms = config.fixed_atoms.copy() if config.fixed_atoms else []
     from .utils import save_molecule
 
-    # Glycosidic trans dihedrals: frozen rigid (positions) in phase 1 as an anchor,
-    # then held as a 180° torsion restraint in phases 2 & 3 so the bond can relax
-    # to length while staying trans. fixed_atoms (linker + PEtN) stay position-
-    # frozen in ALL phases; lipids are free.
+    # Glycosidic trans dihedrals: held as a 180° torsion restraint in ALL
+    # phases, including phase 1, so the bond can relax to length and its
+    # neighborhood can actually move to resolve any construction-time strain
+    # (e.g. a bad QUEST alignment) while staying trans. Phase 1 used to
+    # freeze these atoms outright as a rigid "anchor" instead; verified on a
+    # real tangled structure that this stalls the minimizer completely (see
+    # run_minimization_phase_no_cog's docstring) whenever the strain sits at
+    # or near the anchor itself, which is exactly where construction is
+    # least reliable. fixed_atoms (linker + PEtN) stay position-frozen in
+    # ALL phases; lipids are free.
     torsion_constraints = [
         (i, j, k, l, config.torsion_min_deg, config.torsion_max_deg,
          config.torsion_force_constant)
         for (i, j, k, l) in (config.torsion_constraints or [])
     ]
-    glyco_atoms = sorted({a for t in torsion_constraints for a in t[:4]})
 
     if fixed_atoms:
         print(f"\n  Fixed atoms from config: {len(fixed_atoms)} (frozen all phases)")
     if torsion_constraints:
-        print(f"  Trans torsion restraints: {len(torsion_constraints)} "
-              f"(phase 1 freezes {len(glyco_atoms)} atoms; phases 2-3 restrain @180°)")
+        print(f"  Trans torsion restraints: {len(torsion_constraints)} (all phases restrain @180°)")
 
     # Pyranose rings keep real translational/rotational freedom in every
     # phase (never pinned in place — that would also pin the glycosidic-bond
@@ -1183,15 +1187,15 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     # exactly as they do for any other atom, only their own bonds are made
     # far stiffer than an unconstrained MMFF bond/angle.
 
-    # PHASE 1: CONSTRAINED MINIMIZATION (glycosidic atoms frozen as trans anchor)
-    phase1_fixed = list(dict.fromkeys(fixed_atoms + glyco_atoms))
+    # PHASE 1: CONSTRAINED MINIMIZATION (glycosidic bonds held trans, not frozen)
     t0 = time.perf_counter()
     mol_copy = run_minimization_phase_no_cog(
         mol_copy, props, use_mmff,
-        phase1_fixed,
+        fixed_atoms,
         n_atoms, config,
         trajectory_path=trajectory_path,
-        ring_references=ring_references
+        ring_references=ring_references,
+        torsion_constraints=torsion_constraints
     )
     t_phase1 = time.perf_counter() - t0
 
@@ -1647,7 +1651,7 @@ def run_minimization_phase(mol_copy, props, use_mmff, fixed_atoms,
 
 def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
                            n_atoms, config: OptimizationConfig, trajectory_path=None,
-                           ring_references=None):
+                           ring_references=None, torsion_constraints=None):
     """
     Phase 2: Energy minimization with ring constraints (Avogadro style).
     Uses iterative minimization with small steps.
@@ -1658,6 +1662,21 @@ def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
     separate integrator — ring atoms are ordinary MMFF atoms moved by the
     same dynamics as everything else, just strongly resisting internal
     deformation.
+
+    Glycosidic bonds (torsion_constraints) are held trans the same way
+    phases 2-3 already do, a soft dihedral restraint, not a position
+    freeze. This phase used to freeze those atoms outright as a "trans
+    anchor", which silently defeated its own purpose whenever the
+    construction step (e.g. a bad QUEST alignment) left real strain at or
+    near that exact linkage: with the anchor atoms locked, nothing could
+    move to relieve it, so the minimizer stalled. Verified on a real
+    tangled structure: freezing the anchor left it stuck (2,627,581 ->
+    2,624,790 over 1500 iterations, ring rigidity fine but nothing
+    untangled); the same 1500 iterations with the torsion restraint
+    instead reached 79,184, with the glycosidic dihedral still correctly
+    trans and every ring still at exactly 0.0000 A / 0.000 deg deviation
+    — untangling happens through the flexible linkage, never through the
+    rings.
     """
     print("\n" + "="*60)
 
@@ -1689,6 +1708,7 @@ def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
         success = minimize_with_constraint_no_com(
             mol_copy, props, use_mmff, fixed_atoms,
             n_atoms, max_iterations=steps_per_update,
+            torsion_constraints=torsion_constraints,
             ring_references=ring_references,
             ring_bond_tolerance=config.ring_rigid_bond_tolerance,
             ring_angle_tolerance=config.ring_rigid_angle_tolerance,
