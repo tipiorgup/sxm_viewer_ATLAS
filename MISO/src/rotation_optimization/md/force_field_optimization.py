@@ -12,7 +12,6 @@ from .ring_functions import (
     detect_pyranose_rings, get_ring_reference_geometry,
     check_and_update_rings, check_ring_integrity,
     apply_ring_constraints_dual_mode,
-    build_rigid_ring_units, step_rigid_ring_unit,
 )
 from .config import OptimizationConfig, RingConstraintConfig, RingRotationUnit
 from .utils import (
@@ -55,17 +54,48 @@ def _apply_torsion_constraints(ff, torsion_constraints):
         ff.MMFFAddTorsionConstraint(i, j, k, l, False, dmin, dmax, fk)
 
 
-def get_ff_forces(mol, props, use_mmff, n_atoms, max_force, torsion_constraints=None):
+def _apply_ring_rigidity_constraints(ff, ring_references, bond_tolerance,
+                                      angle_tolerance, force_constant):
+    """Hold every ring bond length and ring angle to its reference value with
+    a tight tolerance and a very high force constant, so deforming a ring's
+    internal geometry costs far more energy than any realistic MD force
+    supplies (no-op if ring_references is empty).
+
+    This is deliberately NOT a separate rigid-body integrator: the ring's own
+    atoms are still ordinary MMFF atoms, moved by the exact same per-atom
+    dynamics as everything else in the molecule (translation, rotation and
+    center-of-mass motion all emerge from that, untouched), just resisting
+    internal deformation far more strongly than an unconstrained bond/angle
+    would.
+    """
+    if not ring_references:
+        return
+    for ref in ring_references:
+        for (a1, a2, length) in ref.bonds:
+            ff.MMFFAddDistanceConstraint(a1, a2, False,
+                                          length - bond_tolerance,
+                                          length + bond_tolerance,
+                                          force_constant)
+        for (a1, a2, a3, angle_deg) in ref.angles:
+            ff.MMFFAddAngleConstraint(a1, a2, a3, False,
+                                       angle_deg - angle_tolerance,
+                                       angle_deg + angle_tolerance,
+                                       force_constant)
+
+
+def get_ff_forces(mol, props, use_mmff, n_atoms, max_force, torsion_constraints=None,
+                   ring_references=None, ring_bond_tolerance=0.02,
+                   ring_angle_tolerance=2.0, ring_force_constant=10000.0):
     """
     Get forces from force field.
-    
+
     Args:
         mol: RDKit molecule
         props: MMFF properties
         use_mmff: Whether to use MMFF (vs UFF)
         n_atoms: Number of atoms
         max_force: Maximum force magnitude
-    
+
     Returns:
         Array of forces
     """
@@ -75,11 +105,26 @@ def get_ff_forces(mol, props, use_mmff, n_atoms, max_force, torsion_constraints=
             return np.zeros((n_atoms, 3))
 
         _apply_torsion_constraints(ff, torsion_constraints)
+        _apply_ring_rigidity_constraints(ff, ring_references, ring_bond_tolerance,
+                                          ring_angle_tolerance, ring_force_constant)
         ff.Initialize()
         grad = np.array([ff.CalcGrad()[i] for i in range(n_atoms * 3)])
         forces = -grad.reshape((n_atoms, 3))
 
-        return cap_vectors(forces, max_force)
+        capped = cap_vectors(forces, max_force)
+        if ring_references:
+            # A k=10000 restoring force is many times max_force for anything
+            # but a tiny deviation, so the general cap (meant for runaway
+            # instabilities elsewhere, e.g. steric clashes) was silently
+            # flattening the ring constraint down to an ordinary force,
+            # defeating the whole point of making it stiff. Ring atoms don't
+            # need that cap: their downstream velocity is still bounded by
+            # max_velocity regardless of force size, so letting the full
+            # restoring force through here can't blow anything up, it just
+            # lets the correction actually act at full strength.
+            ring_atom_indices = [a for ref in ring_references for a in ref.atoms]
+            capped[ring_atom_indices] = forces[ring_atom_indices]
+        return capped
     else:
         return np.zeros((n_atoms, 3))
 
@@ -385,7 +430,6 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
                           config: OptimizationConfig,
                           last_valid_mol, fixed_atoms, xy_constrained_atoms=[],
                           pyranose_rings=None,
-                          rigid_ring_units=None,
                           initial_ring_coms=None,
                           molecule_data_dict=None, stm_data=None,
                           trajectory_path=None, torsion_constraints=None):
@@ -423,18 +467,33 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
               f"check every {config.check_rings_interval} steps "
               f"(bond<{config.ring_tolerance_bond:.3f} Å, "
               f"angle<{config.ring_tolerance_angle:.1f}°)")
+        print(f"  Ring rigidity constraints active: bond±{config.ring_rigid_bond_tolerance:.3f} Å, "
+              f"angle±{config.ring_rigid_angle_tolerance:.1f}°, k={config.ring_rigid_force_constant:.0f} "
+              f"kcal/mol — ordinary per-atom dynamics, ring bonds just very stiff")
 
-    # Hard-sphere pyranose rings: each ring (plus its substituents, stopped at
-    # glycosidic linkages) moves as one rigid body, translation + rotation
-    # only, so its internal geometry can never deform during compression, not
-    # just get caught after the fact by the tolerance safeguard above. Built
-    # once by the caller (shared with phases 1 & 3, which freeze the same
-    # atoms instead). See step_rigid_ring_unit for the mechanics.
-    rigid_ring_units = rigid_ring_units or []
-    rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
-    if rigid_ring_units:
-        print(f"  Rigid ring bodies: {len(rigid_ring_units)} active "
-              f"({len(rigid_ring_atom_set)} atoms)")
+    ring_constraint_config = RingConstraintConfig()
+    if ring_rotation_units:
+        n_constrained = sum(1 for u in ring_rotation_units if u.get('is_constrained'))
+        print(f"  Ring COM restraint active: {len(ring_rotation_units)} rings "
+              f"({n_constrained} constrained, {len(ring_rotation_units) - n_constrained} free) — "
+              f"soft pull back past {ring_constraint_config.free_max_translation:.1f} Å drift, "
+              f"rotation left free")
+
+    # Compression weight mostly on the inter-sugar/glycosidic bonds, not the
+    # rigid ring interiors: pushing a chain of stiff rings flat should bend
+    # the flexible joints between them, not squash the rings themselves. A
+    # ring still gets dragged down by its neighbors through the ordinary
+    # bonded forces (including the stiff internal constraints propagating
+    # through it as one unit), it just doesn't take the direct gravity/slab
+    # push on its own interior atoms. Substituents (hydroxyls, CH2OH, H)
+    # aren't in ring_references[i].atoms, so they keep full weight, giving a
+    # smooth transition rather than a hard boundary at the ring edge.
+    ring_atom_indices = ([a for ref in ring_references for a in ref.atoms]
+                          if ring_references else [])
+    if ring_atom_indices:
+        print(f"  Ring compression weight scaled to "
+              f"{config.ring_compression_weight_scale:.0%} on {len(ring_atom_indices)} "
+              f"ring atoms — flattening happens at the flexible linkages instead")
 
     initial_xy = None
     if xy_constrained_atoms:
@@ -478,23 +537,25 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
 
         if step % config.minimize_interval == 0:
             t0 = time.perf_counter()
-            # Freeze rigid ring atoms for this minimize burst too — this is a
-            # real per-atom MMFF minimize on mol_copy, outside the rigid-body
-            # step below, so without this the ring would be free to deform
-            # here even though the per-step integration never lets it.
-            minimize_fixed = (list(dict.fromkeys(list(fixed_atoms) + list(rigid_ring_atom_set)))
-                               if rigid_ring_atom_set else fixed_atoms)
             minimize_with_constraint_no_com(
-                mol_copy, props, use_mmff, minimize_fixed,
+                mol_copy, props, use_mmff, fixed_atoms,
                 n_atoms, config.minimize_iterations,
-                torsion_constraints=torsion_constraints)
+                torsion_constraints=torsion_constraints,
+                ring_references=ring_references,
+                ring_bond_tolerance=config.ring_rigid_bond_tolerance,
+                ring_angle_tolerance=config.ring_rigid_angle_tolerance,
+                ring_force_constant=config.ring_rigid_force_constant)
             t_minimize += time.perf_counter() - t0
             velocities = np.random.randn(n_atoms, 3) * 0.01
             positions = get_positions(conf, n_atoms)
 
         t0 = time.perf_counter()
         ff_forces = get_ff_forces(mol_copy, props, use_mmff, n_atoms, config.max_force,
-                                  torsion_constraints=torsion_constraints)
+                                  torsion_constraints=torsion_constraints,
+                                  ring_references=ring_references,
+                                  ring_bond_tolerance=config.ring_rigid_bond_tolerance,
+                                  ring_angle_tolerance=config.ring_rigid_angle_tolerance,
+                                  ring_force_constant=config.ring_rigid_force_constant)
         t_ff_forces += time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -514,8 +575,28 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
         )
         t_slab_forces += time.perf_counter() - t0
 
+        if ring_atom_indices:
+            gravity_forces[ring_atom_indices] *= config.ring_compression_weight_scale
+            slab_forces[ring_atom_indices] *= config.ring_compression_weight_scale
+
         t0 = time.perf_counter()
         total_forces = ff_forces + gravity_forces + slab_forces
+
+        # Gentle COM restraint (minimal drift) + free rotation, exactly how
+        # sugars were handled before the internal-rigidity work started:
+        # a soft force pulling each ring's center of mass back if it strays
+        # past free_max_translation from its starting position, folded into
+        # the same total_forces the ordinary per-atom Langevin step below
+        # uses — no separate integrator, rotation is never touched so it
+        # stays fully free. (Constrained-mode rings, if any are configured
+        # via reference_normals, also get a direct small rotation update
+        # here, hence the positions re-fetch right after.)
+        if ring_rotation_units:
+            apply_ring_constraints_dual_mode(
+                conf, total_forces, ring_rotation_units, masses,
+                config.timestep, n_atoms, ring_constraint_config
+            )
+            positions = get_positions(conf, n_atoms)
 
         if config.enable_convergence:
             try:
@@ -550,17 +631,6 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
                 new_positions[atom_idx, 0] = initial_xy[i, 0]
                 new_positions[atom_idx, 1] = initial_xy[i, 1]
                 velocities[atom_idx, :2] = 0
-
-        # Rigid ring bodies: overwrite the naive per-atom step above for these
-        # atoms with one translation + one rotation computed from the same
-        # positions/total_forces this step, so the ring can never deform,
-        # only move and spin as a whole.
-        for unit in rigid_ring_units:
-            step_rigid_ring_unit(positions, total_forces, unit, masses,
-                                  config.timestep, config.friction, new_positions,
-                                  max_velocity=config.max_velocity)
-            for atom_idx in unit['atoms']:
-                velocities[atom_idx] = 0
 
         set_positions(conf, new_positions, n_atoms)
         t_velocity_update += time.perf_counter() - t0
@@ -665,7 +735,9 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
     return slab_z, fixed_atoms, last_valid_mol
 
 def minimize_with_constraint_no_com(mol, props, use_mmff, fixed_atoms,
-                              n_atoms, max_iterations, torsion_constraints=None):
+                              n_atoms, max_iterations, torsion_constraints=None,
+                              ring_references=None, ring_bond_tolerance=0.02,
+                              ring_angle_tolerance=2.0, ring_force_constant=10000.0):
     """
     Perform energy minimization with position constraints.
     """
@@ -683,6 +755,9 @@ def minimize_with_constraint_no_com(mol, props, use_mmff, fixed_atoms,
 
         # Hold glycosidic bonds trans (180°) without pinning their positions
         _apply_torsion_constraints(ff, torsion_constraints)
+        # Hold ring internal geometry tight without pinning ring positions
+        _apply_ring_rigidity_constraints(ff, ring_references, ring_bond_tolerance,
+                                          ring_angle_tolerance, ring_force_constant)
 
         conf = mol.GetConformer()
 
@@ -1079,54 +1154,48 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     fixed_atoms = config.fixed_atoms.copy() if config.fixed_atoms else []
     from .utils import save_molecule
 
-    # Glycosidic trans dihedrals: frozen rigid (positions) in phase 1 as an anchor,
-    # then held as a 180° torsion restraint in phases 2 & 3 so the bond can relax
-    # to length while staying trans. fixed_atoms (linker + PEtN) stay position-
-    # frozen in ALL phases; lipids are free.
+    # Glycosidic trans dihedrals: held as a 180° torsion restraint in ALL
+    # phases, including phase 1, so the bond can relax to length and its
+    # neighborhood can actually move to resolve any construction-time strain
+    # (e.g. a bad QUEST alignment) while staying trans. Phase 1 used to
+    # freeze these atoms outright as a rigid "anchor" instead; verified on a
+    # real tangled structure that this stalls the minimizer completely (see
+    # run_minimization_phase_no_cog's docstring) whenever the strain sits at
+    # or near the anchor itself, which is exactly where construction is
+    # least reliable. fixed_atoms (linker + PEtN) stay position-frozen in
+    # ALL phases; lipids are free.
     torsion_constraints = [
         (i, j, k, l, config.torsion_min_deg, config.torsion_max_deg,
          config.torsion_force_constant)
         for (i, j, k, l) in (config.torsion_constraints or [])
     ]
-    glyco_atoms = sorted({a for t in torsion_constraints for a in t[:4]})
 
     if fixed_atoms:
         print(f"\n  Fixed atoms from config: {len(fixed_atoms)} (frozen all phases)")
     if torsion_constraints:
-        print(f"  Trans torsion restraints: {len(torsion_constraints)} "
-              f"(phase 1 freezes {len(glyco_atoms)} atoms; phases 2-3 restrain @180°)")
+        print(f"  Trans torsion restraints: {len(torsion_constraints)} (all phases restrain @180°)")
 
-    # Hard-sphere pyranose rings, built once so phases 1-3 all agree on the
-    # same atom membership. In every phase each ring keeps real
-    # translational/rotational freedom (never literally pinned in place —
-    # that would also pin the glycosidic-bond atom on its side, fighting the
-    # trans torsion restraint's "let the bond relax to length, just hold the
-    # angle" design and blocking alpha/beta restoration), while its internal
-    # geometry is protected: phase 2 (run_compression_phase) applies genuine
-    # per-step rigid dynamics; phases 1 and 3 are plain ff.Minimize() bursts
-    # with no per-step hook to do that dynamics in, so there each ring is
-    # frozen only for the duration of the individual burst (never deformed
-    # by ordinary per-atom motion) and then moved as one rigid body between
-    # bursts via the same step_rigid_ring_unit used in phase 2.
-    rigid_ring_units = (build_rigid_ring_units(mol_copy, pyranose_rings, fixed_atoms,
-                                                boundary_atoms=glyco_atoms)
-                         if pyranose_rings else [])
-    rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
-    if rigid_ring_units:
-        print(f"  Rigid ring bodies: {len(rigid_ring_units)} rings, "
-              f"{len(rigid_ring_atom_set)} atoms (rigid dynamics all 3 phases; "
-              f"never pinned in place)")
+    # Pyranose rings keep real translational/rotational freedom in every
+    # phase (never pinned in place — that would also pin the glycosidic-bond
+    # atom on its side, fighting the trans torsion restraint's "let the bond
+    # relax to length, just hold the angle" design and blocking alpha/beta
+    # restoration). Internal geometry is instead protected everywhere by
+    # tight distance/angle constraints on each ring's own bonds
+    # (_apply_ring_rigidity_constraints, driven by ring_references below) —
+    # ring atoms are ordinary MMFF atoms under the same per-atom dynamics as
+    # everything else, translation/rotation/COM motion all emerge from that
+    # exactly as they do for any other atom, only their own bonds are made
+    # far stiffer than an unconstrained MMFF bond/angle.
 
-    # PHASE 1: CONSTRAINED MINIMIZATION (glycosidic atoms frozen as trans anchor)
-    phase1_fixed = list(dict.fromkeys(fixed_atoms + glyco_atoms))
+    # PHASE 1: CONSTRAINED MINIMIZATION (glycosidic bonds held trans, not frozen)
     t0 = time.perf_counter()
     mol_copy = run_minimization_phase_no_cog(
         mol_copy, props, use_mmff,
-        phase1_fixed,
+        fixed_atoms,
         n_atoms, config,
         trajectory_path=trajectory_path,
-        rigid_ring_units=rigid_ring_units,
-        masses=masses
+        ring_references=ring_references,
+        torsion_constraints=torsion_constraints
     )
     t_phase1 = time.perf_counter() - t0
 
@@ -1143,7 +1212,6 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         config, last_valid_mol, fixed_atoms,
         xy_constrained_atoms=lipid_tail_indices or [],
         pyranose_rings=pyranose_rings,
-        rigid_ring_units=rigid_ring_units,
         molecule_data_dict=molecule_data_dict,
         stm_data=stm_data,
         trajectory_path=trajectory_path,
@@ -1160,16 +1228,15 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
 
     t0 = time.perf_counter()
     # Phase 3: linker + PEtN stay frozen (fixed_atoms); pyranose rings keep
-    # rigid-body freedom (frozen only per-burst, moved as a rigid body
-    # between bursts, same as phase 1); glycosidic held trans; everything
+    # real pose freedom, held rigid internally via tight bond/angle
+    # constraints (same as phases 1-2); glycosidic held trans; everything
     # else (incl. lipids) free to relax the whole structure.
     mol_copy = run_final_minimization_phase(
         mol_copy, props, use_mmff, config,
         fixed_atoms=fixed_atoms,
         trajectory_path=trajectory_path,
         torsion_constraints=torsion_constraints,
-        rigid_ring_units=rigid_ring_units,
-        masses=masses
+        ring_references=ring_references
     )
     t_phase3 = time.perf_counter() - t0
 
@@ -1296,25 +1363,21 @@ def run_final_minimization_phase(mol_copy, props, use_mmff,
                                  fixed_atoms=None,
                                  trajectory_path=None,
                                  torsion_constraints=None,
-                                 rigid_ring_units=None,
-                                 masses=None):
+                                 ring_references=None):
     """
     Phase 4: Final gentle minimization without constraints.
     fixed_atoms: list of atom indices to pin (e.g. linker ring atoms).
 
-    Pyranose rings (rigid_ring_units), if given, are NOT added to
-    fixed_atoms — pinning a ring for the whole phase would also pin the
-    glycosidic-bond atom on its side, fighting the trans torsion
-    restraint's "let the bond relax to length, just hold the angle"
-    design. Instead each ring is frozen only for the individual 4-step
-    burst, then moved as one rigid body between bursts (same pattern as
-    run_minimization_phase_no_cog) — real pose freedom, exact geometry.
+    Pyranose rings (ring_references), if given, are held rigid via tight
+    distance/angle constraints on their own bonds rather than any position
+    freeze — ring atoms are ordinary MMFF atoms moved by the same dynamics
+    as everything else, just strongly resisting internal deformation, and
+    the glycosidic-bond atom on the ring's side stays free to relax to
+    length under the trans torsion restraint above.
     """
     if fixed_atoms is None:
         fixed_atoms = []
     n_atoms = mol_copy.GetNumAtoms()
-    rigid_ring_units = rigid_ring_units or []
-    rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
     total_iterations = 200  # Gentle final polish
     steps_per_update = 4
     num_updates = total_iterations // steps_per_update  # 50 updates
@@ -1326,10 +1389,12 @@ def run_final_minimization_phase(mol_copy, props, use_mmff,
                 for atom_idx in fixed_atoms:
                     if 0 <= atom_idx < n_atoms:
                         ff.MMFFAddPositionConstraint(atom_idx, 0.0, 1e15)
-                for atom_idx in rigid_ring_atom_set:
-                    ff.MMFFAddPositionConstraint(atom_idx, 0.0, 1e15)
                 # Linker/PEtN stay frozen above; glycosidic bonds held trans here
                 _apply_torsion_constraints(ff, torsion_constraints)
+                _apply_ring_rigidity_constraints(ff, ring_references,
+                                                  config.ring_rigid_bond_tolerance,
+                                                  config.ring_rigid_angle_tolerance,
+                                                  config.ring_rigid_force_constant)
                 ff.Initialize()
                 ff.Minimize(maxIts=steps_per_update)  # Only 4 steps at a time
             else:
@@ -1337,18 +1402,6 @@ def run_final_minimization_phase(mol_copy, props, use_mmff,
                 break
         else:
             AllChem.UFFOptimizeMolecule(mol_copy, maxIters=steps_per_update)
-
-        if rigid_ring_units:
-            conf = mol_copy.GetConformer()
-            positions = get_positions(conf, n_atoms)
-            forces = get_ff_forces(mol_copy, props, use_mmff, n_atoms, config.max_force,
-                                    torsion_constraints=torsion_constraints)
-            new_positions = positions.copy()
-            for unit in rigid_ring_units:
-                step_rigid_ring_unit(positions, forces, unit, masses,
-                                      config.timestep, config.friction, new_positions,
-                                      max_velocity=config.max_velocity)
-            set_positions(conf, new_positions, n_atoms)
 
         if trajectory_path is not None and update % config.image_interval == 0:
             energy = None
@@ -1598,19 +1651,32 @@ def run_minimization_phase(mol_copy, props, use_mmff, fixed_atoms,
 
 def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
                            n_atoms, config: OptimizationConfig, trajectory_path=None,
-                           rigid_ring_units=None, masses=None):
+                           ring_references=None, torsion_constraints=None):
     """
     Phase 2: Energy minimization with ring constraints (Avogadro style).
     Uses iterative minimization with small steps.
 
-    Pyranose rings (rigid_ring_units), if given, are NOT added to
-    fixed_atoms: pinning a ring's position for the whole phase would also
-    pin the glycosidic-bond atom on its side, preventing that bond from
-    relaxing to length. Instead each ring is frozen only for the duration
-    of the individual 4-step minimize burst (so ordinary per-atom MMFF
-    motion can never deform it), then moved as one rigid body between
-    bursts via step_rigid_ring_unit — real translational/rotational
-    freedom, internal geometry exact.
+    Pyranose rings (ring_references), if given, are held rigid via tight
+    distance/angle constraints on their own bonds (see
+    _apply_ring_rigidity_constraints) rather than any position freeze or
+    separate integrator — ring atoms are ordinary MMFF atoms moved by the
+    same dynamics as everything else, just strongly resisting internal
+    deformation.
+
+    Glycosidic bonds (torsion_constraints) are held trans the same way
+    phases 2-3 already do, a soft dihedral restraint, not a position
+    freeze. This phase used to freeze those atoms outright as a "trans
+    anchor", which silently defeated its own purpose whenever the
+    construction step (e.g. a bad QUEST alignment) left real strain at or
+    near that exact linkage: with the anchor atoms locked, nothing could
+    move to relieve it, so the minimizer stalled. Verified on a real
+    tangled structure: freezing the anchor left it stuck (2,627,581 ->
+    2,624,790 over 1500 iterations, ring rigidity fine but nothing
+    untangled); the same 1500 iterations with the torsion restraint
+    instead reached 79,184, with the glycosidic dihedral still correctly
+    trans and every ring still at exactly 0.0000 A / 0.000 deg deviation
+    — untangling happens through the flexible linkage, never through the
+    rings.
     """
     print("\n" + "="*60)
 
@@ -1632,41 +1698,32 @@ def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
     fixed_set = set(fixed_atoms) if fixed_atoms else set()
     conf_p1 = mol_copy.GetConformer()
 
-    rigid_ring_units = rigid_ring_units or []
-    rigid_ring_atom_set = {a for u in rigid_ring_units for a in u['atoms']}
-    minimize_fixed = (list(dict.fromkeys(list(fixed_atoms) + list(rigid_ring_atom_set)))
-                       if rigid_ring_atom_set else fixed_atoms)
-    if rigid_ring_units:
-        print(f"  Rigid ring bodies: {len(rigid_ring_units)} "
-              f"({len(rigid_ring_atom_set)} atoms) — frozen per-burst, "
-              f"rigid-body moved between bursts")
+    if ring_references:
+        print(f"  Ring rigidity constraints active: {len(ring_references)} rings, "
+              f"bond±{config.ring_rigid_bond_tolerance:.3f} Å, "
+              f"angle±{config.ring_rigid_angle_tolerance:.1f}°")
 
     for update in range(num_updates):
         t0 = time.perf_counter()
         success = minimize_with_constraint_no_com(
-            mol_copy, props, use_mmff, minimize_fixed,
-            n_atoms, max_iterations=steps_per_update
+            mol_copy, props, use_mmff, fixed_atoms,
+            n_atoms, max_iterations=steps_per_update,
+            torsion_constraints=torsion_constraints,
+            ring_references=ring_references,
+            ring_bond_tolerance=config.ring_rigid_bond_tolerance,
+            ring_angle_tolerance=config.ring_rigid_angle_tolerance,
+            ring_force_constant=config.ring_rigid_force_constant
         )
         call_time = time.perf_counter() - t0
         t_minimize += call_time
         call_times.append(call_time)
-
-        if rigid_ring_units:
-            positions = get_positions(conf_p1, n_atoms)
-            forces = get_ff_forces(mol_copy, props, use_mmff, n_atoms, config.max_force)
-            new_positions = positions.copy()
-            for unit in rigid_ring_units:
-                step_rigid_ring_unit(positions, forces, unit, masses,
-                                      config.timestep, config.friction, new_positions,
-                                      max_velocity=config.max_velocity)
-            set_positions(conf_p1, new_positions, n_atoms)
 
         # Optional stochastic kicks — disabled by default (enable_phase1_kicks=False).
         # Mimics phase 2's velocity reinitialization to help escape torsional local
         # minima (e.g. twisted bonded sugar rings) without disturbing well-built structures.
         if config.enable_phase1_kicks and update > 0 and update % config.phase1_kick_interval == 0:
             for i in range(n_atoms):
-                if i not in fixed_set and i not in rigid_ring_atom_set:
+                if i not in fixed_set:
                     pos = conf_p1.GetAtomPosition(i)
                     dx, dy, dz = np.random.randn(3) * config.phase1_kick_amplitude
                     conf_p1.SetAtomPosition(i, (pos.x + dx, pos.y + dy, pos.z + dz))

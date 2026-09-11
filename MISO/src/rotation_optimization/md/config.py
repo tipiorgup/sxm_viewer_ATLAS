@@ -101,6 +101,16 @@ class OptimizationConfig:
     constrained_ring_com_limit : float  (Å)
     free_ring_com_limit : float  (Å)
 
+    Ring rigidity (hard MMFF distance/angle constraints on each ring's own
+    bonds, applied in every optimisation phase; not a separate integrator —
+    ring atoms still move under the same per-atom dynamics as everything
+    else, translation/rotation/center-of-mass motion untouched, only their
+    own bonds are made far stiffer than an unconstrained MMFF bond/angle)
+    ------------------------------------------------------------------
+    ring_rigid_bond_tolerance : float  (Å)
+    ring_rigid_angle_tolerance : float  (degrees)
+    ring_rigid_force_constant : float  (kcal mol⁻¹)
+
     Minimisation
     ------------
     minimize_interval : int
@@ -162,6 +172,23 @@ class OptimizationConfig:
     ring_tolerance_angle: float = DEFAULT_ANGLE_TOLERANCE
     check_rings_interval: int = DEFAULT_CHECK_RINGS_INTERVAL
     constrained_ring_com_limit: float = DEFAULT_CONSTRAINED_RING_COM_LIMIT
+
+    # Ring rigidity (hard bond/angle constraints, not a separate integrator)
+    ring_rigid_bond_tolerance: float = 0.02
+    ring_rigid_angle_tolerance: float = 2.0
+    ring_rigid_force_constant: float = 10000.0
+    # Fraction of gravity/slab compression force a ring's own interior atoms
+    # feel during phase 2 (0-1). The rest of that weight, by not being
+    # applied there, effectively falls on the flexible inter-residue
+    # linkages instead, so compression flattens the structure by bending
+    # those joints rather than pushing on the now-rigid ring interiors.
+    # Kept low because the soft COM restraint's own stiffness is bounded by
+    # the shared max_velocity cap: once a ring atom is displaced, raising
+    # restraint stiffness barely speeds its correction, but cutting the
+    # force reaching it in the first place does (measured: 0.1 -> 0.02
+    # dropped worst-case ring COM drift on a real 8-ring test structure
+    # from 0.72 to 0.62 A, tightening the glycosidic bond closure too).
+    ring_compression_weight_scale: float = 0.02
     free_ring_com_limit: float = DEFAULT_FREE_RING_COM_LIMIT
 
     # Minimisation
