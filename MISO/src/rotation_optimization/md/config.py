@@ -182,11 +182,18 @@ class OptimizationConfig:
     # (a hard projection, not a spring -- see recenter_ring_bead) between
     # each. A ring is free to drift within one chunk, whatever helps the
     # minimizer resolve strain, but is snapped back exactly once the chunk
-    # ends. More chunks track the reference more tightly at some cost to
-    # convergence quality (RDKit's minimizer resets its line-search state
-    # on every call), fewer chunks converge better but let more drift
-    # accumulate before it's corrected.
-    phase1_recenter_chunks: int = 10
+    # ends. The snap itself can introduce a fresh clash at the ring/bead
+    # boundary (the just-relaxed neighborhood gets shoved by the
+    # correction), which the *next* chunk's minimization then has to
+    # absorb -- so this isn't simply "fewer chunks converge better" the
+    # way plain (non-recentering) bursting is. Measured on a real tangled
+    # structure: final energy was worse at both extremes (1 chunk: 528,660;
+    # 150 chunks: 10,880) than in the middle (30 chunks: 5,472), since too
+    # few chunks means one huge unrelaxed snap at the very end, and too
+    # many means each individual burst is too short to make real progress
+    # (the same line-search-reset problem that broke the old 375x4 Avogadro
+    # pattern). 30 was the best of the values tried; not fully swept.
+    phase1_recenter_chunks: int = 30
     # Fraction of gravity/slab compression force a ring's own interior atoms
     # feel during phase 2 (0-1). The rest of that weight, by not being
     # applied there, effectively falls on the flexible inter-residue
