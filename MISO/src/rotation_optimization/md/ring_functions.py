@@ -15,7 +15,7 @@ from ..geometry.geometry_utils import (
     get_positions, set_positions, get_atom_position,
     calculate_distance, calculate_angle,
     get_ring_normal_from_positions, calculate_center_of_mass,
-    rodrigues_rotation, calculate_moment_of_inertia,
+    rodrigues_rotation, calculate_moment_of_inertia, cap_vectors,
 )
 from .config import (
     OptimizationConfig, RingConstraintConfig, RingRotationUnit,
@@ -314,7 +314,7 @@ def build_rigid_ring_units(mol, pyranose_rings, fixed_atoms=None, boundary_atoms
 
 
 def step_rigid_ring_unit(positions, forces, unit, masses, timestep, friction,
-                          out_positions):
+                          out_positions, max_velocity=None):
     """Advance one ring rigid body by one MD step.
 
     Net force and net torque about the unit's own center of mass are
@@ -332,6 +332,18 @@ def step_rigid_ring_unit(positions, forces, unit, masses, timestep, friction,
     the rigid body's net force/torque, so the unit feels the same thermal
     environment as an ordinary atom, just responds to it as one rigid body
     instead of len(atoms) independent ones.
+
+    max_velocity caps linear speed directly (same cap ordinary atoms get
+    via cap_vectors) and caps angular speed so that no atom in the unit
+    -- checked at its actual distance from the COM, not some fixed radius
+    -- would exceed that same linear speed from rotation alone. Without
+    this, a large or ill-conditioned unit (e.g. one that absorbed atoms it
+    shouldn't have) can pick up an unbounded velocity from a single bad
+    step and go non-finite; MMFF's energy/gradient then reads that
+    non-finite position for every bonded and nearby atom, so the NaN
+    spreads to the whole structure within a few steps. Any non-finite
+    torque/inertia/acceleration is treated as a failed step (velocity
+    left unchanged) rather than propagated.
     """
     atoms = unit['atoms']
     sub_masses = masses[atoms]
@@ -357,10 +369,26 @@ def step_rigid_ring_unit(positions, forces, unit, masses, timestep, friction,
 
     linear_accel = net_force / total_mass
 
+    if not (np.all(np.isfinite(linear_accel)) and np.all(np.isfinite(angular_accel))):
+        print(f"  ⚠ Rigid ring unit ({len(atoms)} atoms): non-finite "
+              f"acceleration this step, holding velocity and skipping move")
+        linear_accel = np.zeros(3)
+        angular_accel = np.zeros(3)
+
     unit['linear_velocity'] = (unit['linear_velocity'] * (1 - friction * timestep)
                                 + linear_accel * timestep)
     unit['angular_velocity'] = (unit['angular_velocity'] * (1 - friction * timestep)
                                  + angular_accel * timestep)
+
+    if max_velocity is not None:
+        unit['linear_velocity'] = cap_vectors(
+            unit['linear_velocity'][np.newaxis, :], max_velocity)[0]
+        max_radius = np.max(np.linalg.norm(rel, axis=1)) if len(atoms) else 0.0
+        if max_radius > EPSILON:
+            omega_max = max_velocity / max_radius
+            omega_norm = np.linalg.norm(unit['angular_velocity'])
+            if omega_norm > omega_max:
+                unit['angular_velocity'] *= omega_max / omega_norm
 
     new_com = com + unit['linear_velocity'] * timestep
     omega = unit['angular_velocity']

@@ -557,7 +557,8 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
         # only move and spin as a whole.
         for unit in rigid_ring_units:
             step_rigid_ring_unit(positions, total_forces, unit, masses,
-                                  config.timestep, config.friction, new_positions)
+                                  config.timestep, config.friction, new_positions,
+                                  max_velocity=config.max_velocity)
             for atom_idx in unit['atoms']:
                 velocities[atom_idx] = 0
 
