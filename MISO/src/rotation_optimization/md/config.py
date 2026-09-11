@@ -182,7 +182,13 @@ class OptimizationConfig:
     # applied there, effectively falls on the flexible inter-residue
     # linkages instead, so compression flattens the structure by bending
     # those joints rather than pushing on the now-rigid ring interiors.
-    ring_compression_weight_scale: float = 0.1
+    # Kept low because the soft COM restraint's own stiffness is bounded by
+    # the shared max_velocity cap: once a ring atom is displaced, raising
+    # restraint stiffness barely speeds its correction, but cutting the
+    # force reaching it in the first place does (measured: 0.1 -> 0.02
+    # dropped worst-case ring COM drift on a real 8-ring test structure
+    # from 0.72 to 0.62 A, tightening the glycosidic bond closure too).
+    ring_compression_weight_scale: float = 0.02
     free_ring_com_limit: float = DEFAULT_FREE_RING_COM_LIMIT
 
     # Minimisation

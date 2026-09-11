@@ -218,15 +218,19 @@ CONSTRAINED_TRANSLATION_STIFFNESS = get_env_float('CONSTRAINED_TRANSLATION_STIFF
 # Free ring parameters (3D mode)
 # ============================================================================
 
-FREE_MAX_TRANSLATION = get_env_float('FREE_MAX_TRANSLATION', 0.5)
+FREE_MAX_TRANSLATION = get_env_float('FREE_MAX_TRANSLATION', 0.25)
 """Å — maximum COM drift for rings in free (3D) mode. Kept small so a
 ring's center of mass stays essentially anchored (a little drift is fine,
 translation is not the mechanism meant to absorb compression) while
 rotation is left completely free — compression should instead flex the
-glycosidic bond's own dihedral/torsion angles."""
+glycosidic bond's own dihedral/torsion angles. Subunit COM is prioritized
+over glycosidic bond length: an imperfectly closed linkage bond is an
+accepted tradeoff, drift is not."""
 
-FREE_TRANSLATION_STIFFNESS = get_env_float('FREE_TRANSLATION_STIFFNESS', 300.0)
-"""kcal mol⁻¹ Å⁻² — stiffness of the soft COM restraint in free mode."""
+FREE_TRANSLATION_STIFFNESS = get_env_float('FREE_TRANSLATION_STIFFNESS', 500.0)
+"""kcal mol⁻¹ Å⁻² — stiffness of the soft COM restraint in free mode.
+Matches CONSTRAINED_TRANSLATION_STIFFNESS so the restraint pulls back
+decisively once past the (smaller) free-mode threshold."""
 
 # ============================================================================
 # Ring matching (pipeline.extract_initial_ring_coms_from_monomers)
