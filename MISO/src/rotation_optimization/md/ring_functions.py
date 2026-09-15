@@ -341,7 +341,8 @@ def kabsch_rotation(reference_centered, current_centered):
     return Vt.T @ correction @ U.T
 
 
-def restore_ring_shape(conf, n_atoms, ring_atoms, shape_reference_centered):
+def restore_ring_shape(conf, n_atoms, ring_atoms, ring_masses,
+                        shape_reference_centered):
     """
     Snap a ring's own atoms back onto its exact reference shape (bond
     lengths, angles, puckering) via the best-fit rigid rotation, computed
@@ -352,9 +353,16 @@ def restore_ring_shape(conf, n_atoms, ring_atoms, shape_reference_centered):
     is removed, since the reference shape is placed exactly, not pulled
     toward.
 
+    Centering uses the same mass-weighted COM as recenter_ring_bead (not
+    a plain unweighted mean) so the two compose cleanly: since
+    shape_reference_centered is itself centered on its own mass-weighted
+    COM (zero), placing it back at the ring's current mass-weighted COM
+    leaves that COM untouched -- this call fixes shape only, never drift,
+    regardless of whether recenter_ring_bead ran just before or after it.
+
     shape_reference_centered: the ring's reference atom positions (in the
     same atom order as ring_atoms), already centered on their own
-    centroid, captured once before optimization began.
+    mass-weighted COM, captured once before optimization began.
 
     Substituent atoms (hydroxyls, CH2OH, ring H's) are deliberately left
     alone here -- they're bonded to the now-corrected ring atoms and get
@@ -369,7 +377,7 @@ def restore_ring_shape(conf, n_atoms, ring_atoms, shape_reference_centered):
     """
     positions = get_positions(conf, n_atoms)
     current = positions[ring_atoms]
-    centroid = np.mean(current, axis=0)
+    centroid = calculate_center_of_mass(current, ring_masses)
     current_centered = current - centroid
 
     R = kabsch_rotation(shape_reference_centered, current_centered)

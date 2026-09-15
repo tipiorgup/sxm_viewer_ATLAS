@@ -648,6 +648,7 @@ def run_compression_phase(mol_copy, conf, n_atoms, masses, props, use_mmff,
         if ring_shape_references and pyranose_rings:
             for ring_idx, ring_atoms in enumerate(pyranose_rings):
                 restore_ring_shape(conf, n_atoms, ring_atoms,
+                                    masses[ring_atoms],
                                     ring_shape_references[ring_idx])
 
         t_velocity_update += time.perf_counter() - t0
@@ -1220,14 +1221,15 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         for ring_atoms in pyranose_rings
     ]
     # The exact reference shape (bond lengths, angles, puckering) for each
-    # ring, centered on its own geometric centroid -- used by
+    # ring, centered on its own mass-weighted COM (matching
+    # ring_com_references, not a plain unweighted mean) -- used by
     # restore_ring_shape to snap a ring's atoms back onto this shape via a
     # fresh best-fit rotation each time, rather than relying on a k=10000
     # MMFF force to resist deformation in real time (which was found to
     # cause overshoot/oscillation under explicit MD's finite timestep).
     ring_shape_references = [
-        ref_positions[ring_atoms] - np.mean(ref_positions[ring_atoms], axis=0)
-        for ring_atoms in pyranose_rings
+        ref_positions[ring_atoms] - ring_com_references[idx]
+        for idx, ring_atoms in enumerate(pyranose_rings)
     ]
 
     # PHASE 1: CONSTRAINED MINIMIZATION (glycosidic bonds held trans, not frozen)
@@ -1242,7 +1244,8 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         pyranose_rings=pyranose_rings,
         bead_atoms_per_ring=bead_atoms_per_ring,
         ring_com_references=ring_com_references,
-        masses=masses
+        masses=masses,
+        ring_shape_references=ring_shape_references
     )
     t_phase1 = time.perf_counter() - t0
 
@@ -1308,7 +1311,10 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
         fixed_atoms=fixed_atoms,
         trajectory_path=trajectory_path,
         torsion_constraints=torsion_constraints,
-        ring_references=ring_references
+        ring_references=ring_references,
+        pyranose_rings=pyranose_rings,
+        ring_shape_references=ring_shape_references,
+        masses=masses
     )
     t_phase3 = time.perf_counter() - t0
 
@@ -1435,7 +1441,10 @@ def run_final_minimization_phase(mol_copy, props, use_mmff,
                                  fixed_atoms=None,
                                  trajectory_path=None,
                                  torsion_constraints=None,
-                                 ring_references=None):
+                                 ring_references=None,
+                                 pyranose_rings=None,
+                                 ring_shape_references=None,
+                                 masses=None):
     """
     Phase 4: Final gentle minimization without constraints.
     fixed_atoms: list of atom indices to pin (e.g. linker ring atoms).
@@ -1446,6 +1455,16 @@ def run_final_minimization_phase(mol_copy, props, use_mmff,
     as everything else, just strongly resisting internal deformation, and
     the glycosidic-bond atom on the ring's side stays free to relax to
     length under the trans torsion restraint above.
+
+    Runs in 4-iteration bursts (same as the original Avogadro-style
+    pattern), which on its own left the k=10000 constraint unable to fully
+    re-settle each time -- measured on a real structure, rings that left
+    Phase 2 at exactly 0.000 A deviation (thanks to the Kabsch correction
+    there) came out of this phase at 0.067/0.040 A, a real regression, not
+    just failing to improve further. If pyranose_rings/ring_shape_references
+    are given, each ring is snapped back onto its exact reference shape
+    (restore_ring_shape) after every burst, the same fix already used in
+    phases 1-2, so this phase can no longer erode what Phase 2 achieved.
     """
     if fixed_atoms is None:
         fixed_atoms = []
@@ -1453,6 +1472,9 @@ def run_final_minimization_phase(mol_copy, props, use_mmff,
     total_iterations = 200  # Gentle final polish
     steps_per_update = 4
     num_updates = total_iterations // steps_per_update  # 50 updates
+    conf_p3 = mol_copy.GetConformer()
+    restore_rings = bool(pyranose_rings and ring_shape_references is not None
+                          and masses is not None)
 
     for update in range(num_updates):
         if use_mmff:
@@ -1474,6 +1496,12 @@ def run_final_minimization_phase(mol_copy, props, use_mmff,
                 break
         else:
             AllChem.UFFOptimizeMolecule(mol_copy, maxIters=steps_per_update)
+
+        if restore_rings:
+            for ring_idx, ring_atoms in enumerate(pyranose_rings):
+                restore_ring_shape(conf_p3, n_atoms, ring_atoms,
+                                    masses[ring_atoms],
+                                    ring_shape_references[ring_idx])
 
         if trajectory_path is not None and update % config.image_interval == 0:
             energy = None
@@ -1725,7 +1753,8 @@ def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
                            n_atoms, config: OptimizationConfig, trajectory_path=None,
                            ring_references=None, torsion_constraints=None,
                            pyranose_rings=None, bead_atoms_per_ring=None,
-                           ring_com_references=None, masses=None):
+                           ring_com_references=None, masses=None,
+                           ring_shape_references=None):
     """
     Phase 2: Energy minimization with ring constraints (Avogadro style).
     Uses iterative minimization with small steps.
@@ -1844,6 +1873,10 @@ def run_minimization_phase_no_cog(mol_copy, props, use_mmff, fixed_atoms,
                     bead_atoms_per_ring[ring_idx], ring_atoms,
                     masses[ring_atoms], ring_com_references[ring_idx]
                 )
+                if ring_shape_references is not None:
+                    restore_ring_shape(conf_p1, n_atoms, ring_atoms,
+                                        masses[ring_atoms],
+                                        ring_shape_references[ring_idx])
 
         # Optional stochastic kicks — disabled by default (enable_phase1_kicks=False).
         # Mimics phase 2's velocity reinitialization to help escape torsional local
