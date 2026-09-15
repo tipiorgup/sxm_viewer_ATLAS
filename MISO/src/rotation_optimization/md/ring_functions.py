@@ -247,6 +247,137 @@ def get_ring_substituents(mol, ring_atoms, all_ring_atoms_global):
 
     return list(to_rotate)
 
+def get_ring_bead_atoms(mol, ring_atoms, all_ring_atoms_global, glycosidic_bond_pairs):
+    """
+    All atoms that move rigidly with this ring: the ring itself plus every
+    substituent hanging off it (hydroxyls, CH2OH, ring hydrogens, etc.).
+    BFS outward from the ring, but never crosses into another ring's atoms
+    or across a registered glycosidic bond -- those are the flexible
+    tethers between beads, not part of this one. Without the glycosidic
+    stop, BFS would walk straight through the linkage atom (e.g. an Asn
+    side-chain N) into the entire rest of whatever's attached on the other
+    side.
+
+    Args:
+        mol: RDKit molecule
+        ring_atoms: atoms in THIS ring
+        all_ring_atoms_global: set of every pyranose ring atom in the molecule
+        glycosidic_bond_pairs: set of (a, b) atom-index tuples (both
+            directions) marking each glycosidic bond that must not be
+            crossed
+
+    Returns:
+        List of atom indices making up this ring's rigid bead
+    """
+    bead = set(ring_atoms)
+    queue = list(ring_atoms)
+
+    while queue:
+        current = queue.pop(0)
+        atom = mol.GetAtomWithIdx(current)
+
+        for neighbor in atom.GetNeighbors():
+            nbr_idx = neighbor.GetIdx()
+
+            if nbr_idx in bead:
+                continue
+            if nbr_idx in all_ring_atoms_global:
+                continue
+            if (current, nbr_idx) in glycosidic_bond_pairs:
+                continue
+
+            bead.add(nbr_idx)
+            queue.append(nbr_idx)
+
+    return list(bead)
+
+
+def recenter_ring_bead(conf, n_atoms, bead_atoms, ring_atoms, ring_masses,
+                        reference_com):
+    """
+    Rigidly translate a ring's whole bead (ring + substituents) so the
+    ring's own mass-weighted COM lands exactly back on reference_com.
+
+    A uniform shift of every bead atom by the same vector changes nothing
+    about the bead's internal geometry or orientation -- bond lengths,
+    angles, and whatever rotation the minimizer found are all preserved
+    exactly. Only the bead's position moves. This is a hard (projection)
+    constraint, not a spring: the COM lands exactly on the reference every
+    time this is called, with no residual error to accumulate.
+
+    Returns:
+        Distance the ring's COM had drifted before this correction (Å)
+    """
+    positions = get_positions(conf, n_atoms)
+    ring_positions = positions[ring_atoms]
+    com_current = calculate_center_of_mass(ring_positions, ring_masses)
+
+    delta = reference_com - com_current
+    drift = np.linalg.norm(delta)
+
+    positions[bead_atoms] += delta
+    set_positions(conf, positions, n_atoms)
+
+    return drift
+
+
+def kabsch_rotation(reference_centered, current_centered):
+    """
+    Optimal proper (no reflection) rotation matrix mapping
+    *reference_centered* onto *current_centered* -- both already centered
+    at their own origin, both shape (N, 3). Same category of problem QUEST
+    itself solves (Wahba's problem / best-fit rotation between two vector
+    sets), via SVD instead of the quaternion eigenvalue route.
+
+    The determinant check is required: an uncorrected SVD solution can be
+    an improper rotation (a reflection) when the point correspondence is
+    degenerate or near-degenerate, which would invert the ring's
+    stereochemistry (alpha/beta) instead of just reorienting it.
+    """
+    H = reference_centered.T @ current_centered
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    correction = np.diag([1.0, 1.0, d])
+    return Vt.T @ correction @ U.T
+
+
+def restore_ring_shape(conf, n_atoms, ring_atoms, shape_reference_centered):
+    """
+    Snap a ring's own atoms back onto its exact reference shape (bond
+    lengths, angles, puckering) via the best-fit rigid rotation, computed
+    fresh against wherever the ring currently is -- not a force, an exact
+    geometric projection, so there is no stiffness/timestep interaction to
+    go unstable. Whatever legitimate translation or rotation the ring has
+    undergone survives untouched; only the internal deformation component
+    is removed, since the reference shape is placed exactly, not pulled
+    toward.
+
+    shape_reference_centered: the ring's reference atom positions (in the
+    same atom order as ring_atoms), already centered on their own
+    centroid, captured once before optimization began.
+
+    Substituent atoms (hydroxyls, CH2OH, ring H's) are deliberately left
+    alone here -- they're bonded to the now-corrected ring atoms and get
+    pulled into a consistent position by ordinary MMFF forces on the next
+    force evaluation, the same way any bonded atom reacts to a moved
+    neighbor. Rigidly dragging them along too would require re-deriving
+    which ones are still legitimately free to rotate (e.g. a hydroxyl's
+    own rotamer) versus which aren't, and risks the same
+    "correction-shoves-a-neighbor" clash recenter_ring_bead can cause for
+    large jumps -- unnecessary here since a ring already close to its
+    reference shape only needs a small correction.
+    """
+    positions = get_positions(conf, n_atoms)
+    current = positions[ring_atoms]
+    centroid = np.mean(current, axis=0)
+    current_centered = current - centroid
+
+    R = kabsch_rotation(shape_reference_centered, current_centered)
+    positions[ring_atoms] = (shape_reference_centered @ R.T) + centroid
+
+    set_positions(conf, positions, n_atoms)
+
+
 def apply_translation_constraint(positions, forces, ring_atoms, ring_masses,
                                  com_current, com_initial, max_translation,
                                  translation_stiffness):

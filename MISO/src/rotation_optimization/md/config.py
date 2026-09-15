@@ -177,6 +177,23 @@ class OptimizationConfig:
     ring_rigid_bond_tolerance: float = 0.02
     ring_rigid_angle_tolerance: float = 2.0
     ring_rigid_force_constant: float = 10000.0
+    # Phase 1 chunks the 1500-iteration minimization budget into this many
+    # pieces, recentering every ring's COM back onto its original position
+    # (a hard projection, not a spring -- see recenter_ring_bead) between
+    # each. A ring is free to drift within one chunk, whatever helps the
+    # minimizer resolve strain, but is snapped back exactly once the chunk
+    # ends. The snap itself can introduce a fresh clash at the ring/bead
+    # boundary (the just-relaxed neighborhood gets shoved by the
+    # correction), which the *next* chunk's minimization then has to
+    # absorb -- so this isn't simply "fewer chunks converge better" the
+    # way plain (non-recentering) bursting is. Measured on a real tangled
+    # structure: final energy was worse at both extremes (1 chunk: 528,660;
+    # 150 chunks: 10,880) than in the middle (30 chunks: 5,472), since too
+    # few chunks means one huge unrelaxed snap at the very end, and too
+    # many means each individual burst is too short to make real progress
+    # (the same line-search-reset problem that broke the old 375x4 Avogadro
+    # pattern). 30 was the best of the values tried; not fully swept.
+    phase1_recenter_chunks: int = 30
     # Fraction of gravity/slab compression force a ring's own interior atoms
     # feel during phase 2 (0-1). The rest of that weight, by not being
     # applied there, effectively falls on the flexible inter-residue
