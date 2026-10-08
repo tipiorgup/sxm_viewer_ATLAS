@@ -42,3 +42,26 @@ sxm_viewer/
   here.
 - Remaining legacy utilities are isolated under `scripts/` or kept as thin
   shims; new features should target the modules above.
+
+## Position monomer: sugar names and SMILES
+
+In **Tools > Position monomer**, the sugar input accepts either manual SMILES or
+a sugar name. Examples: `glucose`, `chair KDO`, `D chair 4C1 glucose`, and
+`beta-D-glucose`. Optional leading descriptors include D/L, alpha/beta, chair,
+boat, twist, envelope, half-chair, and the specific chairs 4C1/1C4.
+
+Click **Build** to resolve names via PubChem in the background. The resolved
+stereochemical SMILES and requested ring/anomer are filled into the table, then
+the existing build, placement, rotation and export workflow continues. A blank
+MISO **Name** is filled with the sugar name; an existing name is preserved.
+Conflicting typed descriptors and table selections are reported rather than
+silently overridden. D/L is encoded in the retrieved SMILES, not a pucker filter.
+Specific chair selections only accept matching generated conformers; if none
+are generated, the build reports a failure rather than substituting another chair.
+
+Manual SMILES never requires a network connection. When a name lookup cannot
+connect (10-second timeout per request), a small warning explains that SMILES
+and sugar details must be supplied manually. Unknown names and PubChem service
+errors have separate warnings. Failed lookups leave the table and existing
+placed monomers unchanged. Only sugar-name queries are sent to PubChem; images,
+positions and local files are not uploaded.

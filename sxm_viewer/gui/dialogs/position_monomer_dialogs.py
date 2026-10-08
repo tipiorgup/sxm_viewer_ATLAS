@@ -5,15 +5,42 @@ from pathlib import Path
 import numpy as np
 
 from ..._shared import QtCore, QtWidgets
+from ...utils.sugar_lookup import (
+    SugarConnectionError, SugarLookupError, lookup_sugar, parse_sugar_description,
+)
 from ._sxm_image_loader import load_demo_image
 
 
-# Ring-type options wired to monomer_building.classify_puckering base labels.
-# The engine filters on descriptor.split('_')[0], so these bases match
-# chair_4C1/chair_1C4, boat/boat_intermediate, twist_intermediate,
-# envelope_N, half_chair.
-RING_TYPES = ["Any", "chair", "boat", "twist", "envelope", "half"]
+# The engine filters base labels; specific chairs are filtered locally afterward.
+RING_TYPES = ["Any", "chair", "chair_4C1", "chair_1C4", "boat", "twist", "envelope", "half"]
 ANOMERS = ["Any", "alpha", "beta"]
+
+
+class _SugarLookupSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object, str, str)
+
+
+class _SugarLookupWorker(QtCore.QRunnable):
+    def __init__(self, requests):
+        super().__init__()
+        self.requests = requests
+        self.signals = _SugarLookupSignals()
+
+    def run(self):
+        results = []
+        cache = {}
+        for row, request in self.requests:
+            try:
+                if request.query not in cache:
+                    cache[request.query] = lookup_sugar(request.query)
+                results.append((row, request, cache[request.query]))
+            except SugarConnectionError as exc:
+                self.signals.finished.emit([], "No internet connection", str(exc))
+                return
+            except SugarLookupError as exc:
+                self.signals.finished.emit([], "Sugar lookup", f"Row {row+1}: {exc}")
+                return
+        self.signals.finished.emit(results, "", "")
 
 # Amino-acid tables mirrored from MISO peptide_building.build_peptide_with_rdkit_ca
 # (those dicts are function-local there, so we replicate the standard 20 here).
@@ -264,11 +291,12 @@ def _elem_from_key(key):
 
 
 class PositionMonomerDialog(QtWidgets.QDialog):
-    """Build MISO monomers from SMILES and place them on the STM image.
+    """Build MISO monomers from SMILES or sugar names and place them on the STM image.
 
     Workflow:
-      1. Fill the table: SMILES, ring type (chair/boat/...), anomer (alpha/beta)
-         and number of copies for each monomer.
+      1. Fill the table: SMILES or sugar description, ring type (chair/boat/...),
+         anomer (alpha/beta) and number of copies for each monomer. Sugar names
+         are resolved online before building; manual SMILES works offline.
       2. *Build monomers* runs monomer_building.generate_monomer_conformers with
          the chosen puckering/anomer filter and keeps the lowest-energy match,
          then instantiates the requested copies.
@@ -291,6 +319,9 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self._templates = {}      # row index -> template dict
         self._instances = []      # list of instance dicts
         self._overlay_artists = []
+        self._lookup_worker = None
+        self._lookup_cancelled = False
+        self.finished.connect(self._cancel_sugar_lookup)
 
         # Lipids: point-defined chains (start/end/optional mid + carbons + linkage).
         self._lipids = []         # parallel to lipid table rows
@@ -357,13 +388,18 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             "Subunits to build (mix for glycopeptides):"))
         self.table = QtWidgets.QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Type", "Name", "SMILES / Residue", "Ring type", "Anomer", "Copies"])
+            ["Type", "Name", "SMILES / Sugar name / Residue", "Ring type", "Anomer", "Copies"])
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         for c in (0, 1, 3, 4, 5):
             hdr.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
         self.table.setFixedHeight(150)
         col.addWidget(self.table)
+        self.lookup_status = QtWidgets.QLabel(
+            "Sugar input: SMILES or a name, e.g. chair KDO / D chair 4C1 glucose. "
+            "Build looks up names online; manual SMILES works offline.")
+        self.lookup_status.setWordWrap(True)
+        col.addWidget(self.lookup_status)
 
         def_row = QtWidgets.QHBoxLayout()
         self.add_sugar_btn = QtWidgets.QPushButton("Add sugar")
@@ -371,14 +407,14 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self.add_aa_btn = QtWidgets.QPushButton("Add amino acid")
         self.add_aa_btn.setEnabled(False)
         self.add_aa_btn.clicked.connect(lambda: self._add_table_row("Amino acid"))
-        del_btn = QtWidgets.QPushButton("Remove selected")
-        del_btn.clicked.connect(self._remove_table_row)
+        self.del_btn = QtWidgets.QPushButton("Remove selected")
+        self.del_btn.clicked.connect(self._remove_table_row)
         self.build_btn = QtWidgets.QPushButton("Build")
         self.build_btn.setEnabled(loaded)
         self.build_btn.clicked.connect(self._build_monomers)
         def_row.addWidget(self.add_sugar_btn)
         def_row.addWidget(self.add_aa_btn)
-        def_row.addWidget(del_btn)
+        def_row.addWidget(self.del_btn)
         def_row.addStretch()
         def_row.addWidget(self.build_btn)
         col.addLayout(def_row)
@@ -725,10 +761,14 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             name_item.setText("—")
         self.table.setItem(r, 1, name_item)
 
-        # Column 2: SMILES (sugar) or residue code (amino acid).
+        # Column 2: SMILES/sugar description or residue code (amino acid).
         item = QtWidgets.QTableWidgetItem(text)
         if kind == "Amino acid":
             item.setToolTip("1- or 3-letter residue code, e.g. N / Asn")
+        else:
+            item.setToolTip(
+                "SMILES or sugar description, e.g. chair KDO, D chair 4C1 glucose, "
+                "beta-D-glucose. Names are resolved via PubChem when you click Build.")
         self.table.setItem(r, 2, item)
 
         # Columns 3-4: ring type / anomer — only meaningful for sugars.
@@ -789,12 +829,83 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         return defs
 
     def _build_monomers(self):
+        if self._lookup_worker is not None:
+            return
         defs = self._collect_defs()
         if not defs:
             QtWidgets.QMessageBox.warning(
                 self, "Nothing to build", "Add at least one subunit first.")
             return
 
+        from rdkit import Chem, rdBase
+        requests = []
+        for d in defs:
+            if d["kind"] != "sugar":
+                continue
+            with rdBase.BlockLogs():
+                mol = Chem.MolFromSmiles(d["smiles"])
+            if mol is not None:
+                continue
+            try:
+                request = parse_sugar_description(d["smiles"], d["ring"], d["anomer"])
+            except SugarLookupError as exc:
+                QtWidgets.QMessageBox.warning(self, "Sugar description", f"Row {d['row']+1}: {exc}")
+                return
+            requests.append((d["row"], request))
+        if requests:
+            self._lookup_cancelled = False
+            self._set_lookup_busy(True)
+            self.lookup_status.setText("Checking connection and looking up sugar names in PubChem...")
+            worker = _SugarLookupWorker(requests)
+            worker.signals.finished.connect(self._on_sugar_lookup_finished)
+            self._lookup_worker = worker
+            QtCore.QThreadPool.globalInstance().start(worker)
+            return
+        self._build_resolved_monomers(defs)
+
+    def _cancel_sugar_lookup(self, _result):
+        self._lookup_cancelled = True
+
+    def _set_lookup_busy(self, busy):
+        self.table.setEnabled(not busy)
+        self.build_btn.setEnabled(not busy and self._img is not None)
+        self.add_sugar_btn.setEnabled(not busy)
+        self.add_aa_btn.setEnabled(not busy and self.aa_chk.isChecked())
+        self.del_btn.setEnabled(not busy)
+        self.aa_chk.setEnabled(not busy)
+
+    def _on_sugar_lookup_finished(self, results, title, error):
+        self._lookup_worker = None
+        self._set_lookup_busy(False)
+        if self._lookup_cancelled:
+            return
+        if error:
+            self.lookup_status.setText(error)
+            QtWidgets.QMessageBox.warning(self, title, error)
+            return
+        from rdkit import Chem, rdBase
+        for row, request, result in results:
+            with rdBase.BlockLogs():
+                mol = Chem.MolFromSmiles(result.smiles)
+            if mol is None:
+                error = f"PubChem returned invalid SMILES for '{request.query}'. Enter SMILES manually."
+                self.lookup_status.setText(error)
+                QtWidgets.QMessageBox.warning(self, "Sugar lookup", error)
+                return
+        for row, request, result in results:
+            item = self.table.item(row, 2)
+            item.setText(result.smiles)
+            item.setToolTip(
+                f"PubChem: {request.query}\nCID: {result.cid}\n{result.iupac_name}")
+            name_item = self.table.item(row, 1)
+            if not name_item.text().strip():
+                name_item.setText(request.name)
+            self.table.cellWidget(row, 3).setCurrentText(request.ring)
+            self.table.cellWidget(row, 4).setCurrentText(request.anomer)
+        self.lookup_status.setText("Sugar names resolved via PubChem. SMILES and details remain editable.")
+        self._build_resolved_monomers(self._collect_defs())
+
+    def _build_resolved_monomers(self, defs):
         engine = None
         if any(d["kind"] == "sugar" for d in defs):
             try:
@@ -901,7 +1012,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                 "functional_rel": functional_rel}
 
     def _build_sugar_template(self, engine, smiles, ring, anom):
-        known_ring = None if ring == "Any" else ring
+        known_ring = None if ring == "Any" else ring.split("_")[0]
         known_anom = None if anom == "Any" else anom
         try:
             confs = engine.generate_monomer_conformers(
@@ -911,6 +1022,12 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             return None
         if not confs:
             return None
+        if ring.startswith("chair_"):
+            confs = {name: data for name, data in confs.items()
+                     if data["puckering_type"] == ring}
+            if not confs:
+                print(f"No generated conformer matches the requested {ring}.")
+                return None
         # Conformers are returned lowest-energy first (rank1).
         conf_name = next(iter(confs))
         data = confs[conf_name]
