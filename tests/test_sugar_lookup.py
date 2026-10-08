@@ -1,6 +1,9 @@
 import io
+import csv
 import json
 import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -146,6 +149,48 @@ class PositionMonomerLookupTests(unittest.TestCase):
         defs = self.dialog._build_resolved_monomers.call_args.args[0]
         self.assertEqual([d["kind"] for d in defs], ["sugar", "aa"])
         self.assertEqual(defs[0]["smiles"], GLUCOSE)
+
+    def test_named_instance_labels_are_used_in_list_and_exports(self):
+        self.dialog.table.item(0, 1).setText("KDO")
+        self.dialog.table.item(0, 2).setText(GLUCOSE)
+        self.dialog._add_table_row("Sugar", GLUCOSE)
+        self.dialog.table.item(1, 1).setText("glucose")
+        self.dialog.table.cellWidget(1, 5).setValue(2)
+        self.dialog._add_table_row("Sugar", GLUCOSE)
+        self.dialog.table.item(2, 1).setText("KDO")
+        self.dialog._add_table_row("Amino acid", "Asn")
+        self.dialog._add_table_row("Sugar", GLUCOSE)
+        template = {"conf_name": "chair_4C1_beta_rank1", "rel": np.zeros((1, 3)),
+                    "atom_types": ["C"], "bonds": []}
+        with patch("sxm_viewer.gui.dialogs.position_monomer_dialogs.import_monomer_engine"), \
+                patch.object(self.dialog, "_build_sugar_template", return_value=template), \
+                patch.object(self.dialog, "_build_aa_template", return_value=template), \
+                patch.object(self.dialog, "_redraw_overlay"), \
+                patch.object(QtWidgets.QMessageBox, "information"):
+            PositionMonomerDialog._build_resolved_monomers(
+                self.dialog, self.dialog._collect_defs())
+        expected = ["KDO.1.1", "glucose.2.1", "glucose.2.2", "KDO.3.1",
+                    "Asn.4.1", "Sugar5.5.1"]
+        self.assertEqual([inst["label"] for inst in self.dialog._instances], expected)
+        self.assertEqual([self.dialog.inst_list.item(i).text().split("  [")[0]
+                          for i in range(self.dialog.inst_list.count())], expected)
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "monomers.csv"
+            paths = self.dialog._export_miso_inputs(str(output))
+            for path in paths:
+                with open(path, newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual([row["Instance"] for row in rows], expected)
+                self.assertEqual([int(row["Point"]) for row in rows], list(range(6)))
+            self.dialog.csv_le.setText(str(output))
+            with patch.object(self.dialog, "_export_miso_inputs", return_value=[]), \
+                    patch.object(self.dialog, "_export_monomer_pickle", return_value=[]), \
+                    patch.object(self.dialog, "_export_png"), \
+                    patch.object(QtWidgets.QMessageBox, "information"):
+                self.dialog._export_csv()
+            with open(output, newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row["Instance"] for row in rows], expected)
 
     def test_async_name_resolution_continues_build_and_preserves_custom_name(self):
         self.dialog.table.item(0, 2).setText("D chair 4C1 glucose")

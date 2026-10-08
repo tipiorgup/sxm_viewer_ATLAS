@@ -54,6 +54,10 @@ Click **Build** to resolve names via PubChem in the background. The resolved
 stereochemical SMILES and requested ring/anomer are filled into the table, then
 the existing build, placement, rotation and export workflow continues. A blank
 MISO **Name** is filled with the sugar name; an existing name is preserved.
+Placed-unit labels use that name followed by the row and copy numbers, e.g.
+`KDO.1.1`, `glucose.2.1`, and `glucose.2.2`, in the instance list, image
+annotations and exports. Amino acids use their resolved residue name (e.g.
+`Asn.3.1`); unnamed manual sugars keep the fallback name `Sugar1`, etc.
 Conflicting typed descriptors and table selections are reported rather than
 silently overridden. D/L is encoded in the retrieved SMILES, not a pucker filter.
 Specific chair selections only accept matching generated conformers; if none

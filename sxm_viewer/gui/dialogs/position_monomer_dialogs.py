@@ -945,7 +945,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                 self._templates[r] = tmpl
                 for c in range(d["copies"]):
                     self._instances.append({
-                        "label": f"M{r+1}.{c+1}",
+                        "label": f"{d['name']}.{r+1}.{c+1}",
                         "name": d["name"], "kind": d["kind"],
                         "smiles": d["smiles"], "ring": d["ring"], "anomer": d["anomer"],
                         "conf_name": tmpl["conf_name"],
