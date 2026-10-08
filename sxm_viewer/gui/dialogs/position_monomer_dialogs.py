@@ -1413,6 +1413,8 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self._refresh_connection_units()
 
     def _refresh_connection_units(self):
+        blockers = [QtCore.QSignalBlocker(combo) for combo in
+                    (self.root_combo, self.donor_combo, self.acceptor_combo)]
         for combo, placeholder in (
                 (self.root_combo, "Choose root monomer..."),
                 (self.donor_combo, "Choose donor..."),
@@ -1422,6 +1424,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             for index, inst in enumerate(self._instances):
                 if inst["kind"] == "sugar":
                     combo.addItem(inst["label"], index)
+        del blockers
         self._refresh_linkage_carbons()
 
     def _refresh_linkage_carbons(self, _index=None):
