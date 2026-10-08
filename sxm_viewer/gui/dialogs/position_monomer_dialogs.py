@@ -8,6 +8,10 @@ from ..._shared import QtCore, QtWidgets
 from ...utils.sugar_lookup import (
     SugarConnectionError, SugarLookupError, lookup_sugar, parse_sugar_description,
 )
+from ...utils.miso_yaml import (
+    MISOExportError, SugarConnection, build_miso_config,
+    linkage_carbons, validate_connections,
+)
 from ._sxm_image_loader import load_demo_image
 
 
@@ -318,6 +322,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self._func_cid = None     # canvas pick for amino-acid functional point
         self._templates = {}      # row index -> template dict
         self._instances = []      # list of instance dicts
+        self._connections = []
         self._overlay_artists = []
         self._lookup_worker = None
         self._lookup_cancelled = False
@@ -510,6 +515,8 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self.lipid_status.setWordWrap(True)
         lg.addWidget(self.lipid_status)
         col.addWidget(self.lipid_group)
+
+        self._build_connection_ui(col)
 
         # --- export ---
         csv_row = QtWidgets.QHBoxLayout()
@@ -917,6 +924,8 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self._templates.clear()
         self._instances.clear()
         self.inst_list.clear()
+        self._connections.clear()
+        self.connection_table.setRowCount(0)
 
         # Default placement: image centre in Angstrom.
         H, W = self._img.shape
@@ -961,6 +970,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
 
         for inst in self._instances:
             self.inst_list.addItem(f"{inst['label']}  [{inst['conf_name'].split('_rank')[0]}]")
+        self._refresh_connection_units()
         self._redraw_overlay()
         if self._instances:
             self.inst_list.setCurrentRow(0)
@@ -1347,6 +1357,122 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                             edgecolors="white", linewidths=0.3, zorder=19, alpha=0.95)
             self._overlay_artists.append(sc)
 
+    # ------------------------------------------------------------------ MISO connections
+    def _build_connection_ui(self, layout):
+        group = QtWidgets.QGroupBox("MISO YAML: sugar connections")
+        box = QtWidgets.QVBoxLayout(group)
+        hint = QtWidgets.QLabel(
+            "Connect named units explicitly; branches are allowed. Rebuilding clears "
+            "connections and root. YAML export supports sugars only.")
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+        form = QtWidgets.QFormLayout()
+        self.root_combo = QtWidgets.QComboBox()
+        self.root_combo.addItem("Choose root monomer...", None)
+        form.addRow("Root:", self.root_combo)
+        self.orientation_combo = QtWidgets.QComboBox()
+        self.orientation_combo.addItem("Choose orientation mode...", None)
+        self.orientation_combo.addItem("Keep positioned geometry and rotations", True)
+        self.orientation_combo.addItem("Let MISO optimize orientations", False)
+        form.addRow("Orientation:", self.orientation_combo)
+        self.donor_combo = QtWidgets.QComboBox()
+        self.acceptor_combo = QtWidgets.QComboBox()
+        self.donor_carbon_combo = QtWidgets.QComboBox()
+        self.acceptor_carbon_combo = QtWidgets.QComboBox()
+        self.link_anomer_combo = QtWidgets.QComboBox()
+        self.link_anomer_combo.addItems(["Choose...", "alpha", "beta"])
+        for label, unit, carbon in (
+                ("Donor:", self.donor_combo, self.donor_carbon_combo),
+                ("Acceptor:", self.acceptor_combo, self.acceptor_carbon_combo)):
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(unit, 1)
+            row.addWidget(carbon)
+            form.addRow(label, row)
+        form.addRow("Linkage anomer:", self.link_anomer_combo)
+        box.addLayout(form)
+        self.donor_combo.currentIndexChanged.connect(self._refresh_linkage_carbons)
+        self.acceptor_combo.currentIndexChanged.connect(self._refresh_linkage_carbons)
+        buttons = QtWidgets.QHBoxLayout()
+        add = QtWidgets.QPushButton("Add connection")
+        add.clicked.connect(self._add_connection)
+        remove = QtWidgets.QPushButton("Remove selected connection")
+        remove.clicked.connect(self._remove_connection)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        box.addLayout(buttons)
+        self.connection_table = QtWidgets.QTableWidget(0, 5)
+        self.connection_table.setHorizontalHeaderLabels(
+            ["Donor", "Carbon", "Acceptor", "Carbon", "Anomer"])
+        self.connection_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.connection_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.connection_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents)
+        self.connection_table.setFixedHeight(110)
+        box.addWidget(self.connection_table)
+        layout.addWidget(group)
+        self._refresh_connection_units()
+
+    def _refresh_connection_units(self):
+        for combo, placeholder in (
+                (self.root_combo, "Choose root monomer..."),
+                (self.donor_combo, "Choose donor..."),
+                (self.acceptor_combo, "Choose acceptor...")):
+            combo.clear()
+            combo.addItem(placeholder, None)
+            for index, inst in enumerate(self._instances):
+                if inst["kind"] == "sugar":
+                    combo.addItem(inst["label"], index)
+        self._refresh_linkage_carbons()
+
+    def _refresh_linkage_carbons(self, _index=None):
+        for unit, carbon in ((self.donor_combo, self.donor_carbon_combo),
+                             (self.acceptor_combo, self.acceptor_carbon_combo)):
+            selected = carbon.currentText()
+            carbon.clear()
+            index = unit.currentData()
+            if index is not None:
+                carbon.addItems(linkage_carbons(self._instances[index]))
+            if selected in [carbon.itemText(i) for i in range(carbon.count())]:
+                carbon.setCurrentText(selected)
+
+    def _add_connection(self):
+        donor = self.donor_combo.currentData()
+        acceptor = self.acceptor_combo.currentData()
+        if donor is None or acceptor is None:
+            QtWidgets.QMessageBox.warning(
+                self, "MISO connection", "Choose both a donor and an acceptor.")
+            return
+        connection = SugarConnection(
+            donor, self.donor_carbon_combo.currentText(), acceptor,
+            self.acceptor_carbon_combo.currentText(), self.link_anomer_combo.currentText())
+        try:
+            validate_connections(self._instances, self._connections + [connection])
+        except MISOExportError as exc:
+            QtWidgets.QMessageBox.warning(self, "MISO connection", str(exc))
+            return
+        self._connections.append(connection)
+        row = self.connection_table.rowCount()
+        self.connection_table.insertRow(row)
+        values = (self._instances[donor]["label"], connection.donor_carbon,
+                  self._instances[acceptor]["label"], connection.acceptor_carbon,
+                  connection.anomer)
+        for column, value in enumerate(values):
+            self.connection_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+
+    def _remove_connection(self):
+        row = self.connection_table.currentRow()
+        if row >= 0:
+            self._connections.pop(row)
+            self.connection_table.removeRow(row)
+
+    def _make_miso_config(self, out_path):
+        mode = self.orientation_combo.currentData()
+        if mode is None:
+            raise MISOExportError("Choose whether to keep or optimize the positioned orientations.")
+        return build_miso_config(
+            self._instances, self._connections, self.root_combo.currentData(),
+            mode, out_path, self._sxm_path, has_lipids=bool(self._lipids))
+
     # ------------------------------------------------------------------ export
     def _browse_csv(self):
         default_name = self.csv_le.text().strip() or "monomers.csv"
@@ -1356,14 +1482,65 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             self.csv_le.setText(path)
 
     def _export_csv(self):
-        import csv
         placed_lipids = [l for l in self._lipids if l.get("atoms") is not None]
         if not self._instances and not placed_lipids:
             QtWidgets.QMessageBox.warning(
                 self, "Nothing to export", "Build/place subunits or lipids first.")
             return
         out_path = self.csv_le.text().strip() or "monomers.csv"
+        unsupported = bool(self._lipids) or any(
+            inst["kind"] != "sugar" for inst in self._instances)
+        config = None
+        if not unsupported:
+            try:
+                config = self._make_miso_config(out_path)
+            except MISOExportError as exc:
+                QtWidgets.QMessageBox.warning(self, "MISO YAML export", str(exc))
+                return
+        export_errors = (OSError,)
+        if config is not None:
+            try:
+                import yaml
+            except ImportError:
+                QtWidgets.QMessageBox.critical(
+                    self, "Missing dependency", "PyYAML is required for MISO YAML export.")
+                return
+            export_errors += (yaml.YAMLError,)
+        yaml_path = Path(out_path).with_suffix(".yml")
+        try:
+            written = self._write_csv_exports(out_path)
+            if config is not None:
+                with open(yaml_path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(config, handle, sort_keys=False, allow_unicode=True)
+        except export_errors as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Export failed",
+                f"Could not complete the MISO export:\n{exc}\n\n"
+                "Some companion files may already have been written. Fix the error and export again.")
+            return
+        if unsupported:
+            self.viewer.last_monomer_yaml = None
+            QtWidgets.QMessageBox.warning(
+                self, "CSV exported; YAML not generated",
+                "Saved CSV/image companion files:\n  " + "\n  ".join(written)
+                + "\n\nAutomatic MISO YAML export currently supports sugars only. "
+                  "Amino acids or lipid rows are included, so no YAML was generated. "
+                  "Any existing YAML at this path was left unchanged; do not reuse "
+                  "it without updating its connectivity and position indices.")
+            return
+        written.append(yaml_path.name)
+        self.viewer.last_monomer_yaml = str(yaml_path.resolve())
+        QtWidgets.QMessageBox.information(
+            self, "Done",
+            f"Saved {len(self._instances)} sugar unit(s):\n  "
+            + "\n  ".join(written)
+            + "\n\nOpen Run MISO to use this YAML and its companion files. "
+              "The selected orientation mode is saved in the YAML.")
+
+    def _write_csv_exports(self, out_path):
+        import csv
         written = []
+        placed_lipids = [lip for lip in self._lipids if lip.get("atoms") is not None]
 
         if self._instances:
             header = ["Instance", "SMILES", "RingType", "Anomer", "Conformer",
@@ -1393,17 +1570,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
 
         self._export_png(out_path)
         written.append(Path(out_path).with_suffix(".png").name)
-        QtWidgets.QMessageBox.information(
-            self, "Done",
-            f"Saved {len(self._instances)} subunit(s) and {len(placed_lipids)} lipid(s):\n  "
-            + "\n  ".join(written)
-            + "\n\nMISO fixed-orientation run — in the YAML set:\n"
-              "  circle_input_path: *_positions.csv\n"
-              "  orientation_csv_path: *_orientations.csv\n"
-              "  monomer_data_path: *_monomer_data.pkl   (reuse exact geometry)\n"
-              "  use_fixed_orientation: true\n"
-              "then write your connectivity, referencing the point indices (row order) "
-              "and the sugar Names.")
+        return written
 
     def _export_miso_inputs(self, out_path):
         """Write MISO-ready positions (circle_input) + orientations (by point index).

@@ -69,3 +69,36 @@ and sugar details must be supplied manually. Unknown names and PubChem service
 errors have separate warnings. Failed lookups leave the table and existing
 placed monomers unchanged. Only sugar-name queries are sent to PubChem; images,
 positions and local files are not uploaded.
+
+## Position monomer: automatic MISO YAML export
+
+After building and positioning sugars, use **MISO YAML: sugar connections**:
+
+1. Choose the **Root** unit explicitly (normally the reducing end).
+2. Choose **Keep positioned geometry and rotations** or **Let MISO optimize
+   orientations**. Both modes reuse the exact exported sugar conformers; only
+   fixed mode applies the placed rotations.
+3. Select donor and acceptor units by their readable labels, choose their
+   hydroxyl-bearing carbon positions and the alpha/beta linkage, then click
+   **Add connection**. Branches are supported. Connections are chemical choices,
+   not guessed from proximity. Remove mistakes using **Remove selected connection**.
+4. Click **Export CSV**. Alongside the existing CSV, positions, orientations,
+   geometry pickle and image, this generates `<stem>.yml`. **Run MISO** opens
+   with this configuration, companion paths and orientation mode prefilled.
+   Browsing to an exported YAML also loads its paths and orientation mode.
+
+Every sugar must belong to one connected structure. In optimization mode, every
+donor must reach the root through donor-to-acceptor links. A carbon cannot be
+reused in multiple connections. Invalid selections block sugar-only export
+before files are written. Rebuilding clears connections and root selection.
+Rows with the same Name must use identical SMILES and conformer geometry;
+otherwise assign distinct Names and rebuild to avoid incorrect geometry reuse.
+
+The YAML uses MISO's `<Name>_<position-index>` IDs (e.g. `KDO_0`) while controls
+and CSV annotations retain readable labels (e.g. `KDO.1.1`). All positions are
+exported in instance-list order. Companion paths are absolute so MISO can run
+from a different working directory. Re-export after moving or rotating units.
+
+This first version generates YAML for sugars only. Amino-acid or lipid exports
+still save the existing CSV/image files, but explicitly warn that YAML was not
+generated. Any older YAML is left unchanged and must not be reused blindly.

@@ -134,9 +134,47 @@ class MISORunnerDialog(QtWidgets.QDialog):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open file", "", filt)
         if path:
             line_edit.setText(path)
+            if line_edit is self.yaml_le:
+                self._load_yaml_fields(path)
+
+    def _load_yaml_fields(self, path):
+        try:
+            import yaml
+        except ImportError:
+            QtWidgets.QMessageBox.critical(
+                self, "Missing dependency", "PyYAML is required to load MISO configuration.")
+            return False
+        try:
+            with open(path, encoding="utf-8") as handle:
+                config = yaml.safe_load(handle)
+            if not isinstance(config, dict):
+                raise ValueError("The YAML must contain a configuration mapping.")
+            fixed = config.get("use_fixed_orientation", False)
+            if not isinstance(fixed, bool):
+                raise ValueError("use_fixed_orientation must be true or false.")
+            values = {}
+            for key in ("circle_input_path", "orientation_csv_path", "monomer_data_path"):
+                value = config.get(key)
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(f"{key} must be a file path.")
+                values[key] = (str((Path(path).resolve().parent / value).resolve())
+                               if value else "")
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            QtWidgets.QMessageBox.warning(self, "YAML error", f"Could not load configuration:\n{exc}")
+            return False
+        self.csv_le.setText(values["circle_input_path"])
+        self.ori_le.setText(values["orientation_csv_path"])
+        self.monomer_le.setText(values["monomer_data_path"])
+        self.fixed_ori_chk.setChecked(fixed)
+        return True
 
     def _prefill_from_viewer(self):
         """Fill CSV/NPZ from the last export of PositionCoordinatesDialog."""
+        last_yaml = getattr(self.viewer, "last_monomer_yaml", None)
+        if last_yaml:
+            self.yaml_le.setText(last_yaml)
+            self._load_yaml_fields(last_yaml)
+            return
         try:
             canvas = getattr(self.viewer, "preview_canvas", None)
             if canvas and canvas.views:
