@@ -60,6 +60,10 @@ annotations and exports. Amino acids use their resolved residue name (e.g.
 `Asn.3.1`); unnamed manual sugars keep the fallback name `Sugar1`, etc.
 Conflicting typed descriptors and table selections are reported rather than
 silently overridden. D/L is encoded in the retrieved SMILES, not a pucker filter.
+
+After selecting a placed unit, click the unit list or the image and use the
+arrow keys to move it in X/Y on screen (0.5 Å per press; hold Shift for 2.5 Å).
+The COM X/Y fields update to match.
 Specific chair selections only accept matching generated conformers; if none
 are generated, the build reports a failure rather than substituting another chair.
 

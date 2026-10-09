@@ -306,9 +306,14 @@ class PositionMonomerDialog(QtWidgets.QDialog):
          then instantiates the requested copies.
       3. Select an instance, click *Place* to drop its centre on the image, and
          use RX/RY/RZ to rotate it in 3D (projected top-down onto the image).
+         With the subunit list or image focused, arrow keys nudge it in X/Y
+         (Shift for larger steps).
       4. *Export CSV* writes the COM (Angstrom) plus the placement rotation
          matrix and quaternion for every instance, for downstream MISO analysis.
     """
+
+    NUDGE_STEP_ANG = 0.5
+    NUDGE_FAST_FACTOR = 5
 
     def __init__(self, viewer, parent=None):
         super().__init__(parent or viewer)
@@ -432,6 +437,10 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self.inst_list.setMinimumWidth(200)
         self.inst_list.setFixedHeight(150)
         self.inst_list.currentRowChanged.connect(self._on_instance_selected)
+        self.inst_list.setToolTip("Arrow keys move the selected subunit in X/Y "
+                                  f"({self.NUDGE_STEP_ANG:g} Å; Shift: "
+                                  f"{self.NUDGE_STEP_ANG * self.NUDGE_FAST_FACTOR:g} Å).")
+        self.inst_list.installEventFilter(self)
         ctl.addWidget(self.inst_list)
 
         form_box = QtWidgets.QVBoxLayout()
@@ -557,6 +566,8 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         self._fig.tight_layout()
         self._canvas = FigureCanvas(self._fig)
         self._canvas.setMinimumHeight(340)
+        self._canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self._canvas.installEventFilter(self)
         layout.addWidget(NavigationToolbar(self._canvas, self))
         layout.addWidget(self._canvas, stretch=1)
 
@@ -1179,6 +1190,39 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         inst["com"][1] = self.spin["com_y"].value()
         inst["euler"] = [self.spin["rx"].value(), self.spin["ry"].value(),
                          self.spin["rz"].value()]
+        self._redraw_overlay()
+
+    # ------------------------------------------------------------------ keyboard
+    _NUDGE_KEYS = {QtCore.Qt.Key_Left: (-1, 0), QtCore.Qt.Key_Right: (1, 0),
+                   QtCore.Qt.Key_Up: (0, 1), QtCore.Qt.Key_Down: (0, -1)}
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QtCore.QEvent.KeyPress
+                and obj in (getattr(self, "inst_list", None), getattr(self, "_canvas", None))
+                and event.key() in self._NUDGE_KEYS
+                and not event.modifiers() & ~(QtCore.Qt.ShiftModifier | QtCore.Qt.KeypadModifier)
+                and self._active_instance() is not None):
+            dx, dy = self._NUDGE_KEYS[event.key()]
+            fast = bool(event.modifiers() & QtCore.Qt.ShiftModifier)
+            self._nudge_active(dx, dy, fast)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _nudge_active(self, dx_screen, dy_screen, fast=False):
+        """Move the selected subunit by one step in screen directions."""
+        inst = self._active_instance()
+        if inst is None:
+            return
+        step = self.NUDGE_STEP_ANG * (self.NUDGE_FAST_FACTOR if fast else 1)
+        # The image is drawn origin="lower"; for upward scans Y (Å) grows
+        # downward on screen (see _ang_to_pixel).
+        y_sign = 1 if getattr(self, "_scan_dir", "up") == "down" else -1
+        inst["com"][0] += dx_screen * step
+        inst["com"][1] += dy_screen * step * y_sign
+        self._updating = True
+        self.spin["com_x"].setValue(inst["com"][0])
+        self.spin["com_y"].setValue(inst["com"][1])
+        self._updating = False
         self._redraw_overlay()
 
     # ------------------------------------------------------------------ placing
