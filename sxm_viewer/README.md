@@ -159,3 +159,28 @@ approval; an LLM's plausible chemistry is not a substitute for scientific review
 All YAML writing remains local. Service failures and malformed replies are
 reported explicitly, and the offline guide is always available. No real provider
 request is required to use the wizard.
+
+## Why did MISO fail? (explain-only troubleshooting)
+
+When a MISO run ends with an error (not when you click **Stop**), the
+**Why did MISO fail?** button in the MISO Runner becomes available. It opens a
+window that never changes the YAML, CSV, or any setting:
+
+- **Offline checks** (nothing is sent): missing companion files, fixed
+  orientation without an orientation CSV, sugars without positions (or the
+  reverse), duplicate positions, indices outside the positions CSV, an unknown
+  `root_mol`, and malformed or duplicate glycosidic-bond sites.
+- **Optional LLM explanation** using the same service settings as the YAML
+  assistant. Click **Show exactly what will be sent** to review the data first;
+  a consent prompt appears for each new service/model. Sent: the Python
+  traceback and the last ~200 log lines, the YAML structure (including sugar
+  SMILES), the run settings, and the offline findings. Local paths become
+  `<path>/file name (found|MISSING)` and user/computer names become `<user>`.
+  The model is asked to explain the step that failed, the likely cause with the
+  log lines as evidence, and the related input. It does not propose fixes.
+
+The data is offered to the model as read-only tools (`get_failure_log`,
+`get_yaml_structure`, `get_run_settings`, `get_local_checks`) defined in
+`utils/miso_troubleshoot.py` in MCP shape (name, description, inputSchema), so
+they can later be published by an MCP server. Services without tool calling
+receive the same data inline.

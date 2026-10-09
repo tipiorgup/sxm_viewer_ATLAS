@@ -18,6 +18,10 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self.setMinimumWidth(620)
         self._process = None
         self._tmp_yaml = None
+        self._last_cfg = None
+        self._last_settings = {}
+        self._last_exit_code = None
+        self._stopped_by_user = False
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -101,8 +105,15 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop)
+        self.why_btn = QtWidgets.QPushButton("Why did MISO fail?")
+        self.why_btn.setEnabled(False)
+        self.why_btn.setToolTip(
+            "Available after a failed run. Shows offline checks and can ask an optional "
+            "online LLM to explain the error. It never changes your files.")
+        self.why_btn.clicked.connect(self._explain_failure)
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.why_btn)
         btn_row.addStretch()
         root.addLayout(btn_row)
 
@@ -314,6 +325,17 @@ class MISORunnerDialog(QtWidgets.QDialog):
         ]
         if self.debug_chk.isChecked():
             args.append("--debug_checkpoints")
+        self._last_cfg = dict(cfg)
+        self._last_settings = {
+            "iterations": self.iter_spin.value(),
+            "n_polymers": self.poly_spin.value(),
+            "compression_steps": self.comp_spin.value(),
+            "gravity": self.gravity_spin.value(),
+            "use_fixed_orientation": bool(cfg.get("use_fixed_orientation")),
+            "debug_checkpoints": self.debug_chk.isChecked(),
+        }
+        self._stopped_by_user = False
+        self.why_btn.setEnabled(False)
         self._process.start(sys.executable, args)
 
         self.run_btn.setEnabled(False)
@@ -321,6 +343,7 @@ class MISORunnerDialog(QtWidgets.QDialog):
 
     def _stop(self):
         if self._process and self._process.state() != QtCore.QProcess.NotRunning:
+            self._stopped_by_user = True
             self._process.kill()
             self._append("[MISO] Stopped by user.")
 
@@ -338,8 +361,21 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._cleanup_tmp()
+        self._last_exit_code = exit_code
+        failed = exit_code != 0 or exit_status == QtCore.QProcess.CrashExit
+        self.why_btn.setEnabled(failed and not self._stopped_by_user)
+        if failed and not self._stopped_by_user:
+            self._append("[MISO] Click 'Why did MISO fail?' for checks and an explanation.")
         if exit_code == 0:
             self._convert_sdf_outputs()
+
+    def _explain_failure(self):
+        from ...utils.miso_troubleshoot import build_failure_report
+        from .miso_troubleshoot_dialog import MISOTroubleshootDialog
+
+        report = build_failure_report(self.log.toPlainText(), self._last_cfg or {},
+                                      self._last_settings, self._last_exit_code or 1)
+        MISOTroubleshootDialog(report, self).exec_()
 
     def _convert_sdf_outputs(self):
         results_dir = getattr(self, "_results_dir", None)

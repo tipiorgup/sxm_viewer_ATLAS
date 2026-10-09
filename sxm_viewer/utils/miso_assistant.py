@@ -138,6 +138,45 @@ class _NoRedirects(HTTPRedirectHandler):
         raise AssistantError("The service redirected the request. Check the configured API URL.")
 
 
+class ServiceHTTPError(AssistantError):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def post_json(config: ServiceConfig, api_key: str, body: dict) -> dict:
+    """POST a provider request (no redirects, bounded response) and return its JSON."""
+    config.validate()
+    if not api_key.strip():
+        raise AssistantError("Configure an API key, or use the offline guide.")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if config.provider == "Anthropic":
+        headers.update({"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+    else:
+        headers[config.auth_header] = (
+            "Bearer " + api_key if config.auth_header == "Authorization" else api_key)
+    request = Request(config.endpoint, data=json.dumps(body).encode("utf-8"),
+                      headers=headers, method="POST")
+    try:
+        with build_opener(_NoRedirects()).open(request, timeout=45) as response:
+            raw = response.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise AssistantError("The service response was too large.")
+        return json.loads(raw)
+    except HTTPError as exc:
+        descriptions = {401: "Authentication failed. Check the API key.",
+                        403: "Access denied. Check your model and institutional permissions.",
+                        429: "Rate limit or quota reached. Try later or use the offline guide."}
+        raise ServiceHTTPError(descriptions.get(
+            exc.code, f"The service returned HTTP {exc.code}. Use the offline guide or try later."),
+            exc.code) from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise AssistantError(
+            "The LLM service could not be reached. Check the connection or use the offline guide.") from exc
+    except (ValueError, UnicodeError) as exc:
+        raise AssistantError("The service returned an invalid JSON response.") from exc
+
+
 def request_advice(config: ServiceConfig, api_key: str, context: dict,
                    history: list[dict[str, str]]) -> str:
     config.validate()
@@ -148,35 +187,13 @@ def request_advice(config: ServiceConfig, api_key: str, context: dict,
     except (TypeError, ValueError) as exc:
         raise AssistantError("Molecular context contains invalid coordinates or values.") from exc
     messages = [{"role": "user", "content": "Current molecular choices:\n" + context_text}, *history]
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if config.provider == "Anthropic":
-        headers.update({"x-api-key": api_key, "anthropic-version": "2023-06-01"})
         body = {"model": config.model, "system": SYSTEM_PROMPT,
                 "max_tokens": 1600, "messages": messages}
     else:
-        headers[config.auth_header] = (
-            f"Bearer {api_key}" if config.auth_header == "Authorization" else api_key)
         body = {"model": config.model,
                 "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages]}
-    request = Request(config.endpoint, data=json.dumps(body).encode("utf-8"),
-                      headers=headers, method="POST")
-    try:
-        with build_opener(_NoRedirects()).open(request, timeout=45) as response:
-            raw = response.read(2_000_001)
-        if len(raw) > 2_000_000:
-            raise AssistantError("The service response was too large.")
-        value = json.loads(raw)
-    except HTTPError as exc:
-        descriptions = {401: "Authentication failed. Check the API key.",
-                        403: "Access denied. Check your model and institutional permissions.",
-                        429: "Rate limit or quota reached. Try later or use the offline guide."}
-        raise AssistantError(descriptions.get(
-            exc.code, f"The service returned HTTP {exc.code}. Use the offline guide or try later.")) from exc
-    except (URLError, TimeoutError, OSError) as exc:
-        raise AssistantError(
-            "The LLM service could not be reached. Check the connection or use the offline guide.") from exc
-    except (ValueError, UnicodeError) as exc:
-        raise AssistantError("The service returned an invalid JSON response.") from exc
+    value = post_json(config, api_key, body)
     try:
         if config.provider == "Anthropic":
             text = "".join(part["text"] for part in value["content"] if part["type"] == "text")

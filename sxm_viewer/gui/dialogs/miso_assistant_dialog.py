@@ -266,6 +266,160 @@ class ConnectionSketch(QtWidgets.QWidget):
         painter.drawText(box, QtCore.Qt.AlignCenter, label)
 
 
+class ServiceSettingsPanel(QtWidgets.QWidget):
+    """Hosted LLM provider, model and API key settings shared by the MISO assistants."""
+
+    status = QtCore.pyqtSignal(str)
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.settings = QtCore.QSettings("SXMViewer", "MISOAssistant")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_toggle = QtWidgets.QToolButton()
+        self.settings_toggle.setText("Service settings")
+        self.settings_toggle.setCheckable(True)
+        self.settings_toggle.setChecked(True)
+        self.settings_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.settings_toggle.setArrowType(QtCore.Qt.DownArrow)
+        layout.addWidget(self.settings_toggle)
+        self.settings_box = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(self.settings_box)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_toggle.toggled.connect(self._toggle)
+        form = QtWidgets.QFormLayout()
+        self.provider_combo = QtWidgets.QComboBox()
+        self.provider_combo.addItems(PROVIDERS)
+        self.endpoint_edit = QtWidgets.QLineEdit()
+        self.endpoint_edit.setPlaceholderText("Complete HTTPS API request URL from your institution")
+        self.model_edit = QtWidgets.QLineEdit()
+        self.model_edit.setPlaceholderText("Model identifier from your provider or administrator")
+        self.key_edit = QtWidgets.QLineEdit()
+        self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.key_edit.setPlaceholderText("API key (never written to YAML or ordinary settings)")
+        self.auth_combo = QtWidgets.QComboBox()
+        self.auth_combo.addItem("Bearer token", "Authorization")
+        self.auth_combo.addItem("Institutional api-key header", "api-key")
+        for label, control in (("Provider:", self.provider_combo), ("Request URL:", self.endpoint_edit),
+                               ("Model:", self.model_edit), ("API key:", self.key_edit),
+                               ("Authentication:", self.auth_combo)):
+            form.addRow(label, control)
+        settings_layout.addLayout(form)
+        self.remember_key = QtWidgets.QCheckBox("Remember API key in Windows Credential Manager")
+        self.remember_key.setChecked(True)
+        settings_layout.addWidget(self.remember_key)
+        buttons = QtWidgets.QHBoxLayout()
+        save = QtWidgets.QPushButton("Save configuration")
+        load = QtWidgets.QPushButton("Load saved key")
+        forget = QtWidgets.QPushButton("Remove saved key")
+        save.clicked.connect(self._save_settings)
+        load.clicked.connect(self._load_key)
+        forget.clicked.connect(self._forget_key)
+        for button in (save, load, forget):
+            buttons.addWidget(button)
+        settings_layout.addLayout(buttons)
+        layout.addWidget(self.settings_box)
+        self.provider_combo.currentTextChanged.connect(self._provider_changed)
+        self.endpoint_edit.textEdited.connect(self._endpoint_changed)
+        self.auth_combo.currentIndexChanged.connect(self._endpoint_changed)
+        self.model_edit.textEdited.connect(lambda _text: self.changed.emit())
+        self._provider_changed(self.provider_combo.currentText())
+
+    def _toggle(self, shown):
+        self.settings_box.setVisible(shown)
+        self.settings_toggle.setArrowType(QtCore.Qt.DownArrow if shown else QtCore.Qt.RightArrow)
+
+    def _provider_changed(self, provider):
+        self.endpoint_edit.setText(PROVIDERS[provider])
+        self.auth_combo.setEnabled(provider != "Anthropic")
+        self.key_edit.clear()
+        self.changed.emit()
+
+    def _endpoint_changed(self, _value=None):
+        self.key_edit.clear()
+        self.changed.emit()
+
+    def service_config(self):
+        return ServiceConfig(self.provider_combo.currentText(), self.endpoint_edit.text().strip(),
+                             self.model_edit.text().strip(), self.auth_combo.currentData())
+
+    def api_key(self):
+        return self.key_edit.text()
+
+    def ready_config(self):
+        """Validated config with a key, or raise AssistantError (and show the settings)."""
+        config = self.service_config()
+        try:
+            config.validate()
+            if not self.key_edit.text().strip():
+                raise AssistantError("Enter an API key or click Load saved key.")
+        except AssistantError:
+            self.settings_toggle.setChecked(True)
+            raise
+        return config
+
+    def load_settings(self):
+        provider = self.settings.value("provider", "OpenAI")
+        if provider not in PROVIDERS:
+            self.status.emit("Saved provider is unsupported. Configure the online service again.")
+            return
+        self.provider_combo.setCurrentText(provider)
+        self.endpoint_edit.setText(self.settings.value("endpoint", PROVIDERS[provider]))
+        self.model_edit.setText(self.settings.value("model", ""))
+        self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(
+            self.settings.value("auth_header", "Authorization"))))
+        self.settings_toggle.setChecked(not self.model_edit.text().strip())
+        self.changed.emit()
+
+    def _save_settings(self):
+        config = self.service_config()
+        try:
+            config.validate()
+            if self.remember_key.isChecked():
+                save_api_key(config, self.key_edit.text())
+        except AssistantError as exc:
+            self._error(str(exc))
+            return
+        for key, value in (("provider", config.provider), ("endpoint", config.endpoint),
+                           ("model", config.model), ("auth_header", config.auth_header)):
+            self.settings.setValue(key, value)
+        self.settings.sync()
+        if self.settings.status() != QtCore.QSettings.NoError:
+            self._error("Could not save provider settings. Your key may already be stored in Credential Manager.")
+            return
+        self.status.emit(
+            "Configuration saved. Use Load saved key next time." if self.remember_key.isChecked()
+            else "Provider settings saved; the API key is for this session only.")
+
+    def _load_key(self):
+        try:
+            config = self.service_config()
+            config.validate()
+            key = read_api_key(config)
+        except AssistantError as exc:
+            self._error(str(exc))
+            return
+        self.key_edit.setText(key)
+        self.status.emit("Saved key loaded." if key else
+                         "No saved key found for this service. Enter one or use the offline options.")
+
+    def _forget_key(self):
+        try:
+            config = self.service_config()
+            config.validate()
+            delete_api_key(config)
+        except AssistantError as exc:
+            self._error(str(exc))
+            return
+        self.key_edit.clear()
+        self.changed.emit()
+        self.status.emit("Saved API key removed.")
+
+    def _error(self, message):
+        QtWidgets.QMessageBox.warning(self.window(), "LLM service", message)
+
+
 class MISOAssistantDialog(QtWidgets.QDialog):
     """An offline question-by-question guide, with opt-in hosted proposals."""
 
@@ -283,7 +437,6 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self._worker = None
         self._closed = False
         self.finished.connect(self._on_closed)
-        self.settings = QtCore.QSettings("SXMViewer", "MISOAssistant")
         layout = QtWidgets.QVBoxLayout(self)
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_offline(root, mode), "Offline guide")
@@ -526,56 +679,16 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             "Ask an administrator to configure this once. The offline guide always works.")
         note.setWordWrap(True)
         layout.addWidget(note)
-        self.settings_toggle = QtWidgets.QToolButton()
-        self.settings_toggle.setText("Service settings")
-        self.settings_toggle.setCheckable(True)
-        self.settings_toggle.setChecked(True)
-        self.settings_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self.settings_toggle.setArrowType(QtCore.Qt.DownArrow)
-        layout.addWidget(self.settings_toggle)
-        self.settings_box = QtWidgets.QWidget()
-        settings_layout = QtWidgets.QVBoxLayout(self.settings_box)
-        settings_layout.setContentsMargins(0, 0, 0, 0)
-        self.settings_toggle.toggled.connect(self._toggle_service_settings)
-        form = QtWidgets.QFormLayout()
-        self.provider_combo = QtWidgets.QComboBox()
-        self.provider_combo.addItems(PROVIDERS)
-        self.endpoint_edit = QtWidgets.QLineEdit()
-        self.endpoint_edit.setPlaceholderText("Complete HTTPS API request URL from your institution")
-        self.model_edit = QtWidgets.QLineEdit()
-        self.model_edit.setPlaceholderText("Model identifier from your provider or administrator")
-        self.key_edit = QtWidgets.QLineEdit()
-        self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.key_edit.setPlaceholderText("API key (never written to YAML or ordinary settings)")
-        self.auth_combo = QtWidgets.QComboBox()
-        self.auth_combo.addItem("Bearer token", "Authorization")
-        self.auth_combo.addItem("Institutional api-key header", "api-key")
-        for label, control in (("Provider:", self.provider_combo), ("Request URL:", self.endpoint_edit),
-                               ("Model:", self.model_edit), ("API key:", self.key_edit),
-                               ("Authentication:", self.auth_combo)):
-            form.addRow(label, control)
-        settings_layout.addLayout(form)
-        self.remember_key = QtWidgets.QCheckBox("Remember API key in Windows Credential Manager")
-        self.remember_key.setChecked(True)
-        settings_layout.addWidget(self.remember_key)
-        buttons = QtWidgets.QHBoxLayout()
-        save = QtWidgets.QPushButton("Save configuration")
-        load = QtWidgets.QPushButton("Load saved key")
-        forget = QtWidgets.QPushButton("Remove saved key")
-        save.clicked.connect(self._save_settings)
-        load.clicked.connect(self._load_key)
-        forget.clicked.connect(self._forget_key)
-        for button in (save, load, forget):
-            buttons.addWidget(button)
-        settings_layout.addLayout(buttons)
-        layout.addWidget(self.settings_box)
+        self.service = ServiceSettingsPanel(self)
+        for name in ("settings_toggle", "settings_box", "provider_combo", "endpoint_edit",
+                     "model_edit", "key_edit", "auth_combo", "remember_key"):
+            setattr(self, name, getattr(self.service, name))
+        layout.addWidget(self.service)
         self.online_status = QtWidgets.QLabel("No molecular data is sent until you consent and press Send.")
         self.online_status.setWordWrap(True)
         layout.addWidget(self.online_status)
-        self.provider_combo.currentTextChanged.connect(self._provider_changed)
-        self.endpoint_edit.textEdited.connect(self._endpoint_changed)
-        self.auth_combo.currentIndexChanged.connect(self._endpoint_changed)
-        self._provider_changed(self.provider_combo.currentText())
+        self.service.status.connect(self.online_status.setText)
+        self.service.changed.connect(self._reset_consent)
         self.transcript = QtWidgets.QPlainTextEdit()
         self.transcript.setReadOnly(True)
         self.transcript.setPlaceholderText(
@@ -615,79 +728,14 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         layout.addWidget(self.online_approve)
         return widget
 
-    def _toggle_service_settings(self, shown):
-        self.settings_box.setVisible(shown)
-        self.settings_toggle.setArrowType(QtCore.Qt.DownArrow if shown else QtCore.Qt.RightArrow)
-
-    def _provider_changed(self, provider):
-        self.endpoint_edit.setText(PROVIDERS[provider])
-        self.auth_combo.setEnabled(provider != "Anthropic")
-        self.key_edit.clear()
-        self._consent_config = None
-
-    def _endpoint_changed(self, _value=None):
-        self.key_edit.clear()
+    def _reset_consent(self):
         self._consent_config = None
 
     def _service_config(self):
-        return ServiceConfig(self.provider_combo.currentText(), self.endpoint_edit.text().strip(),
-                             self.model_edit.text().strip(), self.auth_combo.currentData())
+        return self.service.service_config()
 
     def _load_settings(self):
-        provider = self.settings.value("provider", "OpenAI")
-        if provider not in PROVIDERS:
-            self.online_status.setText("Saved provider is unsupported. Configure the online service again.")
-            return
-        self.provider_combo.setCurrentText(provider)
-        self.endpoint_edit.setText(self.settings.value("endpoint", PROVIDERS[provider]))
-        self.model_edit.setText(self.settings.value("model", ""))
-        self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(
-            self.settings.value("auth_header", "Authorization"))))
-        self.settings_toggle.setChecked(not self.model_edit.text().strip())
-
-    def _save_settings(self):
-        config = self._service_config()
-        try:
-            config.validate()
-            if self.remember_key.isChecked():
-                save_api_key(config, self.key_edit.text())
-        except AssistantError as exc:
-            self._error(str(exc))
-            return
-        for key, value in (("provider", config.provider), ("endpoint", config.endpoint),
-                           ("model", config.model), ("auth_header", config.auth_header)):
-            self.settings.setValue(key, value)
-        self.settings.sync()
-        if self.settings.status() != QtCore.QSettings.NoError:
-            self._error("Could not save provider settings. Your key may already be stored in Credential Manager.")
-            return
-        self.online_status.setText(
-            "Configuration saved. Use Load saved key next time." if self.remember_key.isChecked()
-            else "Provider settings saved; the API key is for this session only.")
-
-    def _load_key(self):
-        try:
-            config = self._service_config()
-            config.validate()
-            key = read_api_key(config)
-        except AssistantError as exc:
-            self._error(str(exc))
-            return
-        self.key_edit.setText(key)
-        self.online_status.setText("Saved key loaded." if key else
-                                   "No saved key found for this service. Enter one or use the offline guide.")
-
-    def _forget_key(self):
-        try:
-            config = self._service_config()
-            config.validate()
-            delete_api_key(config)
-        except AssistantError as exc:
-            self._error(str(exc))
-            return
-        self.key_edit.clear()
-        self._consent_config = None
-        self.online_status.setText("Saved API key removed.")
+        self.service.load_settings()
 
     def _send(self):
         if self._worker is not None:
