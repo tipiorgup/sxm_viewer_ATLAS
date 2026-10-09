@@ -92,6 +92,9 @@ After building and positioning sugars, use **MISO YAML: sugar connections**:
    linkages, α/β, orientation mode) before running MISO. **Run MISO** opens
    with this configuration, companion paths and orientation mode prefilled.
    Browsing to an exported YAML also loads its paths and orientation mode.
+   To save only the coordinates (CSV, positions, orientations, geometry pickle
+   and image) without choosing a root, connections or mode, click
+   **Export coordinates** instead.
 
 Every sugar must belong to one connected structure. In optimization mode, every
 donor must reach the root through donor-to-acceptor links. A carbon cannot be
@@ -111,7 +114,7 @@ generated. Any older YAML is left unchanged and must not be reused blindly.
 
 ## Position coordinates: optional sugars per picked point
 
-Picking points and **Export CSV** work exactly as before (CSV + NPZ + PNG).
+Picking points and exporting coordinates (CSV + NPZ + PNG) work as before.
 Assigning a sugar is optional and can be done for any subset of points:
 
 1. In the point table, type a sugar name (e.g. `D chair 4C1 glucose`,
@@ -128,19 +131,28 @@ Assigning a sugar is optional and can be done for any subset of points:
    optional LLM assistant** as in Position monomer, including the choice of
    keeping the rotations (fixed) or letting MISO optimize them.
 
-On export with built sugars, the picked-points CSV is used directly as MISO's
-`circle_input_path`, and `<stem>.yml`, `<stem>_monomer_data.pkl` and
-`<stem>_orientations.csv` (used in fixed mode) are also written. YAML IDs use the picked point
-index (e.g. `Glc_2`), so unassigned points stay in the CSV but are not used by
-any sugar. If sugar entries were edited after the last build, export offers
-coordinates only; rebuild to get the YAML.
+Exporting has two buttons:
+
+- **Export coordinates** always works, even before any YAML choices are made.
+  It writes the picked-points CSV, NPZ and PNG and, for built sugars,
+  `<stem>_orientations.csv` (point index, RX/RY/RZ in degrees, quaternion and
+  rotation matrix) and `<stem>_monomer_data.pkl`.
+- **Export coordinates + MISO YAML** writes the same files plus `<stem>.yml`.
+  It needs built sugars, a root and an orientation mode. The picked-points CSV
+  is used directly as MISO's `circle_input_path`.
+
+YAML IDs use the picked point index (e.g. `Glc_2`), so unassigned points stay
+in the CSV but are not used by any sugar. If sugar entries were edited after
+the last build, the YAML export asks you to rebuild, and **Export coordinates**
+saves the points without the stale sugar orientations.
 
 ## Guided YAML assistant: offline or optional hosted LLM
 
 Click **Guide me / optional LLM assistant** after building sugars. The default
 **Offline guide** asks about the root, orientation mode, and each chemical
 connection in separate steps. Review the summary, click **Approve and apply**,
-then **Export CSV + MISO input YAML** to generate the YAML. It needs no internet, account, model
+then **Export CSV + MISO input YAML** (Position monomer) or **Export coordinates +
+MISO YAML** (Position coordinates) to generate the YAML. It needs no internet, account, model
 download, or additional software. Closing without approval leaves settings unchanged.
 
 Both tabs show a live **connection plan** next to the questions. Each sugar is

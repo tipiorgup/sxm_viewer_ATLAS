@@ -275,10 +275,22 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         csv_row.addWidget(csv_browse)
         layout.addLayout(csv_row)
 
-        self.export_btn = QtWidgets.QPushButton("Export CSV (+ MISO YAML if sugars are built)")
+        export_row = QtWidgets.QHBoxLayout()
+        self.export_btn = QtWidgets.QPushButton("Export coordinates")
+        self.export_btn.setToolTip(
+            "Save the picked points (CSV, NPZ, PNG) and, for built sugars, their "
+            "orientations. No MISO YAML choices are needed.")
         self.export_btn.setEnabled(loaded)
-        self.export_btn.clicked.connect(self._export_csv)
-        layout.addWidget(self.export_btn)
+        self.export_btn.clicked.connect(self._export_coordinates)
+        export_row.addWidget(self.export_btn)
+        self.export_yaml_btn = QtWidgets.QPushButton("Export coordinates + MISO YAML")
+        self.export_yaml_btn.setToolTip(
+            "Also write the MISO input YAML. Needs built sugars, a root and an "
+            "orientation mode.")
+        self.export_yaml_btn.setEnabled(loaded)
+        self.export_yaml_btn.clicked.connect(self._export_with_yaml)
+        export_row.addWidget(self.export_yaml_btn)
+        layout.addLayout(export_row)
         layout.addStretch()
 
         scroll.setWidget(right)
@@ -519,6 +531,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self.clear_all_btn.setEnabled(not busy)
         self.pick_btn.setEnabled(not busy and loaded)
         self.export_btn.setEnabled(not busy and loaded)
+        self.export_yaml_btn.setEnabled(not busy and loaded)
 
     def _on_sugar_lookup_finished(self, results, title, error):
         self._lookup_worker = None
@@ -766,7 +779,14 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         if path:
             self.csv_le.setText(path)
 
-    def _export_csv(self):
+    def _export_coordinates(self):
+        """Coordinates (and built sugars' orientations); never needs YAML choices."""
+        self._export(with_yaml=False)
+
+    def _export_with_yaml(self):
+        self._export(with_yaml=True)
+
+    def _export(self, with_yaml):
         import csv
         if self._img is None:
             QtWidgets.QMessageBox.warning(self, "No image", self._load_error or "Image not loaded.")
@@ -780,23 +800,25 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             return
         out_path = self.csv_le.text().strip() or "circle_input.csv"
         use_sugars = self._sugars_current()
-        if self._sugar_entries() and not use_sugars:
-            answer = QtWidgets.QMessageBox.question(
-                self, "Monomers not built",
-                "Some points have sugar entries that are not built (or changed since the "
-                "last build), so no MISO YAML can be written.\n\n"
-                "Export coordinates only? Choose No to go back and click Build monomers.",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No)
-            if answer != QtWidgets.QMessageBox.Yes:
-                return
+        stale = bool(self._sugar_entries()) and not use_sugars
         config = None
         export_errors = (OSError,)
-        if use_sugars:
+        if with_yaml:
+            if not use_sugars:
+                QtWidgets.QMessageBox.warning(
+                    self, "MISO YAML export",
+                    ("Sugar entries are not built or changed since the last build. "
+                     "Click Build monomers first." if stale else
+                     "Assign sugars to points and click Build monomers first.")
+                    + "\n\nUse Export coordinates to save the points without a YAML.")
+                return
             try:
                 config = self._make_miso_config(out_path)
             except MISOExportError as exc:
-                QtWidgets.QMessageBox.warning(self, "MISO YAML export", str(exc))
+                QtWidgets.QMessageBox.warning(
+                    self, "MISO YAML export",
+                    f"{exc}\n\nUse Export coordinates to save the points and rotations "
+                    "without a YAML.")
                 return
             try:
                 import yaml
@@ -806,6 +828,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 return
             export_errors += (yaml.YAMLError,)
         yaml_path = Path(out_path).with_suffix(".yml")
+        extra = []
         try:
             with open(out_path, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -816,10 +839,10 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                     writer.writerow([i, ox, oy, x, y, z, 0.0])
             self._export_npz(out_path)
             self._export_png(out_path)
-            extra = []
-            if config is not None:
-                extra.append(self._export_monomer_pickle(out_path))
+            if use_sugars:
                 extra.append(self._export_orientations(out_path))
+                extra.append(self._export_monomer_pickle(out_path))
+            if config is not None:
                 with open(yaml_path, "w", encoding="utf-8") as handle:
                     yaml.safe_dump(config, handle, sort_keys=False, allow_unicode=True)
         except export_errors as exc:
@@ -831,14 +854,19 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         message = (f"Saved {len(self._points)} points to:\n{out_path}\n"
                    f"NPZ: {Path(out_path).with_suffix('.npz').name}\n"
                    f"PNG: {Path(out_path).with_suffix('.png').name}")
+        if extra:
+            message += (f"\n\nSugar orientations and geometry ({len(self._instances)} "
+                        "unit(s)):\n  " + "\n  ".join(Path(p).name for p in extra))
+        if stale:
+            message += ("\n\nNote: sugar entries are not built (or changed since the last "
+                        "build), so no sugar orientations were saved. Click Build monomers "
+                        "and export again to include them.")
         if config is not None:
             self.viewer.last_monomer_yaml = str(yaml_path.resolve())
-            message += ("\n" + "\n".join(Path(p).name for p in extra)
-                        + f"\n\nMISO input YAML ({len(self._instances)} sugar unit(s)):\n  "
-                        + str(yaml_path.resolve())
-                        + "\n\nPlease give the YAML a final inspection (units, root, "
-                          "linkages, \u03b1/\u03b2, orientation mode) before running MISO. "
-                          "Open Run MISO to use this YAML and its companion files.")
+            message += (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
+                        "\n\nPlease give the YAML a final inspection (units, root, "
+                        "linkages, \u03b1/\u03b2, orientation mode) before running MISO. "
+                        "Open Run MISO to use this YAML and its companion files.")
         QtWidgets.QMessageBox.information(self, "Done", message)
 
     def _export_monomer_pickle(self, out_path):
@@ -859,14 +887,17 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         ori_path = f"{Path(out_path).with_suffix('')}_orientations.csv"
         with open(ori_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["Point", "Instance", "Type", "Conformer",
+            w.writerow(["Point", "Instance", "Type", "Conformer", "SMILES",
+                        "Rot_X (deg)", "Rot_Y (deg)", "Rot_Z (deg)",
                         "quat_x", "quat_y", "quat_z", "quat_w",
                         "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"])
             for inst in self._instances:
                 Rm = euler_to_matrix(*inst["euler"])
                 q = matrix_to_quaternion(Rm)
                 row = [inst["position"], inst["label"], "sugar", inst["conf_name"],
-                       f"{q[0]:.8f}", f"{q[1]:.8f}", f"{q[2]:.8f}", f"{q[3]:.8f}"]
+                       inst["smiles"]]
+                row += [f"{v:.4f}" for v in inst["euler"]]
+                row += [f"{q[0]:.8f}", f"{q[1]:.8f}", f"{q[2]:.8f}", f"{q[3]:.8f}"]
                 row += [f"{v:.8f}" for v in Rm.flatten()]
                 w.writerow(row)
         return ori_path

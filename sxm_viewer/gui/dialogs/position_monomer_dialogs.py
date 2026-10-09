@@ -579,13 +579,22 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         csv_row.addWidget(browse)
         col.addLayout(csv_row)
 
+        export_row = QtWidgets.QHBoxLayout()
+        self.export_coords_btn = QtWidgets.QPushButton("Export coordinates")
+        self.export_coords_btn.setToolTip(
+            "Writes the CSV, positions, orientations, geometry and image files. "
+            "No root, connections or orientation mode needed.")
+        self.export_coords_btn.setEnabled(loaded)
+        self.export_coords_btn.clicked.connect(self._export_coordinates)
+        export_row.addWidget(self.export_coords_btn)
         self.export_btn = QtWidgets.QPushButton("Export CSV + MISO input YAML")
         self.export_btn.setToolTip(
             "Writes the CSV/image companion files and, for sugar-only structures, "
             "the MISO input YAML (same name, .yml) next to them.")
         self.export_btn.setEnabled(loaded)
         self.export_btn.clicked.connect(self._export_csv)
-        col.addWidget(self.export_btn)
+        export_row.addWidget(self.export_btn)
+        col.addLayout(export_row)
         self.export_note = QtWidgets.QLabel(
             "\u26a0 Reminder: open the exported .yml and give it a final inspection "
             "(units, root, linkages, \u03b1/\u03b2, orientation mode) before running MISO.")
@@ -1438,6 +1447,25 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         if path:
             self.csv_le.setText(path)
 
+    def _export_coordinates(self):
+        placed_lipids = [l for l in self._lipids if l.get("atoms") is not None]
+        if not self._instances and not placed_lipids:
+            QtWidgets.QMessageBox.warning(
+                self, "Nothing to export", "Build/place subunits or lipids first.")
+            return
+        out_path = self.csv_le.text().strip() or "monomers.csv"
+        try:
+            written = self._write_csv_exports(out_path)
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Export failed", f"Could not export the coordinates:\n{exc}")
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Done",
+            "Saved coordinates and orientations:\n  " + "\n  ".join(written)
+            + "\n\nNo MISO YAML was written. Use 'Export CSV + MISO input YAML' "
+              "once the root, connections and orientation mode are set.")
+
     def _export_csv(self):
         placed_lipids = [l for l in self._lipids if l.get("atoms") is not None]
         if not self._instances and not placed_lipids:
@@ -1452,7 +1480,10 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
             try:
                 config = self._make_miso_config(out_path)
             except MISOExportError as exc:
-                QtWidgets.QMessageBox.warning(self, "MISO YAML export", str(exc))
+                QtWidgets.QMessageBox.warning(
+                    self, "MISO YAML export",
+                    f"{exc}\n\nNothing was written. To save just the coordinates "
+                    "and orientations, use 'Export coordinates'.")
                 return
         export_errors = (OSError,)
         if config is not None:
