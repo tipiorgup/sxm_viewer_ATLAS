@@ -86,8 +86,10 @@ After building and positioning sugars, use **MISO YAML: sugar connections**:
    hydroxyl-bearing carbon positions and the alpha/beta linkage, then click
    **Add connection**. Branches are supported. Connections are chemical choices,
    not guessed from proximity. Remove mistakes using **Remove selected connection**.
-4. Click **Export CSV**. Alongside the existing CSV, positions, orientations,
-   geometry pickle and image, this generates `<stem>.yml`. **Run MISO** opens
+4. Click **Export CSV + MISO input YAML**. Alongside the existing CSV, positions, orientations,
+   geometry pickle and image, this generates `<stem>.yml`; its full path is
+   shown when export finishes. Give the YAML a final inspection (units, root,
+   linkages, α/β, orientation mode) before running MISO. **Run MISO** opens
    with this configuration, companion paths and orientation mode prefilled.
    Browsing to an exported YAML also loads its paths and orientation mode.
 
@@ -112,13 +114,15 @@ generated. Any older YAML is left unchanged and must not be reused blindly.
 Click **Guide me / optional LLM assistant** after building sugars. The default
 **Offline guide** asks about the root, orientation mode, and each chemical
 connection in separate steps. Review the summary, click **Approve and apply**,
-then **Export CSV** to generate the YAML. It needs no internet, account, model
+then **Export CSV + MISO input YAML** to generate the YAML. It needs no internet, account, model
 download, or additional software. Closing without approval leaves settings unchanged.
 
-Both tabs show a live skeletal **connection plan** next to the questions. Each
-sugar label appears at its placed X/Y position, matching the STM image. Arrows
-run from donor to acceptor and show the carbons and α/β. The root is gold, and
-unconnected units are grey. Online proposals are drawn there only after local
+Both tabs show a live **connection plan** next to the questions. Each sugar is
+drawn top-down as positioned (heavy atoms, same X/Y and rotation as on the STM
+image), with its linkable carbons labelled C1, C2, … (only carbons with a free
+OH that MISO can link; e.g. glucose C5 is not offered). Arrows run from the
+donor carbon to the acceptor carbon and show α/β; carbons in use are highlighted.
+The root is gold, and unconnected units are grey. Online proposals are drawn there only after local
 validation, and are marked as not applied until you approve them.
 
 For optional conversational guidance, use the **Online LLM** tab. An administrator

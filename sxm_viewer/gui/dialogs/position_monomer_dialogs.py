@@ -308,7 +308,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
          use RX/RY/RZ to rotate it in 3D (projected top-down onto the image).
          With the subunit list or image focused, arrow keys nudge it in X/Y
          (Shift for larger steps).
-      4. *Export CSV* writes the COM (Angstrom) plus the placement rotation
+      4. *Export CSV + MISO input YAML* writes the COM (Angstrom) plus the placement rotation
          matrix and quaternion for every instance, for downstream MISO analysis.
     """
 
@@ -529,7 +529,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
 
         # --- export ---
         csv_row = QtWidgets.QHBoxLayout()
-        lbl = QtWidgets.QLabel("Export CSV:")
+        lbl = QtWidgets.QLabel("Export to:")
         csv_row.addWidget(lbl)
         self.csv_le = QtWidgets.QLineEdit()
         self.csv_le.setPlaceholderText("monomers.csv")
@@ -539,10 +539,19 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         csv_row.addWidget(browse)
         col.addLayout(csv_row)
 
-        self.export_btn = QtWidgets.QPushButton("Export CSV")
+        self.export_btn = QtWidgets.QPushButton("Export CSV + MISO input YAML")
+        self.export_btn.setToolTip(
+            "Writes the CSV/image companion files and, for sugar-only structures, "
+            "the MISO input YAML (same name, .yml) next to them.")
         self.export_btn.setEnabled(loaded)
         self.export_btn.clicked.connect(self._export_csv)
         col.addWidget(self.export_btn)
+        self.export_note = QtWidgets.QLabel(
+            "\u26a0 Reminder: open the exported .yml and give it a final inspection "
+            "(units, root, linkages, \u03b1/\u03b2, orientation mode) before running MISO.")
+        self.export_note.setWordWrap(True)
+        self.export_note.setStyleSheet("color: #8a5a00;")
+        col.addWidget(self.export_note)
         col.addStretch()
 
         scroll = QtWidgets.QScrollArea()
@@ -1621,8 +1630,10 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             self, "Done",
             f"Saved {len(self._instances)} sugar unit(s):\n  "
             + "\n  ".join(written)
-            + "\n\nOpen Run MISO to use this YAML and its companion files. "
-              "The selected orientation mode is saved in the YAML.")
+            + f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
+            + "\n\nPlease give the YAML a final inspection (units, root, linkages, "
+              "\u03b1/\u03b2, orientation mode) before running MISO. "
+              "Open Run MISO to use this YAML and its companion files.")
 
     def _write_csv_exports(self, out_path):
         import csv

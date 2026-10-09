@@ -56,21 +56,57 @@ class ConnectionSketch(QtWidgets.QWidget):
         self.caption = caption
         self.update()
 
-    def node_points(self):
-        """Widget coordinates of every unit; y points up as in the STM image."""
-        if not self.instances:
-            return []
-        xs = [float(inst["com"][0]) for inst in self.instances]
-        ys = [float(inst["com"][1]) for inst in self.instances]
-        margin, top = 70.0, 34.0
+    ELEMENT_COLORS = {"C": "#303030", "O": "#e53935", "N": "#1e88e5",
+                      "S": "#c9a800", "P": "#fb8c00"}
+
+    @staticmethod
+    def unit_geometry(inst):
+        """Positioned heavy atoms (x, y in Å) and linkable carbons of a unit.
+
+        Returns None when the unit has no built structure, so it is drawn as a dot.
+        """
+        rel = inst.get("rel")
+        types = inst.get("atom_types")
+        if rel is None or not types:
+            return None
+        from .position_monomer_dialogs import euler_to_matrix
+        import numpy as np
+        coords = np.asarray(rel, dtype=float) @ euler_to_matrix(*inst["euler"]).T
+        coords = coords + np.asarray(inst["com"], dtype=float)
+        heavy = {i: (float(coords[i][0]), float(coords[i][1]), sym)
+                 for i, sym in enumerate(types) if sym != "H"}
+        bonds = [(a, b) for a, b in inst.get("bonds") or () if a in heavy and b in heavy]
+        carbon_map = ((inst.get("rigid") or {}).get(inst.get("conf_name"), {})
+                      .get("carbon_map", {}))
+        carbons = {name: heavy[carbon_map[name]][:2] for name in linkage_carbons(inst)
+                   if carbon_map.get(name) in heavy}
+        return {"atoms": heavy, "bonds": bonds, "carbons": carbons}
+
+    def _mapper(self, geometries):
+        """Å -> widget transform fitting every unit; y points up as in the STM image."""
+        xs, ys = [], []
+        for inst, geo in zip(self.instances, geometries):
+            if geo:
+                xs += [x for x, _y, _s in geo["atoms"].values()]
+                ys += [y for _x, y, _s in geo["atoms"].values()]
+            xs.append(float(inst["com"][0]))
+            ys.append(float(inst["com"][1]))
+        margin, top = 48.0, 34.0
         width = max(1.0, self.width() - 2 * margin)
         height = max(1.0, self.height() - margin - top - 40.0)
-        span = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
+        span = max(max(xs) - min(xs), max(ys) - min(ys), 4.0 if any(geometries) else 1e-9)
         scale = min(width, height) / span
         cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
         mid_x, mid_y = self.width() / 2, top + 24.0 + height / 2
-        return [QtCore.QPointF(mid_x + (x - cx) * scale, mid_y - (y - cy) * scale)
-                for x, y in zip(xs, ys)]
+        return lambda x, y: QtCore.QPointF(mid_x + (x - cx) * scale, mid_y - (y - cy) * scale)
+
+    def node_points(self):
+        """Widget coordinates of every unit centre (COM)."""
+        if not self.instances:
+            return []
+        to_widget = self._mapper([self.unit_geometry(inst) for inst in self.instances])
+        return [to_widget(float(inst["com"][0]), float(inst["com"][1]))
+                for inst in self.instances]
 
     def paintEvent(self, _event):
         painter = QtGui.QPainter(self)
@@ -85,47 +121,116 @@ class ConnectionSketch(QtWidgets.QWidget):
                                else "MISO optimizes orientations")
         painter.drawText(QtCore.QRectF(8, 4, self.width() - 16, 20),
                          QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, header)
-        points = self.node_points()
-        radius = 11.0
-        linked = set()
-        for link in self.connections:
-            if not (0 <= link.donor < len(points) and 0 <= link.acceptor < len(points)):
-                continue
-            linked.update((link.donor, link.acceptor))
-            self._draw_bond(painter, points[link.donor], points[link.acceptor], radius,
-                            f"{link.donor_carbon}\u2192{link.acceptor_carbon} "
-                            + {"alpha": "\u03b1", "beta": "\u03b2"}.get(link.anomer, link.anomer))
-        for index, (inst, point) in enumerate(zip(self.instances, points)):
+        if not self.instances:
+            painter.end()
+            return
+        geometries = [self.unit_geometry(inst) for inst in self.instances]
+        to_widget = self._mapper(geometries)
+        centres = [to_widget(float(inst["com"][0]), float(inst["com"][1]))
+                   for inst in self.instances]
+        valid = [link for link in self.connections
+                 if 0 <= link.donor < len(centres) and 0 <= link.acceptor < len(centres)]
+        linked = {i for link in valid for i in (link.donor, link.acceptor)}
+        used = {(link.donor, link.donor_carbon) for link in valid}
+        used |= {(link.acceptor, link.acceptor_carbon) for link in valid}
+
+        label_tops = []
+        for index, (inst, geo, centre) in enumerate(zip(self.instances, geometries, centres)):
             is_root = index == self.root
-            if is_root:
-                painter.setPen(QtGui.QPen(QtGui.QColor("#d4a017"), 4))
-                painter.setBrush(QtCore.Qt.NoBrush)
-                painter.drawEllipse(point, radius + 5, radius + 5)
             color = QtGui.QColor("steelblue" if index in linked or is_root else "#a0a0a0")
-            painter.setPen(QtGui.QPen(color.darker(130), 1.5))
-            painter.setBrush(color)
-            painter.drawEllipse(point, radius, radius)
+            if geo is None:
+                points = {}
+                extent = 11.0
+                painter.setPen(QtGui.QPen(color.darker(130), 1.5))
+                painter.setBrush(color)
+                painter.drawEllipse(centre, extent, extent)
+            else:
+                points = {i: to_widget(x, y) for i, (x, y, _s) in geo["atoms"].items()}
+                extent = max([math.hypot(p.x() - centre.x(), p.y() - centre.y())
+                              for p in points.values()] + [8.0]) + 8.0
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.setBrush(QtGui.QColor(color.red(), color.green(), color.blue(), 28))
+                painter.drawEllipse(centre, extent, extent)
+                painter.setPen(QtGui.QPen(color.darker(120), 2.0))
+                for a, b in geo["bonds"]:
+                    painter.drawLine(points[a], points[b])
+                for i, point in points.items():
+                    sym = geo["atoms"][i][2]
+                    atom_color = QtGui.QColor(self.ELEMENT_COLORS.get(sym, "#8e24aa"))
+                    painter.setPen(QtGui.QPen(QtCore.Qt.white, 0.8))
+                    painter.setBrush(atom_color)
+                    painter.drawEllipse(point, 3.2, 3.2)
+            if is_root:
+                painter.setPen(QtGui.QPen(QtGui.QColor("#d4a017"), 3))
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.drawEllipse(centre, extent + 4, extent + 4)
+            label_tops.append(centre.y() - extent - 4)
+
+        for link in valid:
+            start = self._site_point(geometries, centres, to_widget, link.donor, link.donor_carbon)
+            end = self._site_point(geometries, centres, to_widget, link.acceptor, link.acceptor_carbon)
+            radius = 11.0 if geometries[link.donor] is None else 5.0
+            anomer = {"alpha": "\u03b1", "beta": "\u03b2"}.get(link.anomer, link.anomer)
+            # Carbon names are already shown on drawn structures.
+            label = (anomer if geometries[link.donor] and geometries[link.acceptor]
+                     else f"{link.donor_carbon}\u2192{link.acceptor_carbon} {anomer}")
+            self._draw_bond(painter, start, end, radius, label)
+
+        small = QtGui.QFont(painter.font())
+        small.setPointSizeF(max(6.5, small.pointSizeF() - 1.5))
+        for index, (geo, centre) in enumerate(zip(geometries, centres)):
+            if not geo:
+                continue
+            for name, (x, y) in geo["carbons"].items():
+                point = to_widget(x, y)
+                dx, dy = point.x() - centre.x(), point.y() - centre.y()
+                length = math.hypot(dx, dy) or 1.0
+                is_used = (index, name) in used
+                small.setBold(is_used)
+                painter.setFont(small)
+                box = painter.fontMetrics().boundingRect(name).adjusted(-2, 0, 2, 0)
+                box.moveCenter(QtCore.QPoint(int(point.x() + dx / length * 12),
+                                             int(point.y() + dy / length * 12)))
+                painter.setPen(QtGui.QPen(QtGui.QColor("#d97706"), 1.2) if is_used else QtCore.Qt.NoPen)
+                painter.setBrush(QtGui.QColor(255, 243, 205, 235) if is_used
+                                 else QtGui.QColor(255, 255, 255, 200))
+                painter.drawRoundedRect(QtCore.QRectF(box), 2, 2)
+                painter.setPen(QtGui.QColor("#9a4a00") if is_used else QtGui.QColor("#1f4e79"))
+                painter.drawText(box, QtCore.Qt.AlignCenter, name)
+        small.setBold(False)
+
+        font = QtGui.QFont(painter.font())
+        font.setPointSizeF(small.pointSizeF() + 1.5)
+        for index, (inst, centre, label_top) in enumerate(zip(self.instances, centres, label_tops)):
+            is_root = index == self.root
+            font.setBold(True)
+            painter.setFont(font)
             text = inst["label"]
             box = painter.fontMetrics().boundingRect(text).adjusted(-3, -1, 3, 1)
-            box.moveCenter(QtCore.QPoint(int(point.x()), int(point.y() - radius - 4 - box.height() / 2)))
+            box.moveCenter(QtCore.QPoint(int(centre.x()), int(label_top - box.height() / 2)))
             box.moveLeft(max(box.left(), 2))
             box.moveRight(min(box.right(), self.width() - 4))
             box.moveTop(max(box.top(), 26))
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(QtGui.QColor(255, 224, 130, 235) if is_root else QtGui.QColor(255, 255, 255, 210))
             painter.drawRoundedRect(QtCore.QRectF(box), 3, 3)
-            font = painter.font()
-            font.setBold(True)
-            painter.setFont(font)
             painter.setPen(QtCore.Qt.black)
             painter.drawText(box, QtCore.Qt.AlignCenter, text)
-            font.setBold(False)
-            painter.setFont(font)
+        font.setBold(False)
+        painter.setFont(font)
         painter.setPen(QtGui.QColor("#606060"))
-        legend = "Arrows: donor \u2192 acceptor (carbons, \u03b1/\u03b2). Gold: root. Grey: not connected yet."
+        legend = ("Drawn as positioned (top view). C1, C2\u2026: carbons that can form a linkage. "
+                  "Arrows: donor \u2192 acceptor (\u03b1/\u03b2). Gold: root. Grey: not connected yet.")
         painter.drawText(QtCore.QRectF(8, self.height() - 38, self.width() - 16, 34),
                          QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter | QtCore.Qt.TextWordWrap, legend)
         painter.end()
+
+    @staticmethod
+    def _site_point(geometries, centres, to_widget, index, carbon):
+        geo = geometries[index]
+        if geo and carbon in geo["carbons"]:
+            return to_widget(*geo["carbons"][carbon])
+        return centres[index]
 
     @staticmethod
     def _draw_bond(painter, start, end, radius, label):
@@ -285,7 +390,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         fourth = QtWidgets.QWidget()
         form = QtWidgets.QVBoxLayout(fourth)
         form.addWidget(QtWidgets.QLabel(
-            "4. Review every chemical choice before applying. Export CSV then writes the YAML."))
+            "4. Review every chemical choice before applying. 'Export CSV + MISO input YAML' "
+            "then writes the YAML; give it a final inspection before running MISO."))
         self.offline_review = QtWidgets.QPlainTextEdit()
         self.offline_review.setReadOnly(True)
         form.addWidget(self.offline_review)
