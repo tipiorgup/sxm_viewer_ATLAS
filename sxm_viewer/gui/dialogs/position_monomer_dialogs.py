@@ -8,11 +8,9 @@ from ..._shared import QtCore, QtWidgets
 from ...utils.sugar_lookup import (
     SugarConnectionError, SugarLookupError, lookup_sugar, parse_sugar_description,
 )
-from ...utils.miso_yaml import (
-    MISOExportError, SugarConnection, build_miso_config,
-    linkage_carbons, validate_connections,
-)
+from ...utils.miso_yaml import MISOExportError, build_miso_config
 from ._sxm_image_loader import load_demo_image
+from ._miso_connection_panel import MISOConnectionMixin
 
 
 # The engine filters base labels; specific chairs are filtered locally afterward.
@@ -264,6 +262,48 @@ def import_monomer_engine():
     return monomer_building
 
 
+def build_sugar_template(engine, smiles, ring, anom):
+    """Lowest-energy MISO conformer matching ring/anomer, plus its exact rigid data."""
+    known_ring = None if ring == "Any" else ring.split("_")[0]
+    known_anom = None if anom == "Any" else anom
+    try:
+        confs = engine.generate_monomer_conformers(
+            smiles, known_ring_type=known_ring, known_anomer=known_anom)
+    except Exception as exc:
+        print(f"generate_monomer_conformers failed for {smiles}: {exc}")
+        return None
+    if not confs:
+        return None
+    if ring.startswith("chair_"):
+        confs = {name: data for name, data in confs.items()
+                 if data["puckering_type"] == ring}
+        if not confs:
+            print(f"No generated conformer matches the requested {ring}.")
+            return None
+    # Conformers are returned lowest-energy first (rank1).
+    conf_name = next(iter(confs))
+    data = confs[conf_name]
+    coords = np.asarray(data["coordinates"], dtype=float)
+    com = np.asarray(data["COM"], dtype=float)
+    atom_types = list(data["atom_types"])
+    bonds = []
+    mol = data.get("molecule")
+    if mol is not None:
+        for b in mol.GetBonds():
+            bonds.append((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
+    # Capture the EXACT rigid monomer data MISO would otherwise regenerate
+    # (relative_coordinates, atom_types, carbon_map, oh_map, anomer,
+    # anomeric_oxygen_idx, quaternion) for this single chosen conformer, so a
+    # fixed-orientation run reuses this geometry instead of re-embedding.
+    rigid = None
+    try:
+        rigid = engine.extract_rigid_monomer_data({conf_name: data})
+    except Exception as exc:
+        print(f"extract_rigid_monomer_data failed for {smiles}: {exc}")
+    return {"conf_name": conf_name, "rel": coords - com,
+            "atom_types": atom_types, "bonds": bonds, "rigid": rigid}
+
+
 def import_lipid_engine():
     """Import MISO's lipid_building module (needs MISO/ on sys.path as a package)."""
     repo = Path(__file__).resolve().parents[3]
@@ -294,7 +334,7 @@ def _elem_from_key(key):
     return {"o": "O", "c": "C", "n": "N"}.get(key[0], "C")
 
 
-class PositionMonomerDialog(QtWidgets.QDialog):
+class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
     """Build MISO monomers from SMILES or sugar names and place them on the STM image.
 
     Workflow:
@@ -1042,44 +1082,7 @@ class PositionMonomerDialog(QtWidgets.QDialog):
                 "functional_rel": functional_rel}
 
     def _build_sugar_template(self, engine, smiles, ring, anom):
-        known_ring = None if ring == "Any" else ring.split("_")[0]
-        known_anom = None if anom == "Any" else anom
-        try:
-            confs = engine.generate_monomer_conformers(
-                smiles, known_ring_type=known_ring, known_anomer=known_anom)
-        except Exception as exc:
-            print(f"generate_monomer_conformers failed for {smiles}: {exc}")
-            return None
-        if not confs:
-            return None
-        if ring.startswith("chair_"):
-            confs = {name: data for name, data in confs.items()
-                     if data["puckering_type"] == ring}
-            if not confs:
-                print(f"No generated conformer matches the requested {ring}.")
-                return None
-        # Conformers are returned lowest-energy first (rank1).
-        conf_name = next(iter(confs))
-        data = confs[conf_name]
-        coords = np.asarray(data["coordinates"], dtype=float)
-        com = np.asarray(data["COM"], dtype=float)
-        atom_types = list(data["atom_types"])
-        bonds = []
-        mol = data.get("molecule")
-        if mol is not None:
-            for b in mol.GetBonds():
-                bonds.append((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))
-        # Capture the EXACT rigid monomer data MISO would otherwise regenerate
-        # (relative_coordinates, atom_types, carbon_map, oh_map, anomer,
-        # anomeric_oxygen_idx, quaternion) for this single chosen conformer, so a
-        # fixed-orientation run reuses this geometry instead of re-embedding.
-        rigid = None
-        try:
-            rigid = engine.extract_rigid_monomer_data({conf_name: data})
-        except Exception as exc:
-            print(f"extract_rigid_monomer_data failed for {smiles}: {exc}")
-        return {"conf_name": conf_name, "rel": coords - com,
-                "atom_types": atom_types, "bonds": bonds, "rigid": rigid}
+        return build_sugar_template(engine, smiles, ring, anom)
 
     def _build_aa_template(self, smiles, name):
         """Single lowest-energy conformer for an amino acid (embed + MMFF)."""
@@ -1411,155 +1414,13 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             self._overlay_artists.append(sc)
 
     # ------------------------------------------------------------------ MISO connections
-    def _build_connection_ui(self, layout):
-        group = QtWidgets.QGroupBox("MISO YAML: sugar connections")
-        box = QtWidgets.QVBoxLayout(group)
-        hint = QtWidgets.QLabel(
-            "Connect named units explicitly; branches are allowed. Rebuilding clears "
-            "connections and root. YAML export supports sugars only.")
-        hint.setWordWrap(True)
-        box.addWidget(hint)
-        self.assistant_btn = QtWidgets.QPushButton("Guide me / optional LLM assistant")
-        self.assistant_btn.clicked.connect(self._open_miso_assistant)
-        box.addWidget(self.assistant_btn)
-        form = QtWidgets.QFormLayout()
-        self.root_combo = QtWidgets.QComboBox()
-        self.root_combo.addItem("Choose root monomer...", None)
-        form.addRow("Root:", self.root_combo)
-        self.orientation_combo = QtWidgets.QComboBox()
-        self.orientation_combo.addItem("Choose orientation mode...", None)
-        self.orientation_combo.addItem("Keep positioned geometry and rotations", True)
-        self.orientation_combo.addItem("Let MISO optimize orientations", False)
-        form.addRow("Orientation:", self.orientation_combo)
-        self.donor_combo = QtWidgets.QComboBox()
-        self.acceptor_combo = QtWidgets.QComboBox()
-        self.donor_carbon_combo = QtWidgets.QComboBox()
-        self.acceptor_carbon_combo = QtWidgets.QComboBox()
-        self.link_anomer_combo = QtWidgets.QComboBox()
-        self.link_anomer_combo.addItems(["Choose...", "alpha", "beta"])
-        for label, unit, carbon in (
-                ("Donor:", self.donor_combo, self.donor_carbon_combo),
-                ("Acceptor:", self.acceptor_combo, self.acceptor_carbon_combo)):
-            row = QtWidgets.QHBoxLayout()
-            row.addWidget(unit, 1)
-            row.addWidget(carbon)
-            form.addRow(label, row)
-        form.addRow("Linkage anomer:", self.link_anomer_combo)
-        box.addLayout(form)
-        self.donor_combo.currentIndexChanged.connect(self._refresh_linkage_carbons)
-        self.acceptor_combo.currentIndexChanged.connect(self._refresh_linkage_carbons)
-        buttons = QtWidgets.QHBoxLayout()
-        add = QtWidgets.QPushButton("Add connection")
-        add.clicked.connect(self._add_connection)
-        remove = QtWidgets.QPushButton("Remove selected connection")
-        remove.clicked.connect(self._remove_connection)
-        buttons.addWidget(add)
-        buttons.addWidget(remove)
-        box.addLayout(buttons)
-        self.connection_table = QtWidgets.QTableWidget(0, 5)
-        self.connection_table.setHorizontalHeaderLabels(
-            ["Donor", "Carbon", "Acceptor", "Carbon", "Anomer"])
-        self.connection_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.connection_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.connection_table.horizontalHeader().setSectionResizeMode(
-            QtWidgets.QHeaderView.ResizeToContents)
-        self.connection_table.setFixedHeight(110)
-        box.addWidget(self.connection_table)
-        layout.addWidget(group)
-        self._refresh_connection_units()
-
-    def _refresh_connection_units(self):
-        blockers = [QtCore.QSignalBlocker(combo) for combo in
-                    (self.root_combo, self.donor_combo, self.acceptor_combo)]
-        for combo, placeholder in (
-                (self.root_combo, "Choose root monomer..."),
-                (self.donor_combo, "Choose donor..."),
-                (self.acceptor_combo, "Choose acceptor...")):
-            combo.clear()
-            combo.addItem(placeholder, None)
-            for index, inst in enumerate(self._instances):
-                if inst["kind"] == "sugar":
-                    combo.addItem(inst["label"], index)
-        del blockers
-        self._refresh_linkage_carbons()
-
-    def _refresh_linkage_carbons(self, _index=None):
-        for unit, carbon in ((self.donor_combo, self.donor_carbon_combo),
-                             (self.acceptor_combo, self.acceptor_carbon_combo)):
-            selected = carbon.currentText()
-            carbon.clear()
-            index = unit.currentData()
-            if index is not None:
-                carbon.addItems(linkage_carbons(self._instances[index]))
-            if selected in [carbon.itemText(i) for i in range(carbon.count())]:
-                carbon.setCurrentText(selected)
-
-    def _add_connection(self):
-        donor = self.donor_combo.currentData()
-        acceptor = self.acceptor_combo.currentData()
-        if donor is None or acceptor is None:
-            QtWidgets.QMessageBox.warning(
-                self, "MISO connection", "Choose both a donor and an acceptor.")
-            return
-        connection = SugarConnection(
-            donor, self.donor_carbon_combo.currentText(), acceptor,
-            self.acceptor_carbon_combo.currentText(), self.link_anomer_combo.currentText())
-        try:
-            validate_connections(self._instances, self._connections + [connection])
-        except MISOExportError as exc:
-            QtWidgets.QMessageBox.warning(self, "MISO connection", str(exc))
-            return
-        self._connections.append(connection)
-        row = self.connection_table.rowCount()
-        self.connection_table.insertRow(row)
-        values = (self._instances[donor]["label"], connection.donor_carbon,
-                  self._instances[acceptor]["label"], connection.acceptor_carbon,
-                  connection.anomer)
-        for column, value in enumerate(values):
-            self.connection_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
-
-    def _remove_connection(self):
-        row = self.connection_table.currentRow()
-        if row >= 0:
-            self._connections.pop(row)
-            self.connection_table.removeRow(row)
-
-    def _open_miso_assistant(self):
+    def _assistant_blocker(self):
         if self._lookup_worker is not None:
-            QtWidgets.QMessageBox.warning(
-                self, "MISO assistant", "Wait for the sugar-name lookup to finish first.")
-            return
-        if (not self._instances or self._lipids or
-                any(inst["kind"] != "sugar" for inst in self._instances)):
-            QtWidgets.QMessageBox.warning(
-                self, "MISO assistant",
-                "Build sugar units first. This assistant currently supports sugars only; "
-                "remove amino-acid units and lipid rows before using it.")
-            return
-        from .miso_assistant_dialog import MISOAssistantDialog
-        dialog = MISOAssistantDialog(
-            self._instances, self._connections, self.root_combo.currentData(),
-            self.orientation_combo.currentData(), parent=self)
-        if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.result_choices is not None:
-            self._apply_assistant_choices(dialog.result_choices)
-
-    def _apply_assistant_choices(self, choices):
-        from ...utils.miso_assistant import validate_choices
-        try:
-            validate_choices(self._instances, choices)
-        except MISOExportError as exc:
-            QtWidgets.QMessageBox.warning(self, "MISO assistant", str(exc))
-            return
-        self._connections = list(choices.connections)
-        self.connection_table.setRowCount(len(self._connections))
-        for row, link in enumerate(self._connections):
-            values = (self._instances[link.donor]["label"], link.donor_carbon,
-                      self._instances[link.acceptor]["label"], link.acceptor_carbon, link.anomer)
-            for column, value in enumerate(values):
-                self.connection_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
-        self.root_combo.setCurrentIndex(self.root_combo.findData(choices.root))
-        self.orientation_combo.setCurrentIndex(
-            self.orientation_combo.findData(choices.fixed_orientation))
+            return "Wait for the sugar-name lookup to finish first."
+        if self._lipids:
+            return ("This assistant currently supports sugars only; "
+                    "remove amino-acid units and lipid rows before using it.")
+        return super()._assistant_blocker()
 
     def _make_miso_config(self, out_path):
         mode = self.orientation_combo.currentData()

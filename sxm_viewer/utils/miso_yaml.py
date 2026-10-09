@@ -57,7 +57,14 @@ def validate_connections(instances: list[dict],
 def build_miso_config(instances: list[dict], connections: list[SugarConnection],
                       root: int | None, fixed_orientation: bool,
                       out_path: str, sxm_path: Path | None = None,
-                      has_lipids: bool = False) -> dict:
+                      has_lipids: bool = False,
+                      positions_csv: str | None = None) -> dict:
+    """MISO input for the sugar ``instances``.
+
+    Each instance occupies point ``inst["position"]`` of the positions CSV
+    (default: its list index). ``positions_csv`` overrides the default
+    ``<stem>_positions.csv`` circle input.
+    """
     if has_lipids or any(inst.get("kind") != "sugar" for inst in instances):
         raise MISOExportError(
             "MISO YAML export currently supports sugars only. "
@@ -71,6 +78,7 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
     positions = {}
     geometries = {}
     molecule_ids = []
+    used_points = {}
     for index, inst in enumerate(instances):
         name = inst["name"]
         if not isinstance(name, str) or not name.strip():
@@ -89,9 +97,16 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
                 f"Rows named '{name}' have different SMILES or conformers. "
                 "Give them distinct Names in the subunit table and rebuild.")
         geometries[name] = signature
+        point = inst.get("position", index)
+        if type(point) is not int or point < 0:
+            raise MISOExportError(f"{inst['label']}: invalid point index {point!r}.")
+        if point in used_points:
+            raise MISOExportError(
+                f"{inst['label']} and {used_points[point]} use the same point {point}.")
+        used_points[point] = inst["label"]
         sugars[name] = inst["smiles"]
-        positions.setdefault(name, []).append(index)
-        molecule_ids.append(f"{name}_{index}")
+        positions.setdefault(name, []).append(point)
+        molecule_ids.append(f"{name}_{point}")
 
     validate_connections(instances, connections)
     adjacent = {i: set() for i in range(len(instances))}
@@ -132,7 +147,8 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
                       link.anomer, description])
     config = {
         "sxm_file": str(sxm_path.resolve()) if sxm_path else str(stem.with_suffix(".sxm")),
-        "circle_input_path": f"{stem}_positions.csv",
+        "circle_input_path": (str(Path(positions_csv).resolve()) if positions_csv
+                              else f"{stem}_positions.csv"),
         "monomer_data_path": f"{stem}_monomer_data.pkl",
         "use_fixed_orientation": fixed_orientation,
         "sugars": sugars,

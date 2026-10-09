@@ -109,6 +109,32 @@ This first version generates YAML for sugars only. Amino-acid or lipid exports
 still save the existing CSV/image files, but explicitly warn that YAML was not
 generated. Any older YAML is left unchanged and must not be reused blindly.
 
+## Position coordinates: optional sugars per picked point
+
+Picking points and **Export CSV** work exactly as before (CSV + NPZ + PNG).
+Assigning a sugar is optional and can be done for any subset of points:
+
+1. In the point table, type a sugar name (e.g. `D chair 4C1 glucose`,
+   `chair KDO`) or a SMILES in **Sugar name / SMILES**, and optionally a
+   **Name**, **Ring type** and **Anomer**. Typed entries are kept when more
+   points are picked.
+2. Click **Build monomers**. Names are looked up in PubChem in the background;
+   without internet a pop-up asks you to enter the SMILES and details
+   manually. Blank Names get automatic names (`Sugar1`, ...). Points with the
+   same Name must be the same sugar.
+3. Built sugars are drawn on the image at their points, labelled
+   `<Name>.<point>`. Select a table row to rotate that sugar with RX/RY/RZ.
+4. Use the same **MISO YAML: sugar connections** panel and **Guide me /
+   optional LLM assistant** as in Position monomer, including the choice of
+   keeping the rotations (fixed) or letting MISO optimize them.
+
+On export with built sugars, the picked-points CSV is used directly as MISO's
+`circle_input_path`, and `<stem>.yml`, `<stem>_monomer_data.pkl` and
+`<stem>_orientations.csv` (used in fixed mode) are also written. YAML IDs use the picked point
+index (e.g. `Glc_2`), so unassigned points stay in the CSV but are not used by
+any sugar. If sugar entries were edited after the last build, export offers
+coordinates only; rebuild to get the YAML.
+
 ## Guided YAML assistant: offline or optional hosted LLM
 
 Click **Guide me / optional LLM assistant** after building sugars. The default

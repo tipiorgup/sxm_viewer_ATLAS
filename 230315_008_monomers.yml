@@ -1,0 +1,44 @@
+sxm_file: C:\Users\gomezf\Desktop\sxm_viewer_ATLAS\Test_folder\230315_008.sxm
+circle_input_path: C:\Users\gomezf\Desktop\sxm_viewer_ATLAS\230315_008_monomers_positions.csv
+monomer_data_path: C:\Users\gomezf\Desktop\sxm_viewer_ATLAS\230315_008_monomers_monomer_data.pkl
+use_fixed_orientation: true
+sugars:
+  KDO: C1[C@H]([C@H]([C@H](OC1(C(=O)O)O)[C@@H](CO)O)O)O
+experimental_positions:
+  KDO:
+  - 0
+  - 1
+  - 2
+conformer_parameters:
+  num_conformers: 20
+  max_keep: 1
+conformer_selection:
+  strategy: lowest_energy
+root_mol: KDO_0
+direction:
+- - KDO_2
+  - C3
+  - KDO_0
+  - C1
+  - beta
+  - KDO.1.3 C3 -> KDO.1.1 C1 (beta)
+- - KDO_0
+  - C3
+  - KDO_1
+  - C1
+  - beta
+  - KDO.1.1 C3 -> KDO.1.2 C1 (beta)
+glycosidic_bonds:
+- - KDO_2
+  - C3
+  - KDO_0
+  - C1
+  - beta
+  - KDO.1.3 C3 -> KDO.1.1 C1 (beta)
+- - KDO_0
+  - C3
+  - KDO_1
+  - C1
+  - beta
+  - KDO.1.1 C3 -> KDO.1.2 C1 (beta)
+orientation_csv_path: C:\Users\gomezf\Desktop\sxm_viewer_ATLAS\230315_008_monomers_orientations.csv
