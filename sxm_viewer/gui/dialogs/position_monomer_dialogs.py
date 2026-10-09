@@ -1366,6 +1366,9 @@ class PositionMonomerDialog(QtWidgets.QDialog):
             "connections and root. YAML export supports sugars only.")
         hint.setWordWrap(True)
         box.addWidget(hint)
+        self.assistant_btn = QtWidgets.QPushButton("Guide me / optional LLM assistant")
+        self.assistant_btn.clicked.connect(self._open_miso_assistant)
+        box.addWidget(self.assistant_btn)
         form = QtWidgets.QFormLayout()
         self.root_combo = QtWidgets.QComboBox()
         self.root_combo.addItem("Choose root monomer...", None)
@@ -1467,6 +1470,43 @@ class PositionMonomerDialog(QtWidgets.QDialog):
         if row >= 0:
             self._connections.pop(row)
             self.connection_table.removeRow(row)
+
+    def _open_miso_assistant(self):
+        if self._lookup_worker is not None:
+            QtWidgets.QMessageBox.warning(
+                self, "MISO assistant", "Wait for the sugar-name lookup to finish first.")
+            return
+        if (not self._instances or self._lipids or
+                any(inst["kind"] != "sugar" for inst in self._instances)):
+            QtWidgets.QMessageBox.warning(
+                self, "MISO assistant",
+                "Build sugar units first. This assistant currently supports sugars only; "
+                "remove amino-acid units and lipid rows before using it.")
+            return
+        from .miso_assistant_dialog import MISOAssistantDialog
+        dialog = MISOAssistantDialog(
+            self._instances, self._connections, self.root_combo.currentData(),
+            self.orientation_combo.currentData(), parent=self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.result_choices is not None:
+            self._apply_assistant_choices(dialog.result_choices)
+
+    def _apply_assistant_choices(self, choices):
+        from ...utils.miso_assistant import validate_choices
+        try:
+            validate_choices(self._instances, choices)
+        except MISOExportError as exc:
+            QtWidgets.QMessageBox.warning(self, "MISO assistant", str(exc))
+            return
+        self._connections = list(choices.connections)
+        self.connection_table.setRowCount(len(self._connections))
+        for row, link in enumerate(self._connections):
+            values = (self._instances[link.donor]["label"], link.donor_carbon,
+                      self._instances[link.acceptor]["label"], link.acceptor_carbon, link.anomer)
+            for column, value in enumerate(values):
+                self.connection_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+        self.root_combo.setCurrentIndex(self.root_combo.findData(choices.root))
+        self.orientation_combo.setCurrentIndex(
+            self.orientation_combo.findData(choices.fixed_orientation))
 
     def _make_miso_config(self, out_path):
         mode = self.orientation_combo.currentData()

@@ -1,0 +1,673 @@
+from __future__ import annotations
+
+from copy import deepcopy
+import json
+
+import math
+
+from ..._shared import QtCore, QtGui, QtWidgets
+from ...utils.miso_assistant import (
+    AssistantChoices, AssistantError, PROVIDERS, ServiceConfig, delete_api_key,
+    molecular_context, parse_reply, read_api_key, request_advice, save_api_key,
+    validate_choices,
+)
+from ...utils.miso_yaml import MISOExportError, SugarConnection, linkage_carbons, validate_connections
+
+
+class _AdviceSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(str, str)
+
+
+class _AdviceWorker(QtCore.QRunnable):
+    def __init__(self, config, key, context, history):
+        super().__init__()
+        self.config, self.key = config, key
+        self.context, self.history = context, history
+        self.signals = _AdviceSignals()
+
+    def run(self):
+        try:
+            reply = request_advice(self.config, self.key, self.context, self.history)
+        except AssistantError as exc:
+            self.signals.finished.emit("", str(exc))
+        else:
+            self.signals.finished.emit(reply, "")
+        finally:
+            self.key = ""
+
+
+class ConnectionSketch(QtWidgets.QWidget):
+    """Skeletal plan of placed sugars and donor-to-acceptor bonds, drawn top-down."""
+
+    def __init__(self, instances, parent=None):
+        super().__init__(parent)
+        self.instances = instances
+        self.connections = []
+        self.root = None
+        self.fixed_orientation = None
+        self.caption = ""
+        self.setMinimumSize(420, 260)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+    def set_plan(self, connections, root=None, fixed_orientation=None, caption=""):
+        self.connections = list(connections)
+        self.root = root
+        self.fixed_orientation = fixed_orientation
+        self.caption = caption
+        self.update()
+
+    def node_points(self):
+        """Widget coordinates of every unit; y points up as in the STM image."""
+        if not self.instances:
+            return []
+        xs = [float(inst["com"][0]) for inst in self.instances]
+        ys = [float(inst["com"][1]) for inst in self.instances]
+        margin, top = 70.0, 34.0
+        width = max(1.0, self.width() - 2 * margin)
+        height = max(1.0, self.height() - margin - top - 40.0)
+        span = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
+        scale = min(width, height) / span
+        cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+        mid_x, mid_y = self.width() / 2, top + 24.0 + height / 2
+        return [QtCore.QPointF(mid_x + (x - cx) * scale, mid_y - (y - cy) * scale)
+                for x, y in zip(xs, ys)]
+
+    def paintEvent(self, _event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QtCore.Qt.white)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#b0b0b0")))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        painter.setPen(QtCore.Qt.black)
+        header = self.caption or "Connection plan"
+        if self.fixed_orientation is not None:
+            header += " | " + ("keep positioned rotations" if self.fixed_orientation
+                               else "MISO optimizes orientations")
+        painter.drawText(QtCore.QRectF(8, 4, self.width() - 16, 20),
+                         QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, header)
+        points = self.node_points()
+        radius = 11.0
+        linked = set()
+        for link in self.connections:
+            if not (0 <= link.donor < len(points) and 0 <= link.acceptor < len(points)):
+                continue
+            linked.update((link.donor, link.acceptor))
+            self._draw_bond(painter, points[link.donor], points[link.acceptor], radius,
+                            f"{link.donor_carbon}\u2192{link.acceptor_carbon} "
+                            + {"alpha": "\u03b1", "beta": "\u03b2"}.get(link.anomer, link.anomer))
+        for index, (inst, point) in enumerate(zip(self.instances, points)):
+            is_root = index == self.root
+            if is_root:
+                painter.setPen(QtGui.QPen(QtGui.QColor("#d4a017"), 4))
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.drawEllipse(point, radius + 5, radius + 5)
+            color = QtGui.QColor("steelblue" if index in linked or is_root else "#a0a0a0")
+            painter.setPen(QtGui.QPen(color.darker(130), 1.5))
+            painter.setBrush(color)
+            painter.drawEllipse(point, radius, radius)
+            text = inst["label"]
+            box = painter.fontMetrics().boundingRect(text).adjusted(-3, -1, 3, 1)
+            box.moveCenter(QtCore.QPoint(int(point.x()), int(point.y() - radius - 4 - box.height() / 2)))
+            box.moveLeft(max(box.left(), 2))
+            box.moveRight(min(box.right(), self.width() - 4))
+            box.moveTop(max(box.top(), 26))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(255, 224, 130, 235) if is_root else QtGui.QColor(255, 255, 255, 210))
+            painter.drawRoundedRect(QtCore.QRectF(box), 3, 3)
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QtCore.Qt.black)
+            painter.drawText(box, QtCore.Qt.AlignCenter, text)
+            font.setBold(False)
+            painter.setFont(font)
+        painter.setPen(QtGui.QColor("#606060"))
+        legend = "Arrows: donor \u2192 acceptor (carbons, \u03b1/\u03b2). Gold: root. Grey: not connected yet."
+        painter.drawText(QtCore.QRectF(8, self.height() - 38, self.width() - 16, 34),
+                         QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter | QtCore.Qt.TextWordWrap, legend)
+        painter.end()
+
+    @staticmethod
+    def _draw_bond(painter, start, end, radius, label):
+        dx, dy = end.x() - start.x(), end.y() - start.y()
+        length = math.hypot(dx, dy)
+        if length <= 2 * radius:
+            return
+        ux, uy = dx / length, dy / length
+        tail = QtCore.QPointF(start.x() + ux * radius, start.y() + uy * radius)
+        tip = QtCore.QPointF(end.x() - ux * radius, end.y() - uy * radius)
+        color = QtGui.QColor("#d97706")
+        painter.setPen(QtGui.QPen(color, 2.5))
+        painter.drawLine(tail, tip)
+        size = 10.0
+        left = QtCore.QPointF(tip.x() - ux * size - uy * size * 0.5, tip.y() - uy * size + ux * size * 0.5)
+        right = QtCore.QPointF(tip.x() - ux * size + uy * size * 0.5, tip.y() - uy * size - ux * size * 0.5)
+        painter.setBrush(color)
+        painter.drawPolygon(QtGui.QPolygonF([tip, left, right]))
+        mid = QtCore.QPointF((tail.x() + tip.x()) / 2, (tail.y() + tip.y()) / 2)
+        box = painter.fontMetrics().boundingRect(label).adjusted(-3, -1, 3, 1)
+        visible = math.hypot(tip.x() - tail.x(), tip.y() - tail.y())
+        if box.width() > 0.6 * visible:
+            nx, ny = (-uy, ux) if ux >= 0 else (uy, -ux)
+            if ny < 0:
+                nx, ny = -nx, -ny
+            shift = box.height() / 2 + 6 + abs(nx) * box.width() / 2
+            mid = QtCore.QPointF(mid.x() + nx * shift, mid.y() + ny * shift)
+        box.moveCenter(mid.toPoint())
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(255, 248, 230, 230))
+        painter.drawRoundedRect(QtCore.QRectF(box), 3, 3)
+        painter.setPen(color.darker(140))
+        painter.drawText(box, QtCore.Qt.AlignCenter, label)
+
+
+class MISOAssistantDialog(QtWidgets.QDialog):
+    """An offline question-by-question guide, with opt-in hosted proposals."""
+
+    def __init__(self, instances, connections, root, mode, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MISO YAML assistant")
+        self.resize(1100, 760)
+        self.instances = deepcopy(instances)
+        self.connections = list(connections)
+        self.context = molecular_context(self.instances, connections, root, mode)
+        self.result_choices = None
+        self._online_choices = None
+        self._history = []
+        self._consent_config = None
+        self._worker = None
+        self._closed = False
+        self.finished.connect(self._on_closed)
+        self.settings = QtCore.QSettings("SXMViewer", "MISOAssistant")
+        layout = QtWidgets.QVBoxLayout(self)
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self._build_offline(root, mode), "Offline guide")
+        self.tabs.addTab(self._build_online(), "Online LLM (optional)")
+        layout.addWidget(self.tabs)
+        close = QtWidgets.QPushButton("Close without applying")
+        close.clicked.connect(self.reject)
+        layout.addWidget(close)
+        self._load_settings()
+
+    def _on_closed(self, _result):
+        self._closed = True
+        self.key_edit.clear()
+
+    def _unit_combo(self):
+        combo = QtWidgets.QComboBox()
+        combo.addItem("Choose a unit...", None)
+        for index, inst in enumerate(self.instances):
+            combo.addItem(inst["label"], index)
+        return combo
+
+    def _build_offline(self, root, mode):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.addWidget(QtWidgets.QLabel(
+            "No internet, account, or model installation is needed for this guide."))
+        self.offline_sketch = ConnectionSketch(self.instances)
+        self.pages = QtWidgets.QStackedWidget()
+        first = QtWidgets.QWidget()
+        form = QtWidgets.QVBoxLayout(first)
+        text = QtWidgets.QLabel(
+            "1. Which unit is the root?\n\n"
+            "The root is the reference sugar that MISO starts from, normally at "
+            "the reducing end. For optimized orientations, donor-to-acceptor "
+            "connections must lead toward it. Its position is not guessed.")
+        text.setWordWrap(True)
+        form.addWidget(text)
+        self.root_combo = self._unit_combo()
+        self.root_combo.setCurrentIndex(max(0, self.root_combo.findData(root)))
+        form.addWidget(self.root_combo)
+        form.addStretch()
+        self.pages.addWidget(first)
+
+        second = QtWidgets.QWidget()
+        form = QtWidgets.QVBoxLayout(second)
+        text = QtWidgets.QLabel(
+            "2. Should MISO keep your rotations or optimize them?\n\n"
+            "Keep: reuse the geometry and rotations you positioned.\n"
+            "Optimize: reuse the same sugar geometry, but let MISO search for "
+            "orientations that connect the sugars. Neither option infers chemical bonds.")
+        text.setWordWrap(True)
+        form.addWidget(text)
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItem("Choose orientation mode...", None)
+        self.mode_combo.addItem("Keep positioned geometry and rotations", True)
+        self.mode_combo.addItem("Let MISO optimize orientations", False)
+        self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(mode)))
+        form.addWidget(self.mode_combo)
+        form.addStretch()
+        self.pages.addWidget(second)
+
+        third = QtWidgets.QWidget()
+        form = QtWidgets.QVBoxLayout(third)
+        text = QtWidgets.QLabel(
+            "3. Which sugars are chemically connected?\n\n"
+            "For each bond, choose the donor (provides the anomeric carbon), "
+            "the acceptor, both carbon positions, and alpha/beta. "
+            "Only hydroxyl-bearing carbons recognized by MISO are listed. "
+            "Do not infer a bond just because two sugars are close together.")
+        text.setWordWrap(True)
+        form.addWidget(text)
+        fields = QtWidgets.QFormLayout()
+        self.donor_combo, self.acceptor_combo = self._unit_combo(), self._unit_combo()
+        self.donor_carbon, self.acceptor_carbon = QtWidgets.QComboBox(), QtWidgets.QComboBox()
+        for label, unit, carbon in (
+                ("Donor:", self.donor_combo, self.donor_carbon),
+                ("Acceptor:", self.acceptor_combo, self.acceptor_carbon)):
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(unit, 1)
+            row.addWidget(carbon)
+            fields.addRow(label, row)
+            unit.currentIndexChanged.connect(self._refresh_carbons)
+        self.anomer_combo = QtWidgets.QComboBox()
+        self.anomer_combo.addItems(["Choose...", "alpha", "beta"])
+        fields.addRow("Anomer:", self.anomer_combo)
+        form.addLayout(fields)
+        buttons = QtWidgets.QHBoxLayout()
+        add = QtWidgets.QPushButton("Add this connection")
+        remove = QtWidgets.QPushButton("Remove selected connection")
+        add.clicked.connect(self._add_connection)
+        remove.clicked.connect(self._remove_connection)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        form.addLayout(buttons)
+        self.link_table = QtWidgets.QTableWidget(0, 5)
+        self.link_table.setHorizontalHeaderLabels(["Donor", "Carbon", "Acceptor", "Carbon", "Anomer"])
+        self.link_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.link_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.link_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        form.addWidget(self.link_table)
+        self.pages.addWidget(third)
+        self._show_connections()
+
+        fourth = QtWidgets.QWidget()
+        form = QtWidgets.QVBoxLayout(fourth)
+        form.addWidget(QtWidgets.QLabel(
+            "4. Review every chemical choice before applying. Export CSV then writes the YAML."))
+        self.offline_review = QtWidgets.QPlainTextEdit()
+        self.offline_review.setReadOnly(True)
+        form.addWidget(self.offline_review)
+        self.offline_approve = QtWidgets.QPushButton("Approve and apply these settings")
+        self.offline_approve.clicked.connect(self._approve_offline)
+        form.addWidget(self.offline_approve)
+        self.pages.addWidget(fourth)
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.addWidget(self.pages)
+        split.addWidget(self.offline_sketch)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        layout.addWidget(split, 1)
+        split.setSizes([550, 550])
+        self.root_combo.currentIndexChanged.connect(self._refresh_offline_sketch)
+        self.mode_combo.currentIndexChanged.connect(self._refresh_offline_sketch)
+        self._refresh_offline_sketch()
+        navigation = QtWidgets.QHBoxLayout()
+        self.back_btn = QtWidgets.QPushButton("Back")
+        self.back_btn.setEnabled(False)
+        self.next_btn = QtWidgets.QPushButton("Next")
+        self.back_btn.clicked.connect(self._back)
+        self.next_btn.clicked.connect(self._next)
+        navigation.addWidget(self.back_btn)
+        navigation.addStretch()
+        navigation.addWidget(self.next_btn)
+        layout.addLayout(navigation)
+        return widget
+
+    def _refresh_carbons(self, _index=None):
+        for unit, carbon in ((self.donor_combo, self.donor_carbon),
+                             (self.acceptor_combo, self.acceptor_carbon)):
+            carbon.clear()
+            index = unit.currentData()
+            if index is not None:
+                carbon.addItems(linkage_carbons(self.instances[index]))
+
+    def _show_connections(self):
+        self.link_table.setRowCount(len(self.connections))
+        for row, link in enumerate(self.connections):
+            values = (self.instances[link.donor]["label"], link.donor_carbon,
+                      self.instances[link.acceptor]["label"], link.acceptor_carbon, link.anomer)
+            for column, value in enumerate(values):
+                self.link_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+        self._refresh_offline_sketch()
+
+    def _refresh_offline_sketch(self, _index=None):
+        if hasattr(self, "root_combo") and hasattr(self, "mode_combo"):
+            self.offline_sketch.set_plan(self.connections, self.root_combo.currentData(),
+                                         self.mode_combo.currentData(), "Your plan")
+
+    def _add_connection(self):
+        donor, acceptor = self.donor_combo.currentData(), self.acceptor_combo.currentData()
+        if donor is None or acceptor is None:
+            self._error("Choose both named units first.")
+            return
+        link = SugarConnection(donor, self.donor_carbon.currentText(), acceptor,
+                               self.acceptor_carbon.currentText(), self.anomer_combo.currentText())
+        try:
+            validate_connections(self.instances, self.connections + [link])
+        except MISOExportError as exc:
+            self._error(str(exc))
+            return
+        self.connections.append(link)
+        self._show_connections()
+
+    def _remove_connection(self):
+        row = self.link_table.currentRow()
+        if row >= 0:
+            self.connections.pop(row)
+            self._show_connections()
+
+    def _offline_choices(self):
+        root, mode = self.root_combo.currentData(), self.mode_combo.currentData()
+        if root is None or mode is None:
+            raise MISOExportError("Choose a root and an orientation mode explicitly.")
+        choices = AssistantChoices(root, mode, list(self.connections))
+        validate_choices(self.instances, choices)
+        return choices
+
+    def _summary(self, choices):
+        lines = [
+            f"Root: {self.instances[choices.root]['label']}",
+            "Orientation: " + ("Keep positioned rotations" if choices.fixed_orientation
+                                else "Let MISO optimize"),
+            "\nConnections:",
+        ]
+        for link in choices.connections:
+            lines.append(f"{self.instances[link.donor]['label']} {link.donor_carbon} -> "
+                         f"{self.instances[link.acceptor]['label']} {link.acceptor_carbon} "
+                         f"({link.anomer})")
+        if not choices.connections:
+            lines.append("None (single sugar).")
+        return "\n".join(lines)
+
+    def _next(self):
+        page = self.pages.currentIndex()
+        if page == 0 and self.root_combo.currentData() is None:
+            self._error("Which named unit should be the root? Select it before continuing.")
+            return
+        if page == 1 and self.mode_combo.currentData() is None:
+            self._error("Choose whether MISO should keep or optimize your rotations.")
+            return
+        if page == 2:
+            try:
+                self.offline_review.setPlainText(self._summary(self._offline_choices()))
+            except MISOExportError as exc:
+                self._error(str(exc))
+                return
+        self.pages.setCurrentIndex(page + 1)
+        self.back_btn.setEnabled(True)
+        self.next_btn.setEnabled(page + 1 < 3)
+
+    def _back(self):
+        self.pages.setCurrentIndex(max(0, self.pages.currentIndex() - 1))
+        self.back_btn.setEnabled(self.pages.currentIndex() > 0)
+        self.next_btn.setEnabled(True)
+
+    def _approve_offline(self):
+        try:
+            self.result_choices = self._offline_choices()
+        except MISOExportError as exc:
+            self._error(str(exc))
+            return
+        self.accept()
+
+    def _build_online(self):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        note = QtWidgets.QLabel(
+            "Optional: needs internet, provider access, and an API key; requests may cost money. "
+            "Ask an administrator to configure this once. The offline guide always works.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.settings_toggle = QtWidgets.QToolButton()
+        self.settings_toggle.setText("Service settings")
+        self.settings_toggle.setCheckable(True)
+        self.settings_toggle.setChecked(True)
+        self.settings_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.settings_toggle.setArrowType(QtCore.Qt.DownArrow)
+        layout.addWidget(self.settings_toggle)
+        self.settings_box = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(self.settings_box)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_toggle.toggled.connect(self._toggle_service_settings)
+        form = QtWidgets.QFormLayout()
+        self.provider_combo = QtWidgets.QComboBox()
+        self.provider_combo.addItems(PROVIDERS)
+        self.endpoint_edit = QtWidgets.QLineEdit()
+        self.endpoint_edit.setPlaceholderText("Complete HTTPS API request URL from your institution")
+        self.model_edit = QtWidgets.QLineEdit()
+        self.model_edit.setPlaceholderText("Model identifier from your provider or administrator")
+        self.key_edit = QtWidgets.QLineEdit()
+        self.key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.key_edit.setPlaceholderText("API key (never written to YAML or ordinary settings)")
+        self.auth_combo = QtWidgets.QComboBox()
+        self.auth_combo.addItem("Bearer token", "Authorization")
+        self.auth_combo.addItem("Institutional api-key header", "api-key")
+        for label, control in (("Provider:", self.provider_combo), ("Request URL:", self.endpoint_edit),
+                               ("Model:", self.model_edit), ("API key:", self.key_edit),
+                               ("Authentication:", self.auth_combo)):
+            form.addRow(label, control)
+        settings_layout.addLayout(form)
+        self.remember_key = QtWidgets.QCheckBox("Remember API key in Windows Credential Manager")
+        self.remember_key.setChecked(True)
+        settings_layout.addWidget(self.remember_key)
+        buttons = QtWidgets.QHBoxLayout()
+        save = QtWidgets.QPushButton("Save configuration")
+        load = QtWidgets.QPushButton("Load saved key")
+        forget = QtWidgets.QPushButton("Remove saved key")
+        save.clicked.connect(self._save_settings)
+        load.clicked.connect(self._load_key)
+        forget.clicked.connect(self._forget_key)
+        for button in (save, load, forget):
+            buttons.addWidget(button)
+        settings_layout.addLayout(buttons)
+        layout.addWidget(self.settings_box)
+        self.online_status = QtWidgets.QLabel("No molecular data is sent until you consent and press Send.")
+        self.online_status.setWordWrap(True)
+        layout.addWidget(self.online_status)
+        self.provider_combo.currentTextChanged.connect(self._provider_changed)
+        self.endpoint_edit.textEdited.connect(self._endpoint_changed)
+        self.auth_combo.currentIndexChanged.connect(self._endpoint_changed)
+        self._provider_changed(self.provider_combo.currentText())
+        self.transcript = QtWidgets.QPlainTextEdit()
+        self.transcript.setReadOnly(True)
+        self.transcript.setPlaceholderText(
+            "Describe known chemical bonds or ask which information is missing. "
+            "The model must not infer chemistry from coordinates.")
+        row = QtWidgets.QHBoxLayout()
+        self.message_edit = QtWidgets.QLineEdit()
+        self.message_edit.setMaxLength(4000)
+        self.message_edit.setPlaceholderText("Your question or molecular connectivity instructions")
+        self.message_edit.returnPressed.connect(self._send)
+        self.send_btn = QtWidgets.QPushButton("Send")
+        self.send_btn.clicked.connect(self._send)
+        row.addWidget(self.message_edit, 1)
+        row.addWidget(self.send_btn)
+        self.online_sketch = ConnectionSketch(self.instances)
+        self.online_sketch.set_plan(self.connections, self.context.get("root"),
+                                    self.context.get("fixed_orientation"),
+                                    "Current settings (no proposal yet)")
+        chat = QtWidgets.QWidget()
+        chat_layout = QtWidgets.QVBoxLayout(chat)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+        chat_layout.addWidget(self.transcript, 1)
+        chat_layout.addLayout(row)
+        self.online_review = QtWidgets.QPlainTextEdit()
+        self.online_review.setReadOnly(True)
+        self.online_review.setMaximumHeight(110)
+        self.online_review.setPlaceholderText("A locally validated proposal appears here for review.")
+        chat_layout.addWidget(self.online_review)
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.addWidget(chat)
+        split.addWidget(self.online_sketch)
+        split.setSizes([550, 550])
+        layout.addWidget(split, 1)
+        self.online_approve = QtWidgets.QPushButton("Approve and apply reviewed proposal")
+        self.online_approve.setEnabled(False)
+        self.online_approve.clicked.connect(self._approve_online)
+        layout.addWidget(self.online_approve)
+        return widget
+
+    def _toggle_service_settings(self, shown):
+        self.settings_box.setVisible(shown)
+        self.settings_toggle.setArrowType(QtCore.Qt.DownArrow if shown else QtCore.Qt.RightArrow)
+
+    def _provider_changed(self, provider):
+        self.endpoint_edit.setText(PROVIDERS[provider])
+        self.auth_combo.setEnabled(provider != "Anthropic")
+        self.key_edit.clear()
+        self._consent_config = None
+
+    def _endpoint_changed(self, _value=None):
+        self.key_edit.clear()
+        self._consent_config = None
+
+    def _service_config(self):
+        return ServiceConfig(self.provider_combo.currentText(), self.endpoint_edit.text().strip(),
+                             self.model_edit.text().strip(), self.auth_combo.currentData())
+
+    def _load_settings(self):
+        provider = self.settings.value("provider", "OpenAI")
+        if provider not in PROVIDERS:
+            self.online_status.setText("Saved provider is unsupported. Configure the online service again.")
+            return
+        self.provider_combo.setCurrentText(provider)
+        self.endpoint_edit.setText(self.settings.value("endpoint", PROVIDERS[provider]))
+        self.model_edit.setText(self.settings.value("model", ""))
+        self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(
+            self.settings.value("auth_header", "Authorization"))))
+        self.settings_toggle.setChecked(not self.model_edit.text().strip())
+
+    def _save_settings(self):
+        config = self._service_config()
+        try:
+            config.validate()
+            if self.remember_key.isChecked():
+                save_api_key(config, self.key_edit.text())
+        except AssistantError as exc:
+            self._error(str(exc))
+            return
+        for key, value in (("provider", config.provider), ("endpoint", config.endpoint),
+                           ("model", config.model), ("auth_header", config.auth_header)):
+            self.settings.setValue(key, value)
+        self.settings.sync()
+        if self.settings.status() != QtCore.QSettings.NoError:
+            self._error("Could not save provider settings. Your key may already be stored in Credential Manager.")
+            return
+        self.online_status.setText(
+            "Configuration saved. Use Load saved key next time." if self.remember_key.isChecked()
+            else "Provider settings saved; the API key is for this session only.")
+
+    def _load_key(self):
+        try:
+            config = self._service_config()
+            config.validate()
+            key = read_api_key(config)
+        except AssistantError as exc:
+            self._error(str(exc))
+            return
+        self.key_edit.setText(key)
+        self.online_status.setText("Saved key loaded." if key else
+                                   "No saved key found for this service. Enter one or use the offline guide.")
+
+    def _forget_key(self):
+        try:
+            config = self._service_config()
+            config.validate()
+            delete_api_key(config)
+        except AssistantError as exc:
+            self._error(str(exc))
+            return
+        self.key_edit.clear()
+        self._consent_config = None
+        self.online_status.setText("Saved API key removed.")
+
+    def _send(self):
+        if self._worker is not None:
+            return
+        message = self.message_edit.text().strip()
+        if not message:
+            self._error("Enter a question or instruction before sending.")
+            return
+        config = self._service_config()
+        try:
+            config.validate()
+            if not self.key_edit.text().strip():
+                raise AssistantError("Enter an API key or click Load saved key; offline guidance needs no key.")
+        except AssistantError as exc:
+            self.settings_toggle.setChecked(True)
+            self._error(str(exc))
+            return
+        if self._consent_config != config:
+            answer = QtWidgets.QMessageBox.question(
+                self, "Send molecular information?",
+                f"Send to {config.endpoint} using model '{config.model}'?\n\n"
+                "This sends sugar names, labels, position indices, XYZ coordinates in Angstrom, "
+                "available carbons, connection/root/mode settings, and this conversation.\n\n"
+                "No images, local file paths, SMILES, or repository code are included automatically. "
+                "Do not type confidential information or credentials into chat. "
+                "Provider retention policies and charges apply.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+            if answer != QtWidgets.QMessageBox.Yes:
+                self.online_status.setText("Nothing sent. You can use the offline guide.")
+                return
+            self._consent_config = config
+        self._online_choices = None
+        self.online_approve.setEnabled(False)
+        self.online_review.clear()
+        self.online_sketch.set_plan(self.connections, self.context.get("root"),
+                                    self.context.get("fixed_orientation"),
+                                    "Current settings (waiting for proposal)")
+        self._history.append({"role": "user", "content": message})
+        self.transcript.appendPlainText("You: " + message)
+        self.message_edit.clear()
+        self.send_btn.setEnabled(False)
+        self.online_status.setText("Waiting for the service (up to 45 seconds). Offline guidance remains available.")
+        worker = _AdviceWorker(config, self.key_edit.text(), self.context, list(self._history))
+        worker.signals.finished.connect(self._on_reply)
+        self._worker = worker
+        QtCore.QThreadPool.globalInstance().start(worker)
+
+    def _on_reply(self, text, error):
+        self._worker = None
+        if self._closed:
+            return
+        self.send_btn.setEnabled(True)
+        if error:
+            self.online_status.setText(error)
+            self._error(error)
+            return
+        try:
+            message, choices = parse_reply(text, self.instances)
+        except AssistantError as exc:
+            self.online_status.setText(str(exc))
+            self.transcript.appendPlainText("Local validation: " + str(exc))
+            self._error(str(exc))
+            return
+        self._history.append({"role": "assistant", "content": text})
+        self.transcript.appendPlainText("Assistant: " + message)
+        self._online_choices = choices
+        if choices is not None:
+            self.online_review.setPlainText(self._summary(choices))
+            self.online_sketch.set_plan(choices.connections, choices.root, choices.fixed_orientation,
+                                        "Proposal - NOT applied until you approve")
+            self.online_approve.setEnabled(True)
+            self.online_status.setText("Proposal validated locally. Review every bond; nothing has been applied.")
+        else:
+            self.online_status.setText("Advice received. No settings changed.")
+
+    def _approve_online(self):
+        if self._online_choices is None:
+            self._error("No valid proposal is available to approve.")
+            return
+        try:
+            validate_choices(self.instances, self._online_choices)
+        except MISOExportError as exc:
+            self._error(str(exc))
+            return
+        self.result_choices = self._online_choices
+        self.accept()
+
+    def _error(self, message):
+        QtWidgets.QMessageBox.warning(self, "MISO assistant", message)

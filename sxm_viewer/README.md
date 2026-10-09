@@ -102,3 +102,52 @@ from a different working directory. Re-export after moving or rotating units.
 This first version generates YAML for sugars only. Amino-acid or lipid exports
 still save the existing CSV/image files, but explicitly warn that YAML was not
 generated. Any older YAML is left unchanged and must not be reused blindly.
+
+## Guided YAML assistant: offline or optional hosted LLM
+
+Click **Guide me / optional LLM assistant** after building sugars. The default
+**Offline guide** asks about the root, orientation mode, and each chemical
+connection in separate steps. Review the summary, click **Approve and apply**,
+then **Export CSV** to generate the YAML. It needs no internet, account, model
+download, or additional software. Closing without approval leaves settings unchanged.
+
+Both tabs show a live skeletal **connection plan** next to the questions. Each
+sugar label appears at its placed X/Y position, matching the STM image. Arrows
+run from donor to acceptor and show the carbons and α/β. The root is gold, and
+unconnected units are grey. Online proposals are drawn there only after local
+validation, and are marked as not applied until you approve them.
+
+For optional conversational guidance, use the **Online LLM** tab. An administrator
+can configure a provider once per computer:
+
+- **OpenAI** or **Anthropic**: use the preset request URL, your provider's model
+  identifier, and an API key with access to that model.
+- **Institution / OpenAI-compatible**: obtain the complete HTTPS request URL
+  (including `/chat/completions` and any required non-secret API-version query),
+  model identifier, and API key from your institution. Choose Bearer authentication
+  or the `api-key` header as specified by the administrator. Other protocols,
+  browser SSO, and arbitrary OAuth flows are not supported by this first version.
+- Click **Save configuration**. On Windows, **Remember API key** stores it in
+  Windows Credential Manager using the existing pywin32 dependency, never in
+  YAML, ordinary settings, or logs. Use **Load saved key** in later sessions.
+  **Remove saved key** deletes the saved credential. Uncheck Remember to use a
+  session-only key. On systems without Windows Credential Manager support, use
+  session-only keys; the offline guide remains available.
+
+Before the first **Send**, and whenever the service/model changes, a consent
+prompt names the destination. Online requests contain sugar names/labels,
+position indices, XYZ coordinates in Angstrom, available hydroxyl-bearing
+carbons, current connection/root/mode choices, and chat history. Images, local
+file paths, SMILES, and repository code are not included automatically. Do not
+paste confidential material or credentials into chat. Provider retention rules
+and charges apply. Only HTTPS endpoints are supported; redirects are refused
+so credentials cannot be forwarded to another destination.
+
+The model should ask about missing chemistry, not infer bonds from XYZ proximity.
+Its proposals are parsed into a restricted structure and validated by the same
+local MISO validator. Invalid or incomplete proposals cannot be applied. A valid
+proposal is displayed with readable unit labels and still requires your explicit
+approval; an LLM's plausible chemistry is not a substitute for scientific review.
+All YAML writing remains local. Service failures and malformed replies are
+reported explicitly, and the offline guide is always available. No real provider
+request is required to use the wizard.
