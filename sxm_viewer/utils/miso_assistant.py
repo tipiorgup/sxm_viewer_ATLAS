@@ -243,7 +243,7 @@ def save_api_key(config: ServiceConfig, key: str):
     try:
         win32cred.CredWrite({
             "Type": win32cred.CRED_TYPE_GENERIC, "TargetName": _credential_target(config),
-            "UserName": "SXMViewer", "CredentialBlob": key.encode("utf-16-le"),
+            "UserName": "SXMViewer", "CredentialBlob": key,
             "Persist": win32cred.CRED_PERSIST_LOCAL_MACHINE,
         }, 0)
     except pywintypes.error as exc:
