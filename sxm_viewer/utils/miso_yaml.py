@@ -49,13 +49,19 @@ class LipidAttachment:
 
 @dataclass(frozen=True)
 class LipidBond:
-    """One lipid chain as MISO needs it. Points are (x, y) in Angstrom on the image."""
+    """One lipid chain as MISO needs it. Points are (x, y) in Angstrom on the image.
+
+    ``start`` is the free tip of the chain and ``end`` is where the lipid is bonded
+    (to a sugar carbon or to another lipid chain). MISO grows the chain from the
+    bond toward the tip, so ``start`` becomes its ``direction`` and, for a branch,
+    ``end`` becomes its ``connection_blob``.
+    """
     label: str
     anchor: str
     sugar: int | None
     sugar_carbon: str | None
-    start: tuple | None        # branch point on the parent chain for a "lipid" anchor
-    end: tuple | None
+    start: tuple | None        # free tip of the chain (MISO direction)
+    end: tuple | None          # bond point; for a "lipid" anchor the blob on the parent chain
     mid: tuple | None
     carbons: int | None
     linkage: str
@@ -135,10 +141,12 @@ def validate_lipids(instances: list[dict], lipids, used_sites=()) -> None:
         if lipid.linkage not in LIPID_LINKAGES:
             raise MISOExportError(
                 f"{name}: choose ester, amide or ether. MISO has no 'none' linkage.")
-        for what, point in (("End", lipid.end), ("Start", lipid.start), ("Mid", lipid.mid)):
+        for what, point in (("Start", lipid.start), ("End", lipid.end), ("Mid", lipid.mid)):
             if point is None:
-                if what == "End":
-                    raise MISOExportError(f"{name} has no End point. Pick Start and End first.")
+                if what != "Mid":
+                    raise MISOExportError(
+                        f"{name} has no {what} point. Pick the Start (free tip) and the "
+                        "End (bond point) first.")
                 continue
             if not _point_ok(point):
                 raise MISOExportError(f"{name}: the {what} point is not a valid coordinate.")
@@ -412,9 +420,9 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
             entry = {"connection_anchor": lip.anchor}
             if lip.anchor == "sugar":
                 entry["connection"] = [molecule_ids[lip.sugar], lip.sugar_carbon]
-            elif lip.start is not None:
-                entry["connection_blob"] = xyz(lip.start)
-            entry["direction"] = xyz(lip.end)
+            else:
+                entry["connection_blob"] = xyz(lip.end)
+            entry["direction"] = xyz(lip.start)
             if lip.mid is not None:
                 entry["midpoint"] = xyz(lip.mid)
             if lip.carbons:

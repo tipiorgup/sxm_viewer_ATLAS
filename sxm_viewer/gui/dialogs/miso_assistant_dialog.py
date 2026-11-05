@@ -280,11 +280,12 @@ class ConnectionSketch(QtWidgets.QWidget):
     LIPID_COLOR = "#6d4c41"
 
     def _draw_lipids(self, painter, geometries, centres, to_widget):
-        """Each lipid as a brown line from its attachment through the bend to its End."""
+        """Each lipid as a brown arrow from its bond (sugar carbon or lipid chain) to its free tip."""
         color = QtGui.QColor(self.LIPID_COLOR)
         for row in self.lipids:
-            end = row.get("end_xy_angstrom")
-            if end is None:
+            tip = row.get("start_xy_angstrom")        # free tip of the chain
+            bond_point = row.get("end_xy_angstrom")   # where the lipid is bonded
+            if tip is None:
                 continue
             origin = None
             index = row.get("sugar")
@@ -292,17 +293,16 @@ class ConnectionSketch(QtWidgets.QWidget):
                     and 0 <= index < len(centres)):
                 origin = self._site_point(geometries, centres, to_widget, index,
                                           row.get("sugar_carbon"))
-            elif row.get("anchor") == "lipid" and row.get("start_xy_angstrom") is not None:
-                origin = to_widget(*row["start_xy_angstrom"])
-            attached = origin is not None
-            if origin is None and row.get("start_xy_angstrom") is not None:
-                origin = to_widget(*row["start_xy_angstrom"])
+            attached = origin is not None or (
+                row.get("anchor") == "lipid" and bond_point is not None)
+            if origin is None and bond_point is not None:
+                origin = to_widget(*bond_point)
             if origin is None:
                 continue
             points = [origin]
             if row.get("mid_xy_angstrom") is not None:
                 points.append(to_widget(*row["mid_xy_angstrom"]))
-            points.append(to_widget(*end))
+            points.append(to_widget(*tip))
             pen = QtGui.QPen(color if attached else QtGui.QColor("#a1887f"), 2.2)
             if not attached:
                 pen.setStyle(QtCore.Qt.DashLine)
@@ -731,10 +731,11 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         number = 4 + (1 if self.has_peptide else 0)
         text = QtWidgets.QLabel(
             f"{number}. Where is each lipid attached?\n\n"
-            "The lipids are the chains you drew on the image. MISO builds each one from a "
-            "sugar carbon (the head group sits about 3.5 A off that carbon and the chain "
-            "runs to the End point you picked), or as a branch off another lipid chain at "
-            "its Start point. Choose the linkage too: ester, amide or ether. A carbon can "
+            "The lipids are the chains you drew on the image. Each is a segment: the Start is "
+            "its FREE tip and the End is where it is BONDED. MISO builds the chain from the "
+            "bond toward the free tip. Attach it to a sugar carbon (the sugar lying next "
+            "to the End point), or as a branch off another lipid chain (the End point lies "
+            "on that chain). Choose the linkage too: ester, amide or ether. A carbon can "
             "carry only one bond or lipid. Do not choose by distance alone.")
         text.setWordWrap(True)
         form.addWidget(text)
@@ -1178,7 +1179,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.transcript.setReadOnly(True)
         self.transcript.setPlaceholderText(
             "Describe known chemical bonds or ask which information is missing. "
-            "The model must not infer chemistry from coordinates.")
+            "The model must not infer chemistry from coordinates. For lipids: the Start "
+            "is the free tip and the End is where the lipid is bonded.")
         row = QtWidgets.QHBoxLayout()
         self.message_edit = QtWidgets.QLineEdit()
         self.message_edit.setMaxLength(4000)

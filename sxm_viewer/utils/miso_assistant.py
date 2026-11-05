@@ -81,8 +81,13 @@ lipid chain (no sugar; the branch begins at that lipid's own start point). Every
 needs a linkage of ester, amide or ether, never "none"; ask the user which. A sugar
 carbon holds only ONE thing: a sugar bond, a peptide bond or a lipid. Branching lipids
 need at least one lipid attached to a sugar, and all sugar attached lipids on ONE sugar.
-Never decide where a lipid belongs from its position alone: you may suggest the nearest
-sugar, but the user must confirm sugar, carbon and linkage. In the proposal add, one
+Each lipid is a segment with two ends. "start_xy_angstrom" is its FREE tip and
+"end_xy_angstrom" is its BOND point, where it connects to the sugar or to another lipid
+chain; MISO grows the chain from the bond toward the tip. So the sugar you attach a lipid
+to should be the one that lies near its end point, and a branch ("anchor": "lipid") must
+have its end point on another lipid's chain. Never decide where a lipid belongs from its
+position alone: you may suggest a sugar, but the user must confirm sugar, carbon and
+linkage. In the proposal add, one
 entry per lipid row:
  "lipid_attachments": [{"lipid": 0, "anchor": "sugar", "sugar": 1,
                         "sugar_carbon": "C6", "linkage": "ester"}]

@@ -78,13 +78,33 @@ class LipidPickerMixin:
         self._lipid_last_build = 0.0
 
     # ------------------------------------------------------------------ UI
+    LIPID_HELP = (
+        "How to draw a lipid. A lipid is a segment with two ends.\n"
+        "Start: the FREE end of the chain (the tail tip).\n"
+        "End: where the lipid is BONDED, either to a sugar or to another lipid chain. "
+        "The connection happens at the End; MISO grows the chain from there toward the Start.\n"
+        "1. Press Add lipid and switch Pick points on.\n"
+        "2. Click the Start (free tip), then the End (bond point). One lipid at a time.\n"
+        "3. Drag the square ends to adjust. Drag the diamond to bend the chain; Straighten "
+        "removes the bend.\n"
+        "4. Under MISO attachment choose a sugar and its carbon (put the End next to that "
+        "sugar), or Branch off a lipid chain (put the End on that lipid's chain).\n"
+        "5. Choose ester, amide or ether. Carbons 0 means automatic.\n"
+        "A sugar carbon holds only one thing: a sugar bond, a peptide bond or a lipid. "
+        "Branches need at least one lipid attached to a sugar, all on one sugar.")
+
     def _build_lipid_group(self, parent_layout):
         self.lipid_group = QtWidgets.QGroupBox("Lipids")
         self.lipid_group.setVisible(False)
         lg = QtWidgets.QVBoxLayout(self.lipid_group)
+        self.lipid_help = QtWidgets.QLabel(self.LIPID_HELP)
+        self.lipid_help.setWordWrap(True)
+        self.lipid_help.setStyleSheet("color: #455a64;")
+        lg.addWidget(self.lipid_help)
         self.lipid_table = QtWidgets.QTableWidget(0, 6)
         self.lipid_table.setHorizontalHeaderLabels(
-            [f"Start ({ANGSTROM})", f"End ({ANGSTROM})", f"Mid ({ANGSTROM})",
+            [f"Start, free tip ({ANGSTROM})", f"End, bond point ({ANGSTROM})",
+             f"Mid ({ANGSTROM})",
              "Carbons (0=auto)", "Linkage", "Attached to"])
         lhdr = self.lipid_table.horizontalHeader()
         for c in range(3):
@@ -119,8 +139,8 @@ class LipidPickerMixin:
         lbtn.addStretch()
         lg.addLayout(lbtn)
         self.lipid_status = QtWidgets.QLabel(
-            "Add a lipid, switch Pick points on, click Start then End, "
-            "then drag the handles to adjust.")
+            "Add a lipid, switch Pick points on, click Start (free tip) then End "
+            "(bond point), then drag the handles to adjust.")
         self.lipid_status.setWordWrap(True)
         lg.addWidget(self.lipid_status)
 
@@ -235,7 +255,7 @@ class LipidPickerMixin:
 
     def _lipid_attach_text(self, lip):
         if lip.get("anchor") == "lipid":
-            return "branch (Start point)"
+            return "branch (at End point)"
         index, carbon = lip.get("sugar"), lip.get("carbon")
         instances = getattr(self, "_instances", [])
         if index is None or carbon is None or not 0 <= index < len(instances):
@@ -427,8 +447,8 @@ class LipidPickerMixin:
         lip = self._lipids[r] if 0 <= r < len(self._lipids) else None
         who = lip["label"] if lip is not None else "?"
         self._lipid_stage = self._lipid_stage_of(lip)
-        text = [f"{who}: click the Start point (head group end).",
-                f"{who}: click the End point (tail tip).",
+        text = [f"{who}: click the Start point, the FREE tip of the chain.",
+                f"{who}: click the End point, where the lipid is bonded to a sugar or a lipid.",
                 f"{who}: drag the square ends or the diamond handle to adjust the fit. "
                 "Dragging the diamond bends the chain; 'Straighten' removes the bend."][
                     self._lipid_stage]
@@ -589,8 +609,9 @@ class LipidPickerMixin:
                 self.lipid_status.setText(f"Lipid engine import failed: {exc}")
                 return
         L = self._lipid_engine
-        start = np.array([lip["start"][0], lip["start"][1], 0.0])
-        end = np.array([lip["end"][0], lip["end"][1], 0.0])
+        # The lipid is bonded at its End and grows toward its free Start, as in MISO.
+        start = np.array([lip["end"][0], lip["end"][1], 0.0])
+        end = np.array([lip["start"][0], lip["start"][1], 0.0])
         mid = np.array([lip["mid"][0], lip["mid"][1], 0.0]) if lip["mid"] else None
         linkage = lip.get("linkage", "none")
         n_carbons = lip.get("carbons")
@@ -682,11 +703,15 @@ class LipidPickerMixin:
                              color=color, ms=8 if is_sel else 6,
                              mec="white", mew=0.7, zorder=24)
                 artists.append(m)
-                if key == "start":
-                    t = ax.annotate(lip["label"], xy=(c, rw), xytext=(5, 5),
-                                    textcoords="offset points", color="#c8e6c9",
-                                    fontsize=8, zorder=25)
-                    artists.append(t)
+                if key in ("start", "end"):
+                    caption = lip["label"] if key == "start" else ""
+                    if is_sel:
+                        caption = f"{lip['label']} " + ("tip" if key == "start" else "bond")
+                    if caption:
+                        t = ax.annotate(caption, xy=(c, rw), xytext=(5, 5),
+                                        textcoords="offset points", color="#c8e6c9",
+                                        fontsize=8, zorder=25)
+                        artists.append(t)
             # built chain
             atoms = lip.get("atoms")
             if atoms is None or len(atoms) == 0:
