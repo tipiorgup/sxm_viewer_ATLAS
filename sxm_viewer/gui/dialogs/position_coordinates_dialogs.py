@@ -39,6 +39,10 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
     # The Type column is appended (logical 8) so the existing column numbers stay
     # valid; it is moved next to the coordinates visually.
     COL_TYPE = 8
+    SUPPORTS_PEPTIDE = True
+    CONNECTION_HINT = (
+        "Connect named sugars explicitly; branches are allowed. Rebuilding clears "
+        "connections, peptide bonds and root.")
     TYPE_SUGAR, TYPE_AA = "Sugar", "Amino acid"
 
     def __init__(self, viewer, parent=None):
@@ -910,7 +914,9 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 "Choose whether to keep or optimize the positioned orientations.")
         return build_miso_config(
             self._instances, self._connections, self.root_combo.currentData(),
-            mode, out_path, self._sxm_path, positions_csv=out_path)
+            mode, out_path, self._sxm_path, positions_csv=out_path,
+            peptide_bonds=self._peptide_bonds,
+            peptide_order=self._current_peptide_order() if self._residue_indices() else None)
 
     # ------------------------------------------------------------------ export
     def _browse_csv(self):
@@ -955,7 +961,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                      "Assign sugars to points and click Build monomers first.")
                     + "\n\nUse Export coordinates to save the points without a YAML.")
                 return
-        if with_yaml and not has_amino:
+        if with_yaml:
             try:
                 config = self._make_miso_config(out_path)
             except MISOExportError as exc:
@@ -1008,13 +1014,6 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             message += ("\n\nNote: monomer entries are not built (or changed since the last "
                         "build), so no orientations were saved. Click Build monomers "
                         "and export again to include them.")
-        if with_yaml and has_amino:
-            self.viewer.last_monomer_yaml = None
-            message += ("\n\nNo MISO YAML was generated: automatic YAML export supports "
-                        "sugars only, and amino acids are present. The orientations CSV "
-                        "lists each residue's C-alpha point (column Point). Any existing "
-                        "YAML at this path was left unchanged; do not reuse it without "
-                        "updating it.")
         if config is not None:
             self.viewer.last_monomer_yaml = str(yaml_path.resolve())
             message += (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"

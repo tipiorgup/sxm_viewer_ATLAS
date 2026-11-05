@@ -1028,6 +1028,8 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self._instances.clear()
         self.inst_list.clear()
         self._connections.clear()
+        self._peptide_bonds = []
+        self._peptide_order = None
         self.connection_table.setRowCount(0)
 
         # Default placement: image centre in Angstrom.
@@ -1429,13 +1431,32 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
             self._overlay_artists.append(sc)
 
     # ------------------------------------------------------------------ MISO connections
+    SUPPORTS_PEPTIDE = True
+    CONNECTION_HINT = (
+        "Connect named sugars explicitly; branches are allowed. Rebuilding clears "
+        "connections, peptide bonds and root.")
+
     def _assistant_blocker(self):
         if self._lookup_worker is not None:
             return "Wait for the sugar-name lookup to finish first."
         if self._lipids:
-            return ("This assistant currently supports sugars only; "
-                    "remove amino-acid units and lipid rows before using it.")
+            return ("This assistant supports sugars and amino acids only; "
+                    "remove lipid rows before using it.")
         return super()._assistant_blocker()
+
+    def _functional_point_indices(self):
+        """{amino acid unit index: circle index of its side-chain point}.
+
+        Same order as the positions CSV: one COM point per unit first, then the
+        side-chain points of the amino acids that have one.
+        """
+        mapping = {}
+        index = len(self._instances)
+        for i, inst in enumerate(self._instances):
+            if inst.get("kind") == "aa" and self._effective_func_pos(inst) is not None:
+                mapping[i] = index
+                index += 1
+        return mapping
 
     def _make_miso_config(self, out_path):
         mode = self.orientation_combo.currentData()
@@ -1443,7 +1464,10 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
             raise MISOExportError("Choose whether to keep or optimize the positioned orientations.")
         return build_miso_config(
             self._instances, self._connections, self.root_combo.currentData(),
-            mode, out_path, self._sxm_path, has_lipids=bool(self._lipids))
+            mode, out_path, self._sxm_path, has_lipids=bool(self._lipids),
+            peptide_bonds=self._peptide_bonds,
+            peptide_order=self._current_peptide_order() if self._residue_indices() else None,
+            functional_points=self._functional_point_indices())
 
     # ------------------------------------------------------------------ export
     def _browse_csv(self):
@@ -1479,8 +1503,7 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 self, "Nothing to export", "Build/place subunits or lipids first.")
             return
         out_path = self.csv_le.text().strip() or "monomers.csv"
-        unsupported = bool(self._lipids) or any(
-            inst["kind"] != "sugar" for inst in self._instances)
+        unsupported = bool(self._lipids)
         config = None
         if not unsupported:
             try:
@@ -1517,8 +1540,8 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self, "CSV exported; YAML not generated",
                 "Saved CSV/image companion files:\n  " + "\n  ".join(written)
-                + "\n\nAutomatic MISO YAML export currently supports sugars only. "
-                  "Amino acids or lipid rows are included, so no YAML was generated. "
+                + "\n\nAutomatic MISO YAML export supports sugars and amino acids only. "
+                  "Lipid rows are included, so no YAML was generated. "
                   "Any existing YAML at this path was left unchanged; do not reuse "
                   "it without updating its connectivity and position indices.")
             return
@@ -1526,7 +1549,7 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self.viewer.last_monomer_yaml = str(yaml_path.resolve())
         QtWidgets.QMessageBox.information(
             self, "Done",
-            f"Saved {len(self._instances)} sugar unit(s):\n  "
+            f"Saved {len(self._instances)} unit(s):\n  "
             + "\n  ".join(written)
             + f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
             + "\n\nPlease give the YAML a final inspection (units, root, linkages, "

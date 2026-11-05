@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 
 import math
@@ -12,7 +13,10 @@ from ...utils.miso_assistant import (
     rejection_note, request_advice, save_api_key, validate_choices,
 )
 from ...utils.miso_models import profile_for
-from ...utils.miso_yaml import MISOExportError, SugarConnection, linkage_carbons, validate_connections
+from ...utils.miso_yaml import (
+    GLYCOSYLATION_TYPES, AA_ONE_LETTER, MISOExportError, PeptideBond, SugarConnection,
+    default_peptide_order, is_amino_acid, linkage_carbons, validate_connections,
+)
 
 
 class _AdviceSignals(QtCore.QObject):
@@ -48,14 +52,17 @@ class ConnectionSketch(QtWidgets.QWidget):
         super().__init__(parent)
         self.instances = instances
         self.connections = []
+        self.peptide_bonds = []
         self.root = None
         self.fixed_orientation = None
         self.caption = ""
         self.setMinimumSize(420, 260)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
-    def set_plan(self, connections, root=None, fixed_orientation=None, caption=""):
+    def set_plan(self, connections, root=None, fixed_orientation=None, caption="",
+                 peptide_bonds=()):
         self.connections = list(connections)
+        self.peptide_bonds = list(peptide_bonds)
         self.root = root
         self.fixed_orientation = fixed_orientation
         self.caption = caption
@@ -135,9 +142,13 @@ class ConnectionSketch(QtWidgets.QWidget):
                    for inst in self.instances]
         valid = [link for link in self.connections
                  if 0 <= link.donor < len(centres) and 0 <= link.acceptor < len(centres)]
+        valid_peptide = [bond for bond in self.peptide_bonds
+                         if 0 <= bond.sugar < len(centres) and 0 <= bond.residue < len(centres)]
         linked = {i for link in valid for i in (link.donor, link.acceptor)}
+        linked |= {i for bond in valid_peptide for i in (bond.sugar, bond.residue)}
         used = {(link.donor, link.donor_carbon) for link in valid}
         used |= {(link.acceptor, link.acceptor_carbon) for link in valid}
+        used |= {(bond.sugar, bond.sugar_carbon) for bond in valid_peptide}
 
         label_tops = []
         for index, (inst, geo, centre) in enumerate(zip(self.instances, geometries, centres)):
@@ -180,6 +191,12 @@ class ConnectionSketch(QtWidgets.QWidget):
             label = (anomer if geometries[link.donor] and geometries[link.acceptor]
                      else f"{link.donor_carbon}\u2192{link.acceptor_carbon} {anomer}")
             self._draw_bond(painter, start, end, radius, label)
+        for bond in valid_peptide:
+            start = self._site_point(geometries, centres, to_widget, bond.sugar, bond.sugar_carbon)
+            end = centres[bond.residue]
+            radius = 11.0 if geometries[bond.sugar] is None else 5.0
+            anomer = {"alpha": "\u03b1", "beta": "\u03b2"}.get(bond.anomer, bond.anomer)
+            self._draw_bond(painter, start, end, radius, anomer, "#00897b")
 
         small = QtGui.QFont(painter.font())
         small.setPointSizeF(max(6.5, small.pointSizeF() - 1.5))
@@ -225,8 +242,9 @@ class ConnectionSketch(QtWidgets.QWidget):
         painter.setFont(font)
         painter.setPen(QtGui.QColor("#606060"))
         legend = ("Drawn as positioned (top view). C1, C2\u2026: carbons that can form a linkage. "
-                  "Arrows: donor \u2192 acceptor (\u03b1/\u03b2). Gold: root. Grey: not connected yet.")
-        painter.drawText(QtCore.QRectF(8, self.height() - 38, self.width() - 16, 34),
+                  "Arrows: donor \u2192 acceptor (\u03b1/\u03b2); green: sugar \u2192 amino acid. "
+                  "Gold: root. Grey: not connected yet.")
+        painter.drawText(QtCore.QRectF(8, self.height() - 56, self.width() - 16, 52),
                          QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter | QtCore.Qt.TextWordWrap, legend)
         painter.end()
 
@@ -238,7 +256,7 @@ class ConnectionSketch(QtWidgets.QWidget):
         return centres[index]
 
     @staticmethod
-    def _draw_bond(painter, start, end, radius, label):
+    def _draw_bond(painter, start, end, radius, label, color_name="#d97706"):
         dx, dy = end.x() - start.x(), end.y() - start.y()
         length = math.hypot(dx, dy)
         if length <= 2 * radius:
@@ -246,7 +264,7 @@ class ConnectionSketch(QtWidgets.QWidget):
         ux, uy = dx / length, dy / length
         tail = QtCore.QPointF(start.x() + ux * radius, start.y() + uy * radius)
         tip = QtCore.QPointF(end.x() - ux * radius, end.y() - uy * radius)
-        color = QtGui.QColor("#d97706")
+        color = QtGui.QColor(color_name)
         painter.setPen(QtGui.QPen(color, 2.5))
         painter.drawLine(tail, tip)
         size = 10.0
@@ -428,13 +446,19 @@ class ServiceSettingsPanel(QtWidgets.QWidget):
 class MISOAssistantDialog(QtWidgets.QDialog):
     """An offline question-by-question guide, with opt-in hosted proposals."""
 
-    def __init__(self, instances, connections, root, mode, parent=None):
+    def __init__(self, instances, connections, root, mode, parent=None,
+                 peptide_bonds=(), peptide_order=None):
         super().__init__(parent)
         self.setWindowTitle("MISO YAML assistant")
         self.resize(1100, 760)
         self.instances = deepcopy(instances)
         self.connections = list(connections)
-        self.context = molecular_context(self.instances, connections, root, mode)
+        self.peptide_bonds = list(peptide_bonds)
+        self.has_peptide = any(is_amino_acid(inst) for inst in self.instances)
+        self.peptide_order = (list(peptide_order) if peptide_order is not None
+                              else default_peptide_order(self.instances))
+        self.context = molecular_context(self.instances, connections, root, mode,
+                                         self.peptide_bonds, self.peptide_order)
         self.result_choices = None
         self._online_choices = None
         self._history = []
@@ -457,12 +481,139 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self._closed = True
         self.key_edit.clear()
 
-    def _unit_combo(self):
+    def _unit_combo(self, accept=None):
         combo = QtWidgets.QComboBox()
         combo.addItem("Choose a unit...", None)
         for index, inst in enumerate(self.instances):
-            combo.addItem(inst["label"], index)
+            if accept is None or accept(inst):
+                combo.addItem(inst["label"], index)
         return combo
+
+    @staticmethod
+    def _is_sugar_unit(inst):
+        return not is_amino_acid(inst)
+
+    def _build_peptide_page(self):
+        page = QtWidgets.QWidget()
+        form = QtWidgets.QVBoxLayout(page)
+        text = QtWidgets.QLabel(
+            "4. Which sugar is bonded to which amino acid?\n\n"
+            "MISO can attach a sugar to Asn (N-linked), Ser, Thr or Tyr (O-linked), "
+            "one sugar per residue. The sugar carbon is usually C1. Residues such as "
+            "Leu, Ile, Val, Ala or Gly are simply part of the chain and need no bond. "
+            "Then set the chain order, N-terminus first.")
+        text.setWordWrap(True)
+        form.addWidget(text)
+        fields = QtWidgets.QFormLayout()
+        self.pep_sugar_combo = self._unit_combo(self._is_sugar_unit)
+        self.pep_carbon = QtWidgets.QComboBox()
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.pep_sugar_combo, 1)
+        row.addWidget(self.pep_carbon)
+        fields.addRow("Sugar:", row)
+        self.pep_sugar_combo.currentIndexChanged.connect(self._refresh_peptide_carbons)
+        self.pep_residue_combo = self._unit_combo(
+            lambda inst: is_amino_acid(inst) and inst["name"] in GLYCOSYLATION_TYPES)
+        fields.addRow("Residue:", self.pep_residue_combo)
+        self.pep_anomer_combo = QtWidgets.QComboBox()
+        self.pep_anomer_combo.addItems(["Choose...", "alpha", "beta"])
+        fields.addRow("Anomer:", self.pep_anomer_combo)
+        form.addLayout(fields)
+        buttons = QtWidgets.QHBoxLayout()
+        add = QtWidgets.QPushButton("Add this peptide bond")
+        remove = QtWidgets.QPushButton("Remove selected peptide bond")
+        add.clicked.connect(self._add_peptide_bond)
+        remove.clicked.connect(self._remove_peptide_bond)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        form.addLayout(buttons)
+        self.pep_table = QtWidgets.QTableWidget(0, 4)
+        self.pep_table.setHorizontalHeaderLabels(["Sugar", "Carbon", "Residue", "Anomer"])
+        self.pep_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.pep_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.pep_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents)
+        form.addWidget(self.pep_table)
+        form.addWidget(QtWidgets.QLabel("Peptide chain order (N-terminus first):"))
+        order_row = QtWidgets.QHBoxLayout()
+        self.pep_order_list = QtWidgets.QListWidget()
+        order_row.addWidget(self.pep_order_list, 1)
+        order_buttons = QtWidgets.QVBoxLayout()
+        up, down = QtWidgets.QPushButton("Move up"), QtWidgets.QPushButton("Move down")
+        up.clicked.connect(lambda: self._move_residue(-1))
+        down.clicked.connect(lambda: self._move_residue(1))
+        order_buttons.addWidget(up)
+        order_buttons.addWidget(down)
+        order_buttons.addStretch()
+        order_row.addLayout(order_buttons)
+        form.addLayout(order_row)
+        self._show_peptide()
+        return page
+
+    def _refresh_peptide_carbons(self, _index=None):
+        self.pep_carbon.clear()
+        index = self.pep_sugar_combo.currentData()
+        if index is not None:
+            self.pep_carbon.addItems(linkage_carbons(self.instances[index]))
+
+    def _show_peptide(self):
+        self.pep_table.setRowCount(len(self.peptide_bonds))
+        for row, bond in enumerate(self.peptide_bonds):
+            values = (self.instances[bond.sugar]["label"], bond.sugar_carbon,
+                      self.instances[bond.residue]["label"], bond.anomer)
+            for column, value in enumerate(values):
+                self.pep_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+        for lst in self._order_lists():
+            lst.clear()
+            for number, index in enumerate(self.peptide_order, 1):
+                lst.addItem(f"{number}. {self.instances[index]['label']}")
+        self._refresh_offline_sketch()
+
+    def _add_peptide_bond(self):
+        sugar, residue = self.pep_sugar_combo.currentData(), self.pep_residue_combo.currentData()
+        if sugar is None or residue is None:
+            self._error("Choose both a sugar and a residue first.")
+            return
+        bond = PeptideBond(sugar, self.pep_carbon.currentText(), residue,
+                           self.pep_anomer_combo.currentText())
+        try:
+            validate_connections(self.instances, self.connections, self.peptide_bonds + [bond])
+        except MISOExportError as exc:
+            self._error(str(exc))
+            return
+        self.peptide_bonds.append(bond)
+        self._show_peptide()
+
+    def _remove_peptide_bond(self):
+        row = self.pep_table.currentRow()
+        if row >= 0:
+            self.peptide_bonds.pop(row)
+            self._show_peptide()
+
+    def _order_lists(self):
+        return [lst for lst in (getattr(self, "pep_order_list", None),
+                                getattr(self, "online_order_list", None)) if lst is not None]
+
+    def _move_residue(self, step, widget=None):
+        widget = widget or self.pep_order_list
+        row = widget.currentRow()
+        target = row + step
+        if row < 0 or not 0 <= target < len(self.peptide_order):
+            return
+        self.peptide_order[row], self.peptide_order[target] = (
+            self.peptide_order[target], self.peptide_order[row])
+        self._show_peptide()
+        for lst in self._order_lists():
+            lst.setCurrentRow(target)
+        self._order_changed()
+
+    def _order_changed(self):
+        """Keep the model's context and any proposal under review in step with the order."""
+        self.context["peptide_order"] = list(self.peptide_order)
+        choices = getattr(self, "_online_choices", None)
+        if choices is not None:
+            self._online_choices = replace(choices, peptide_order=list(self.peptide_order))
+            self.online_review.setPlainText(self._summary(self._online_choices))
 
     def _build_offline(self, root, mode):
         widget = QtWidgets.QWidget()
@@ -480,7 +631,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             "connections must lead toward it. Its position is not guessed.")
         text.setWordWrap(True)
         form.addWidget(text)
-        self.root_combo = self._unit_combo()
+        self.root_combo = self._unit_combo(self._is_sugar_unit)
         self.root_combo.setCurrentIndex(max(0, self.root_combo.findData(root)))
         form.addWidget(self.root_combo)
         form.addStretch()
@@ -515,7 +666,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         text.setWordWrap(True)
         form.addWidget(text)
         fields = QtWidgets.QFormLayout()
-        self.donor_combo, self.acceptor_combo = self._unit_combo(), self._unit_combo()
+        self.donor_combo = self._unit_combo(self._is_sugar_unit)
+        self.acceptor_combo = self._unit_combo(self._is_sugar_unit)
         self.donor_carbon, self.acceptor_carbon = QtWidgets.QComboBox(), QtWidgets.QComboBox()
         for label, unit, carbon in (
                 ("Donor:", self.donor_combo, self.donor_carbon),
@@ -544,12 +696,14 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.link_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         form.addWidget(self.link_table)
         self.pages.addWidget(third)
+        if self.has_peptide:
+            self.pages.addWidget(self._build_peptide_page())
         self._show_connections()
 
         fourth = QtWidgets.QWidget()
         form = QtWidgets.QVBoxLayout(fourth)
         form.addWidget(QtWidgets.QLabel(
-            "4. Review every chemical choice before applying. 'Export CSV + MISO input YAML' "
+            f"{5 if self.has_peptide else 4}. Review every chemical choice before applying. 'Export CSV + MISO input YAML' "
             "then writes the YAML; give it a final inspection before running MISO."))
         self.offline_review = QtWidgets.QPlainTextEdit()
         self.offline_review.setReadOnly(True)
@@ -600,7 +754,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
     def _refresh_offline_sketch(self, _index=None):
         if hasattr(self, "root_combo") and hasattr(self, "mode_combo"):
             self.offline_sketch.set_plan(self.connections, self.root_combo.currentData(),
-                                         self.mode_combo.currentData(), "Your plan")
+                                         self.mode_combo.currentData(), "Your plan",
+                                         self.peptide_bonds)
 
     def _add_connection(self):
         donor, acceptor = self.donor_combo.currentData(), self.acceptor_combo.currentData()
@@ -627,7 +782,9 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         root, mode = self.root_combo.currentData(), self.mode_combo.currentData()
         if root is None or mode is None:
             raise MISOExportError("Choose a root and an orientation mode explicitly.")
-        choices = AssistantChoices(root, mode, list(self.connections))
+        choices = AssistantChoices(
+            root, mode, list(self.connections), list(self.peptide_bonds),
+            list(self.peptide_order) if self.has_peptide else None)
         validate_choices(self.instances, choices)
         return choices
 
@@ -643,7 +800,19 @@ class MISOAssistantDialog(QtWidgets.QDialog):
                          f"{self.instances[link.acceptor]['label']} {link.acceptor_carbon} "
                          f"({link.anomer})")
         if not choices.connections:
-            lines.append("None (single sugar).")
+            lines.append("None (single sugar)." if not self.has_peptide else "None.")
+        if self.has_peptide:
+            order = (choices.peptide_order if choices.peptide_order is not None
+                     else default_peptide_order(self.instances))
+            lines.append("\nPeptide (N to C): " + "-".join(
+                AA_ONE_LETTER.get(self.instances[i]["name"], "?") for i in order)
+                + "  [" + ", ".join(self.instances[i]["label"] for i in order) + "]")
+            lines.append("\nSugar to amino acid bonds:")
+            for bond in choices.peptide_bonds:
+                residue = self.instances[bond.residue]
+                lines.append(f"{self.instances[bond.sugar]['label']} {bond.sugar_carbon} -> "
+                             f"{residue['label']} ({bond.anomer}, "
+                             f"{GLYCOSYLATION_TYPES.get(residue['name'], '?')})")
         return "\n".join(lines)
 
     def _next(self):
@@ -654,7 +823,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         if page == 1 and self.mode_combo.currentData() is None:
             self._error("Choose whether MISO should keep or optimize your rotations.")
             return
-        if page == 2:
+        review = self.pages.count() - 1
+        if page == review - 1:
             try:
                 self.offline_review.setPlainText(self._summary(self._offline_choices()))
             except MISOExportError as exc:
@@ -662,7 +832,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
                 return
         self.pages.setCurrentIndex(page + 1)
         self.back_btn.setEnabled(True)
-        self.next_btn.setEnabled(page + 1 < 3)
+        self.next_btn.setEnabled(page + 1 < review)
 
     def _back(self):
         self.pages.setCurrentIndex(max(0, self.pages.currentIndex() - 1))
@@ -712,7 +882,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.online_sketch = ConnectionSketch(self.instances)
         self.online_sketch.set_plan(self.connections, self.context.get("root"),
                                     self.context.get("fixed_orientation"),
-                                    "Current settings (no proposal yet)")
+                                    "Current settings (no proposal yet)",
+                                    self.peptide_bonds)
         chat = QtWidgets.QWidget()
         chat_layout = QtWidgets.QVBoxLayout(chat)
         chat_layout.setContentsMargins(0, 0, 0, 0)
@@ -723,6 +894,24 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.online_review.setMaximumHeight(110)
         self.online_review.setPlaceholderText("A locally validated proposal appears here for review.")
         chat_layout.addWidget(self.online_review)
+        if self.has_peptide:
+            chat_layout.addWidget(QtWidgets.QLabel(
+                "Peptide chain order (N-terminus first). Change it here at any time; "
+                "the model is told the new order and the proposal under review is updated:"))
+            order_row = QtWidgets.QHBoxLayout()
+            self.online_order_list = QtWidgets.QListWidget()
+            self.online_order_list.setMaximumHeight(90)
+            order_row.addWidget(self.online_order_list, 1)
+            order_buttons = QtWidgets.QVBoxLayout()
+            up, down = QtWidgets.QPushButton("Move up"), QtWidgets.QPushButton("Move down")
+            up.clicked.connect(lambda: self._move_residue(-1, self.online_order_list))
+            down.clicked.connect(lambda: self._move_residue(1, self.online_order_list))
+            order_buttons.addWidget(up)
+            order_buttons.addWidget(down)
+            order_buttons.addStretch()
+            order_row.addLayout(order_buttons)
+            chat_layout.addLayout(order_row)
+            self._show_peptide()
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         split.addWidget(chat)
         split.addWidget(self.online_sketch)
@@ -763,7 +952,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             answer = QtWidgets.QMessageBox.question(
                 self, "Send molecular information?",
                 f"Send to {config.endpoint} using model '{config.model}'?\n\n"
-                "This sends sugar names, labels, position indices, XYZ coordinates in Angstrom, "
+                "This sends sugar and amino acid names, labels, position indices, XYZ coordinates in Angstrom, "
                 "available carbons, connection/root/mode settings, and this conversation.\n\n"
                 "No images, local file paths, SMILES, or repository code are included automatically. "
                 "Do not type confidential information or credentials into chat. "
@@ -778,7 +967,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.online_review.clear()
         self.online_sketch.set_plan(self.connections, self.context.get("root"),
                                     self.context.get("fixed_orientation"),
-                                    "Current settings (waiting for proposal)")
+                                    "Current settings (waiting for proposal)",
+                                    self.peptide_bonds)
         # The model cannot see local validation: tell it what was rejected last time.
         content = self._pending_note + "\n\n" + message if self._pending_note else message
         self._pending_note = ""
@@ -814,11 +1004,16 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             return
         self._history.append({"role": "assistant", "content": text})
         self.transcript.appendPlainText("Assistant: " + message)
+        if choices is not None and self.has_peptide and choices.peptide_order is not None:
+            self.peptide_order = list(choices.peptide_order)
+            self._show_peptide()
+            self.context["peptide_order"] = list(self.peptide_order)
         self._online_choices = choices
         if choices is not None:
             self.online_review.setPlainText(self._summary(choices))
             self.online_sketch.set_plan(choices.connections, choices.root, choices.fixed_orientation,
-                                        "Proposal - NOT applied until you approve")
+                                        "Proposal - NOT applied until you approve",
+                                        choices.peptide_bonds)
             self.online_approve.setEnabled(True)
             self.online_status.setText("Proposal validated locally. Review every bond; nothing has been applied.")
         else:
@@ -828,12 +1023,15 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         if self._online_choices is None:
             self._error("No valid proposal is available to approve.")
             return
+        choices = self._online_choices
+        if self.has_peptide:
+            choices = replace(choices, peptide_order=list(self.peptide_order))
         try:
-            validate_choices(self.instances, self._online_choices)
+            validate_choices(self.instances, choices)
         except MISOExportError as exc:
             self._error(str(exc))
             return
-        self.result_choices = self._online_choices
+        self.result_choices = choices
         self.accept()
 
     def _error(self, message):

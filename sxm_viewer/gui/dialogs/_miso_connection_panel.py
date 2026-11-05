@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from ..._shared import QtCore, QtWidgets
 from ...utils.miso_yaml import (
-    MISOExportError, SugarConnection, linkage_carbons, validate_connections,
+    GLYCOSYLATION_TYPES, MISOExportError, PeptideBond, SugarConnection,
+    default_peptide_order, is_amino_acid, linkage_carbons, validate_connections,
 )
 
 
@@ -17,6 +18,12 @@ class MISOConnectionMixin:
     CONNECTION_HINT = (
         "Connect named units explicitly; branches are allowed. Rebuilding clears "
         "connections and root. YAML export supports sugars only.")
+    # Hosts that can export a peptide section set this to True; others stay sugar only.
+    SUPPORTS_PEPTIDE = False
+    PEPTIDE_HINT = (
+        "Join a sugar carbon to an amino acid (Asn, Ser, Thr or Tyr; one sugar per "
+        "residue). The chain runs in the order listed below; any residue can be part "
+        "of a long peptide.")
 
     def _build_connection_ui(self, layout):
         group = QtWidgets.QGroupBox("MISO YAML: sugar connections")
@@ -71,11 +78,157 @@ class MISOConnectionMixin:
         self.connection_table.setFixedHeight(110)
         box.addWidget(self.connection_table)
         layout.addWidget(group)
+        self._peptide_bonds = []
+        self._peptide_order = None
+        if self.SUPPORTS_PEPTIDE:
+            self._build_peptide_ui(box)
         self._refresh_connection_units()
         return group
 
+    def _build_peptide_ui(self, box):
+        title = QtWidgets.QLabel("<b>Sugar to amino acid bonds</b>")
+        box.addWidget(title)
+        hint = QtWidgets.QLabel(self.PEPTIDE_HINT)
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+        form = QtWidgets.QFormLayout()
+        self.pep_sugar_combo = QtWidgets.QComboBox()
+        self.pep_carbon_combo = QtWidgets.QComboBox()
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.pep_sugar_combo, 1)
+        row.addWidget(self.pep_carbon_combo)
+        form.addRow("Sugar:", row)
+        self.pep_residue_combo = QtWidgets.QComboBox()
+        form.addRow("Residue:", self.pep_residue_combo)
+        self.pep_anomer_combo = QtWidgets.QComboBox()
+        self.pep_anomer_combo.addItems(["Choose...", "alpha", "beta"])
+        form.addRow("Linkage anomer:", self.pep_anomer_combo)
+        box.addLayout(form)
+        self.pep_sugar_combo.currentIndexChanged.connect(self._refresh_peptide_carbons)
+        buttons = QtWidgets.QHBoxLayout()
+        add = QtWidgets.QPushButton("Add peptide bond")
+        add.clicked.connect(self._add_peptide_bond)
+        remove = QtWidgets.QPushButton("Remove selected peptide bond")
+        remove.clicked.connect(self._remove_peptide_bond)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        box.addLayout(buttons)
+        self.peptide_table = QtWidgets.QTableWidget(0, 4)
+        self.peptide_table.setHorizontalHeaderLabels(["Sugar", "Carbon", "Residue", "Anomer"])
+        self.peptide_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.peptide_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.peptide_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents)
+        self.peptide_table.setFixedHeight(90)
+        box.addWidget(self.peptide_table)
+        box.addWidget(QtWidgets.QLabel("Peptide chain order (N-terminus first):"))
+        order_row = QtWidgets.QHBoxLayout()
+        self.order_list = QtWidgets.QListWidget()
+        self.order_list.setFixedHeight(90)
+        order_row.addWidget(self.order_list, 1)
+        order_buttons = QtWidgets.QVBoxLayout()
+        up = QtWidgets.QPushButton("Move up")
+        down = QtWidgets.QPushButton("Move down")
+        up.clicked.connect(lambda: self._move_residue(-1))
+        down.clicked.connect(lambda: self._move_residue(1))
+        order_buttons.addWidget(up)
+        order_buttons.addWidget(down)
+        order_buttons.addStretch()
+        order_row.addLayout(order_buttons)
+        box.addLayout(order_row)
+
+    def _residue_indices(self):
+        return [i for i, inst in enumerate(self._instances) if is_amino_acid(inst)]
+
+    def _current_peptide_order(self):
+        """Chain order in use: the user's order, else ascending point index."""
+        if self._peptide_order is not None and set(self._peptide_order) == set(
+                self._residue_indices()):
+            return list(self._peptide_order)
+        return default_peptide_order(self._instances)
+
+    def _refresh_peptide_carbons(self, _index=None):
+        selected = self.pep_carbon_combo.currentText()
+        self.pep_carbon_combo.clear()
+        index = self.pep_sugar_combo.currentData()
+        if index is not None:
+            self.pep_carbon_combo.addItems(linkage_carbons(self._instances[index]))
+        if selected in [self.pep_carbon_combo.itemText(i)
+                        for i in range(self.pep_carbon_combo.count())]:
+            self.pep_carbon_combo.setCurrentText(selected)
+
+    def _refresh_peptide_ui(self):
+        blockers = [QtCore.QSignalBlocker(self.pep_sugar_combo),
+                    QtCore.QSignalBlocker(self.pep_residue_combo)]
+        self.pep_sugar_combo.clear()
+        self.pep_sugar_combo.addItem("Choose sugar...", None)
+        self.pep_residue_combo.clear()
+        self.pep_residue_combo.addItem("Choose residue...", None)
+        for index, inst in enumerate(self._instances):
+            if is_amino_acid(inst):
+                if inst["name"] in GLYCOSYLATION_TYPES:
+                    self.pep_residue_combo.addItem(inst["label"], index)
+            else:
+                self.pep_sugar_combo.addItem(inst["label"], index)
+        del blockers
+        self._refresh_peptide_carbons()
+        self._fill_peptide_table()
+        self._fill_order_list()
+
+    def _fill_peptide_table(self):
+        self.peptide_table.setRowCount(len(self._peptide_bonds))
+        for row, bond in enumerate(self._peptide_bonds):
+            values = (self._instances[bond.sugar]["label"], bond.sugar_carbon,
+                      self._instances[bond.residue]["label"], bond.anomer)
+            for column, value in enumerate(values):
+                self.peptide_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+
+    def _fill_order_list(self):
+        self.order_list.clear()
+        for number, index in enumerate(self._current_peptide_order(), 1):
+            item = QtWidgets.QListWidgetItem(f"{number}. {self._instances[index]['label']}")
+            item.setData(QtCore.Qt.UserRole, index)
+            self.order_list.addItem(item)
+
+    def _move_residue(self, step):
+        row = self.order_list.currentRow()
+        order = self._current_peptide_order()
+        target = row + step
+        if row < 0 or not 0 <= target < len(order):
+            return
+        order[row], order[target] = order[target], order[row]
+        self._peptide_order = order
+        self._fill_order_list()
+        self.order_list.setCurrentRow(target)
+
+    def _add_peptide_bond(self):
+        sugar = self.pep_sugar_combo.currentData()
+        residue = self.pep_residue_combo.currentData()
+        if sugar is None or residue is None:
+            QtWidgets.QMessageBox.warning(
+                self, "MISO peptide bond", "Choose both a sugar and a residue.")
+            return
+        bond = PeptideBond(sugar, self.pep_carbon_combo.currentText(), residue,
+                           self.pep_anomer_combo.currentText())
+        try:
+            validate_connections(self._instances, self._connections,
+                                 self._peptide_bonds + [bond])
+        except MISOExportError as exc:
+            QtWidgets.QMessageBox.warning(self, "MISO peptide bond", str(exc))
+            return
+        self._peptide_bonds.append(bond)
+        self._fill_peptide_table()
+
+    def _remove_peptide_bond(self):
+        row = self.peptide_table.currentRow()
+        if row >= 0:
+            self._peptide_bonds.pop(row)
+            self.peptide_table.removeRow(row)
+
     def _reset_connections(self):
         self._connections.clear()
+        self._peptide_bonds = []
+        self._peptide_order = None
         self.connection_table.setRowCount(0)
         self._refresh_connection_units()
 
@@ -93,6 +246,8 @@ class MISOConnectionMixin:
                     combo.addItem(inst["label"], index)
         del blockers
         self._refresh_linkage_carbons()
+        if self.SUPPORTS_PEPTIDE:
+            self._refresh_peptide_ui()
 
     def _refresh_linkage_carbons(self, _index=None):
         for unit, carbon in ((self.donor_combo, self.donor_carbon_combo),
@@ -116,7 +271,8 @@ class MISOConnectionMixin:
             donor, self.donor_carbon_combo.currentText(), acceptor,
             self.acceptor_carbon_combo.currentText(), self.link_anomer_combo.currentText())
         try:
-            validate_connections(self._instances, self._connections + [connection])
+            validate_connections(self._instances, self._connections + [connection],
+                                 self._peptide_bonds)
         except MISOExportError as exc:
             QtWidgets.QMessageBox.warning(self, "MISO connection", str(exc))
             return
@@ -139,6 +295,12 @@ class MISOConnectionMixin:
 
     def _assistant_blocker(self):
         """Message explaining why the assistant cannot open yet, or None."""
+        if self.SUPPORTS_PEPTIDE:
+            if not any(inst["kind"] == "sugar" for inst in self._instances):
+                return "Build at least one sugar unit first."
+            if any(inst["kind"] not in ("sugar", "aa") for inst in self._instances):
+                return "Remove lipid rows before using this assistant."
+            return None
         if not self._instances or any(inst["kind"] != "sugar" for inst in self._instances):
             return ("Build sugar units first. This assistant currently supports sugars only; "
                     "remove amino-acid units and lipid rows before using it.")
@@ -152,7 +314,9 @@ class MISOConnectionMixin:
         from .miso_assistant_dialog import MISOAssistantDialog
         dialog = MISOAssistantDialog(
             self._instances, self._connections, self.root_combo.currentData(),
-            self.orientation_combo.currentData(), parent=self)
+            self.orientation_combo.currentData(), parent=self,
+            peptide_bonds=self._peptide_bonds,
+            peptide_order=self._current_peptide_order() if self._residue_indices() else None)
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.result_choices is not None:
             self._apply_assistant_choices(dialog.result_choices)
 
@@ -164,6 +328,12 @@ class MISOConnectionMixin:
             QtWidgets.QMessageBox.warning(self, "MISO assistant", str(exc))
             return
         self._connections = list(choices.connections)
+        self._peptide_bonds = list(choices.peptide_bonds)
+        self._peptide_order = (list(choices.peptide_order)
+                               if choices.peptide_order is not None else None)
+        if self.SUPPORTS_PEPTIDE:
+            self._fill_peptide_table()
+            self._fill_order_list()
         self._fill_connection_table()
         self.root_combo.setCurrentIndex(self.root_combo.findData(choices.root))
         self.orientation_combo.setCurrentIndex(

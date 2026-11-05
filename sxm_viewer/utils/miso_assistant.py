@@ -1,7 +1,7 @@
 """Hosted advice is untrusted; only locally validated choices may be applied."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from http.client import HTTPException
 import hashlib
 import json
@@ -13,7 +13,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .miso_models import profile_for
 from .miso_yaml import (
-    MISOExportError, SugarConnection, build_miso_config, linkage_carbons,
+    GLYCOSYLATION_TYPES, MISOExportError, PeptideBond, SugarConnection, build_miso_config,
+    default_peptide_order, is_amino_acid, linkage_carbons,
 )
 
 
@@ -27,7 +28,7 @@ PROVIDERS = {
     "Institution / OpenAI-compatible": "",
 }
 
-SYSTEM_PROMPT = """You help a scientist configure a sugar-only MISO molecular assembly.
+SYSTEM_PROMPT = """You help a scientist configure a MISO molecular assembly of sugars and, optionally, amino acids (a glycopeptide).
 Ask one focused question at a time about missing chemical connectivity, root, or
 orientation settings. Explain terms simply. XYZ proximity DOES NOT establish chemical
 bonds: never invent or infer bonds from positions. Ask the user for unknown bonds,
@@ -38,7 +39,22 @@ take part in only ONE bond, so a branch point (a unit joined to several partners
 use a different carbon for each bond; never reuse a carbon, and branches are allowed.
 If a message starts with "LOCAL CHECK FAILED", the program rejected your previous
 proposal: explain the problem briefly, ask the user for what is missing, and do not say
-the configuration is valid until a proposal passes. Answer EVERY message, including
+the configuration is valid until a proposal passes.
+Units with "kind": "aa" are amino acid residues of ONE peptide; they have no sugar
+carbons. A sugar joins a residue through a peptide bond: the sugar carbon (usually the
+anomeric C1), the residue unit, and alpha/beta. Rules: MISO can glycosylate only Asn
+(N-linked), Ser, Thr and Tyr (O-linked), listed under "can_take_sugar"; Trp, Lys and
+every other residue cannot take a sugar yet. Each residue takes at most ONE sugar, and
+a sugar carbon is still used by only one bond (sugar-sugar or peptide). Residues of
+any other type (for example Leu, Ile, Val, Ala, Gly) are simply part of the chain and
+need no bond. The peptide can be long. "peptide_order" lists the residue units from the
+N-terminus to the C-terminus; its default is ascending point index. ALWAYS name the
+current chain order in your message (for example Leu.2, Asn.3, Gly.4) and ask the user
+to confirm it or give another order; never say the order is settled just because a
+default exists. When the user states an order, put it in "peptide_order". Never guess
+which residue carries a sugar: ask. The root is always a sugar. With optimized orientation all sugars
+must form one glycan joined by sugar-sugar bonds; separate glycans on several residues
+need "Keep positioned rotations". Answer EVERY message, including
 short ones such as "yes", with the full JSON object below; when the user confirms, put
 the complete proposal in the proposal field instead of only describing it. Never suggest code,
 file paths, commands, additional YAML fields, or upload images.
@@ -50,6 +66,9 @@ Only when the user has explicitly supplied all necessary choices, proposal may b
 {"root": 0, "fixed_orientation": true,
  "connections": [{"donor": 1, "donor_carbon": "C1",
                   "acceptor": 0, "acceptor_carbon": "C4", "anomer": "beta"}]}
+When amino acid units exist, add the two optional fields:
+ "peptide_bonds": [{"sugar": 0, "sugar_carbon": "C1", "residue": 3, "anomer": "beta"}],
+ "peptide_order": [2, 3, 4]   (or null for the default order)
 This is a COMPLETE proposed configuration, not a partial update. No automatic
 application occurs; the user must review and approve. Never choose anomer, root,
 mode or carbon on the user's behalf. For one unit, connections may be empty.
@@ -61,6 +80,9 @@ class AssistantChoices:
     root: int
     fixed_orientation: bool
     connections: list[SugarConnection]
+    peptide_bonds: list[PeptideBond] = field(default_factory=list)
+    # Amino acid unit indices from N- to C-terminus; None means ascending point index.
+    peptide_order: list[int] | None = None
 
 
 @dataclass(frozen=True)
@@ -89,24 +111,39 @@ class ServiceConfig:
 
 
 def molecular_context(instances: list[dict], connections: list[SugarConnection],
-                      root: int | None, mode: bool | None) -> dict:
+                      root: int | None, mode: bool | None,
+                      peptide_bonds=(), peptide_order=None) -> dict:
     """Explicit allowlist: no images, file paths, SMILES, keys, or geometry blobs."""
-    return {
-        "units": [{"index": i, "name": inst["name"], "label": inst["label"],
-                   "xyz_angstrom": [float(value) for value in inst["com"]],
-                   "available_carbons": linkage_carbons(inst)}
-                  for i, inst in enumerate(instances)],
+    units = []
+    for i, inst in enumerate(instances):
+        unit = {"index": i, "name": inst["name"], "label": inst["label"],
+                "xyz_angstrom": [float(value) for value in inst["com"]],
+                "available_carbons": linkage_carbons(inst)}
+        if is_amino_acid(inst):
+            unit["kind"] = "aa"
+            unit["can_take_sugar"] = inst["name"] in GLYCOSYLATION_TYPES
+        units.append(unit)
+    context = {
+        "units": units,
         "root": root, "fixed_orientation": mode,
         "connections": [asdict(link) for link in connections],
     }
+    if any(is_amino_acid(inst) for inst in instances):
+        context["peptide_bonds"] = [asdict(bond) for bond in peptide_bonds]
+        context["peptide_order"] = (list(peptide_order) if peptide_order is not None
+                                    else default_peptide_order(instances))
+    return context
 
 
 def validate_choices(instances: list[dict], choices: AssistantChoices):
     build_miso_config(instances, choices.connections, choices.root,
-                      choices.fixed_orientation, "monomers.csv")
+                      choices.fixed_orientation, "monomers.csv",
+                      peptide_bonds=choices.peptide_bonds,
+                      peptide_order=choices.peptide_order)
 
 
-_PROPOSAL_FIELDS = {"root", "fixed_orientation", "connections"}
+_REQUIRED_FIELDS = {"root", "fixed_orientation", "connections"}
+_PROPOSAL_FIELDS = _REQUIRED_FIELDS | {"peptide_bonds", "peptide_order"}
 _REJECTED_PLACEHOLDER = json.dumps(
     {"message": "(reply rejected by the program)", "proposal": None})
 
@@ -162,7 +199,7 @@ def parse_reply(text: str, instances: list[dict]) -> tuple[str, AssistantChoices
     except (ValueError, TypeError) as exc:
         raise AssistantError("The model did not return the required JSON format. Try again.") from exc
     # A bare proposal without the wrapper object is a common slip after "yes".
-    if isinstance(value, dict) and set(value) == _PROPOSAL_FIELDS:
+    if isinstance(value, dict) and _REQUIRED_FIELDS <= set(value) <= _PROPOSAL_FIELDS:
         value = {"message": "Proposed configuration. Review every bond before approving.",
                  "proposal": value}
     # Extra fields are ignored and a missing proposal means "no proposal".
@@ -175,8 +212,8 @@ def parse_reply(text: str, instances: list[dict]) -> tuple[str, AssistantChoices
     proposal = value.get("proposal")
     if proposal is None or proposal == {}:
         return message, None
-    if not isinstance(proposal, dict) or set(proposal) != {
-            "root", "fixed_orientation", "connections"}:
+    if (not isinstance(proposal, dict) or not _REQUIRED_FIELDS <= set(proposal)
+            or not set(proposal) <= _PROPOSAL_FIELDS):
         raise AssistantError("The proposed settings have an invalid format.")
     if type(proposal["root"]) is not int or type(proposal["fixed_orientation"]) is not bool:
         raise AssistantError("The proposed root or orientation mode has an invalid type.")
@@ -192,7 +229,26 @@ def parse_reply(text: str, instances: list[dict]) -> tuple[str, AssistantChoices
                     ("donor_carbon", "acceptor_carbon", "anomer"))):
             raise AssistantError("A proposed connection contains invalid types.")
         connections.append(SugarConnection(**link))
-    choices = AssistantChoices(proposal["root"], proposal["fixed_orientation"], connections)
+    bonds = []
+    bond_fields = {"sugar", "sugar_carbon", "residue", "anomer"}
+    raw_bonds = proposal.get("peptide_bonds")
+    if raw_bonds is None:
+        raw_bonds = []
+    if not isinstance(raw_bonds, list):
+        raise AssistantError("The proposed peptide bonds must be a list.")
+    for bond in raw_bonds:
+        if not isinstance(bond, dict) or set(bond) != bond_fields:
+            raise AssistantError("A proposed peptide bond has missing or unsupported fields.")
+        if (type(bond["sugar"]) is not int or type(bond["residue"]) is not int or
+                not isinstance(bond["sugar_carbon"], str) or not isinstance(bond["anomer"], str)):
+            raise AssistantError("A proposed peptide bond contains invalid types.")
+        bonds.append(PeptideBond(**bond))
+    order = proposal.get("peptide_order")
+    if order is not None and (not isinstance(order, list)
+                              or any(type(i) is not int for i in order)):
+        raise AssistantError("The proposed peptide order must be a list of unit numbers.")
+    choices = AssistantChoices(proposal["root"], proposal["fixed_orientation"], connections,
+                               bonds, order)
     try:
         validate_choices(instances, choices)
     except MISOExportError as exc:
@@ -208,7 +264,7 @@ def rejection_note(error: str) -> str:
     """
     return ("LOCAL CHECK FAILED: " + error.strip() +
             " Your previous reply was NOT applied. A carbon can be used by one bond only; "
-            "branches need different carbons.")
+            "branches need different carbons, and a residue takes one sugar.")
 
 
 def failed_reply_for_history(text: str) -> str:
