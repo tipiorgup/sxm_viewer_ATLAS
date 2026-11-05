@@ -8,9 +8,10 @@ import math
 from ..._shared import QtCore, QtGui, QtWidgets
 from ...utils.miso_assistant import (
     AssistantChoices, AssistantError, PROVIDERS, ServiceConfig, delete_api_key,
-    molecular_context, parse_reply, read_api_key, request_advice, save_api_key,
-    validate_choices,
+    failed_reply_for_history, molecular_context, parse_reply, read_api_key,
+    rejection_note, request_advice, save_api_key, validate_choices,
 )
+from ...utils.miso_models import profile_for
 from ...utils.miso_yaml import MISOExportError, SugarConnection, linkage_carbons, validate_connections
 
 
@@ -30,6 +31,10 @@ class _AdviceWorker(QtCore.QRunnable):
             reply = request_advice(self.config, self.key, self.context, self.history)
         except AssistantError as exc:
             self.signals.finished.emit("", str(exc))
+        except Exception as exc:  # never leave the dialog waiting or crash the thread
+            self.signals.finished.emit(
+                "", f"Unexpected error while contacting the service ({type(exc).__name__}). "
+                    "Try again, choose another model, or use the offline guide.")
         else:
             self.signals.finished.emit(reply, "")
         finally:
@@ -433,6 +438,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.result_choices = None
         self._online_choices = None
         self._history = []
+        self._pending_note = ""
         self._consent_config = None
         self._worker = None
         self._closed = False
@@ -773,11 +779,16 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.online_sketch.set_plan(self.connections, self.context.get("root"),
                                     self.context.get("fixed_orientation"),
                                     "Current settings (waiting for proposal)")
-        self._history.append({"role": "user", "content": message})
+        # The model cannot see local validation: tell it what was rejected last time.
+        content = self._pending_note + "\n\n" + message if self._pending_note else message
+        self._pending_note = ""
+        self._history.append({"role": "user", "content": content})
         self.transcript.appendPlainText("You: " + message)
         self.message_edit.clear()
         self.send_btn.setEnabled(False)
-        self.online_status.setText("Waiting for the service (up to 45 seconds). Offline guidance remains available.")
+        self.online_status.setText(
+            f"Waiting for the service (up to {profile_for(config.model).timeout} seconds). "
+            "Offline guidance remains available.")
         worker = _AdviceWorker(config, self.key_edit.text(), self.context, list(self._history))
         worker.signals.finished.connect(self._on_reply)
         self._worker = worker
@@ -797,6 +808,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         except AssistantError as exc:
             self.online_status.setText(str(exc))
             self.transcript.appendPlainText("Local validation: " + str(exc))
+            self._history.append({"role": "assistant", "content": failed_reply_for_history(text)})
+            self._pending_note = rejection_note(str(exc))
             self._error(str(exc))
             return
         self._history.append({"role": "assistant", "content": text})
