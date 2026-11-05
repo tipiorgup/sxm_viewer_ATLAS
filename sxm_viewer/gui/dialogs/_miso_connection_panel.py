@@ -232,7 +232,7 @@ class MISOConnectionMixin:
                            self.pep_anomer_combo.currentText())
         try:
             validate_connections(self._instances, self._connections,
-                                 self._peptide_bonds + [bond])
+                                 self._peptide_bonds + [bond], self._used_lipid_sites())
         except MISOExportError as exc:
             QtWidgets.QMessageBox.warning(self, "MISO peptide bond", str(exc))
             return
@@ -244,6 +244,11 @@ class MISOConnectionMixin:
         if row >= 0:
             self._peptide_bonds.pop(row)
             self.peptide_table.removeRow(row)
+
+    def _used_lipid_sites(self):
+        """Sugar carbons already holding a lipid (hosts without lipids return nothing)."""
+        sites = getattr(self, "_lipid_sites", None)
+        return sites() if sites is not None else set()
 
     def _reset_connections(self):
         self._connections.clear()
@@ -268,6 +273,9 @@ class MISOConnectionMixin:
         self._refresh_linkage_carbons()
         if self.SUPPORTS_PEPTIDE:
             self._refresh_peptide_ui()
+        refresh_lipids = getattr(self, "_refresh_lipid_attach_ui", None)
+        if refresh_lipids is not None and hasattr(self, "lipid_attach_sugar"):
+            refresh_lipids()
 
     def _refresh_linkage_carbons(self, _index=None):
         for unit, carbon in ((self.donor_combo, self.donor_carbon_combo),
@@ -292,7 +300,7 @@ class MISOConnectionMixin:
             self.acceptor_carbon_combo.currentText(), self.link_anomer_combo.currentText())
         try:
             validate_connections(self._instances, self._connections + [connection],
-                                 self._peptide_bonds)
+                                 self._peptide_bonds, self._used_lipid_sites())
         except MISOExportError as exc:
             QtWidgets.QMessageBox.warning(self, "MISO connection", str(exc))
             return
@@ -321,7 +329,8 @@ class MISOConnectionMixin:
                 return "Build at least one sugar unit first."
             if any(inst["kind"] not in ("sugar", "aa") for inst in self._instances):
                 return "Remove lipid rows before using this assistant."
-            return None
+            lipid_blocker = getattr(self, "_lipid_assistant_blocker", None)
+            return lipid_blocker() if lipid_blocker is not None else None
         if not self._instances or any(inst["kind"] != "sugar" for inst in self._instances):
             return ("Build sugar units first. This assistant currently supports sugars only; "
                     "remove amino-acid units and lipid rows before using it.")
@@ -337,18 +346,22 @@ class MISOConnectionMixin:
             self._instances, self._connections, self.root_combo.currentData(),
             self.orientation_combo.currentData(), parent=self,
             peptide_bonds=self._peptide_bonds,
-            peptide_order=self._current_peptide_order() if self._residue_indices() else None)
+            peptide_order=self._current_peptide_order() if self._residue_indices() else None,
+            lipid_rows=self._lipid_context() if hasattr(self, "_lipid_context") else ())
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.result_choices is not None:
             self._apply_assistant_choices(dialog.result_choices)
 
     def _apply_assistant_choices(self, choices):
         from ...utils.miso_assistant import validate_choices
         try:
-            validate_choices(self._instances, choices)
+            validate_choices(self._instances, choices,
+                             self._lipid_context() if hasattr(self, "_lipid_context") else ())
         except MISOExportError as exc:
             QtWidgets.QMessageBox.warning(self, "MISO assistant", str(exc))
             return
         self._connections = list(choices.connections)
+        if choices.lipid_attachments and hasattr(self, "_apply_lipid_attachments"):
+            self._apply_lipid_attachments(choices.lipid_attachments)
         self._peptide_bonds = list(choices.peptide_bonds)
         self._peptide_order = (list(choices.peptide_order)
                                if choices.peptide_order is not None else None)

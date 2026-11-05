@@ -911,9 +911,6 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
             return "Wait for the sugar-name lookup to finish first."
         if self._instances and not self._sugars_current():
             return "Sugar entries changed since the last build; click Build monomers again."
-        if self._lipids:
-            return ("This assistant supports sugars and amino acids only; "
-                    "remove lipid rows before using it.")
         return super()._assistant_blocker()
 
     def _make_miso_config(self, out_path):
@@ -924,7 +921,7 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
         return build_miso_config(
             self._instances, self._connections, self.root_combo.currentData(),
             mode, out_path, self._sxm_path, positions_csv=out_path,
-            has_lipids=bool(self._lipids),
+            has_lipids=bool(self._lipids), lipids=self._lipid_bonds(),
             peptide_bonds=self._peptide_bonds,
             peptide_order=self._current_peptide_order() if self._residue_indices() else None)
 
@@ -964,9 +961,6 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
         has_amino = use_sugars and any(inst["kind"] == "aa" for inst in self._instances)
         config = None
         export_errors = (OSError,)
-        lipid_blocks_yaml = with_yaml and bool(self._lipids)
-        if lipid_blocks_yaml:
-            with_yaml = False
         if with_yaml:
             if not use_sugars:
                 QtWidgets.QMessageBox.warning(
@@ -1033,11 +1027,8 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
                         "and export again to include them.")
         if lipid_files:
             message += "\n\nLipids:\n  " + "\n  ".join(Path(p).name for p in lipid_files)
-        if lipid_blocks_yaml:
-            message += ("\n\nNo MISO YAML was generated: automatic YAML export supports "
-                        "sugars and amino acids only and lipid rows are present. Any existing "
-                        "YAML at this path was left unchanged.")
         if config is not None:
+            message += self._lipid_yaml_note()
             self.viewer.last_monomer_yaml = str(yaml_path.resolve())
             message += (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
                         "\n\nPlease give the YAML a final inspection (units, root, "

@@ -13,8 +13,9 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .miso_models import profile_for
 from .miso_yaml import (
-    GLYCOSYLATION_TYPES, MISOExportError, PeptideBond, SugarConnection, build_miso_config,
-    default_peptide_order, is_amino_acid, linkage_carbons,
+    GLYCOSYLATION_TYPES, LIPID_LINKAGES, LipidAttachment, LipidBond, MISOExportError,
+    PeptideBond, SugarConnection, build_miso_config, default_peptide_order, is_amino_acid,
+    is_sugar, lipid_carbons, linkage_carbons,
 )
 
 
@@ -72,6 +73,21 @@ When amino acid units exist, add the two optional fields:
 This is a COMPLETE proposed configuration, not a partial update. No automatic
 application occurs; the user must review and approve. Never choose anomer, root,
 mode or carbon on the user's behalf. For one unit, connections may be empty.
+LIPIDS. When the context has "lipids", they are chains the user already drew on the
+image; you cannot add, move or delete them, you only say how each one is attached.
+MISO builds a lipid from a sugar carbon: anchor "sugar" with the sugar unit index and
+a carbon from that unit's "lipid_carbons", or anchor "lipid" for a branch off an existing
+lipid chain (no sugar; the branch begins at that lipid's own start point). Every lipid
+needs a linkage of ester, amide or ether, never "none"; ask the user which. A sugar
+carbon holds only ONE thing: a sugar bond, a peptide bond or a lipid. Branching lipids
+need at least one lipid attached to a sugar, and all sugar attached lipids on ONE sugar.
+Never decide where a lipid belongs from its position alone: you may suggest the nearest
+sugar, but the user must confirm sugar, carbon and linkage. In the proposal add, one
+entry per lipid row:
+ "lipid_attachments": [{"lipid": 0, "anchor": "sugar", "sugar": 1,
+                        "sugar_carbon": "C6", "linkage": "ester"}]
+(for anchor "lipid" omit "sugar" and "sugar_carbon"; "linkage" may be omitted to keep
+the row's current one).
 Return JSON only, without Markdown fences."""
 
 
@@ -83,6 +99,8 @@ class AssistantChoices:
     peptide_bonds: list[PeptideBond] = field(default_factory=list)
     # Amino acid unit indices from N- to C-terminus; None means ascending point index.
     peptide_order: list[int] | None = None
+    # How each lipid row joins the assembly; empty when there are no lipid rows.
+    lipid_attachments: list[LipidAttachment] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -112,7 +130,7 @@ class ServiceConfig:
 
 def molecular_context(instances: list[dict], connections: list[SugarConnection],
                       root: int | None, mode: bool | None,
-                      peptide_bonds=(), peptide_order=None) -> dict:
+                      peptide_bonds=(), peptide_order=None, lipid_rows=()) -> dict:
     """Explicit allowlist: no images, file paths, SMILES, keys, or geometry blobs."""
     units = []
     for i, inst in enumerate(instances):
@@ -122,6 +140,8 @@ def molecular_context(instances: list[dict], connections: list[SugarConnection],
         if is_amino_acid(inst):
             unit["kind"] = "aa"
             unit["can_take_sugar"] = inst["name"] in GLYCOSYLATION_TYPES
+        elif lipid_rows and is_sugar(inst):
+            unit["lipid_carbons"] = lipid_carbons(inst)
         units.append(unit)
     context = {
         "units": units,
@@ -132,18 +152,58 @@ def molecular_context(instances: list[dict], connections: list[SugarConnection],
         context["peptide_bonds"] = [asdict(bond) for bond in peptide_bonds]
         context["peptide_order"] = (list(peptide_order) if peptide_order is not None
                                     else default_peptide_order(instances))
+    if lipid_rows:
+        context["lipids"] = [dict(row) for row in lipid_rows]
     return context
 
 
-def validate_choices(instances: list[dict], choices: AssistantChoices):
+def lipids_for(lipid_rows, attachments) -> list[LipidBond]:
+    """LipidBond list from the drawn lipid rows plus the proposed attachments.
+
+    ``lipid_rows`` are the allowlisted rows of ``molecular_context`` (with the
+    ``mid_xy_angstrom`` and current attachment). A lipid without an entry in
+    ``attachments`` keeps the attachment it already has.
+    """
+    lipid_rows = list(lipid_rows)
+    by_row = {}
+    for att in attachments:
+        if type(att.lipid) is not int or not 0 <= att.lipid < len(lipid_rows):
+            raise MISOExportError(f"The proposal names lipid {att.lipid}, which does not exist.")
+        if att.lipid in by_row:
+            raise MISOExportError(f"Lipid {att.lipid} appears twice in the attachments.")
+        by_row[att.lipid] = att
+    bonds = []
+    for number, row in enumerate(lipid_rows):
+        att = by_row.get(number)
+        if att is not None:
+            anchor, sugar, carbon = att.anchor, att.sugar, att.sugar_carbon
+            linkage = att.linkage or row.get("linkage")
+        else:
+            anchor, sugar, carbon = row.get("anchor", "sugar"), row.get("sugar"), row.get("sugar_carbon")
+            linkage = row.get("linkage")
+        bonds.append(LipidBond(
+            label=row.get("label", f"L{number + 1}"), anchor=anchor,
+            sugar=sugar, sugar_carbon=carbon,
+            start=_pair(row.get("start_xy_angstrom")), end=_pair(row.get("end_xy_angstrom")),
+            mid=_pair(row.get("mid_xy_angstrom")), carbons=row.get("carbons") or None,
+            linkage=linkage))
+    return bonds
+
+
+def _pair(value):
+    return None if value is None else tuple(value)
+
+
+def validate_choices(instances: list[dict], choices: AssistantChoices, lipid_rows=()):
     build_miso_config(instances, choices.connections, choices.root,
                       choices.fixed_orientation, "monomers.csv",
                       peptide_bonds=choices.peptide_bonds,
-                      peptide_order=choices.peptide_order)
+                      peptide_order=choices.peptide_order,
+                      lipids=lipids_for(lipid_rows, choices.lipid_attachments))
 
 
 _REQUIRED_FIELDS = {"root", "fixed_orientation", "connections"}
-_PROPOSAL_FIELDS = _REQUIRED_FIELDS | {"peptide_bonds", "peptide_order"}
+_PROPOSAL_FIELDS = _REQUIRED_FIELDS | {"peptide_bonds", "peptide_order", "lipid_attachments"}
 _REJECTED_PLACEHOLDER = json.dumps(
     {"message": "(reply rejected by the program)", "proposal": None})
 
@@ -193,7 +253,8 @@ def clean_reply(text: str) -> str:
     return cleaned
 
 
-def parse_reply(text: str, instances: list[dict]) -> tuple[str, AssistantChoices | None]:
+def parse_reply(text: str, instances: list[dict],
+                lipid_rows=()) -> tuple[str, AssistantChoices | None]:
     try:
         value = json.loads(clean_reply(text))
     except (ValueError, TypeError) as exc:
@@ -247,10 +308,32 @@ def parse_reply(text: str, instances: list[dict]) -> tuple[str, AssistantChoices
     if order is not None and (not isinstance(order, list)
                               or any(type(i) is not int for i in order)):
         raise AssistantError("The proposed peptide order must be a list of unit numbers.")
+    attachments = []
+    raw_lipids = proposal.get("lipid_attachments")
+    if raw_lipids is None:
+        raw_lipids = []
+    if not isinstance(raw_lipids, list):
+        raise AssistantError("The proposed lipid attachments must be a list.")
+    required_lipid = {"lipid", "anchor"}
+    allowed_lipid = required_lipid | {"sugar", "sugar_carbon", "linkage"}
+    for entry in raw_lipids:
+        if (not isinstance(entry, dict) or not required_lipid <= set(entry)
+                or not set(entry) <= allowed_lipid):
+            raise AssistantError("A proposed lipid attachment has missing or unsupported fields.")
+        sugar, carbon, linkage = (entry.get("sugar"), entry.get("sugar_carbon"),
+                                  entry.get("linkage"))
+        if (type(entry["lipid"]) is not int or entry["anchor"] not in ("sugar", "lipid")
+                or (sugar is not None and type(sugar) is not int)
+                or (carbon is not None and not isinstance(carbon, str))
+                or (linkage is not None and linkage not in LIPID_LINKAGES)):
+            raise AssistantError("A proposed lipid attachment contains invalid values.")
+        attachments.append(LipidAttachment(entry["lipid"], entry["anchor"], sugar, carbon, linkage))
+    if attachments and not lipid_rows:
+        raise AssistantError("The proposal attaches lipids, but there are no lipid rows.")
     choices = AssistantChoices(proposal["root"], proposal["fixed_orientation"], connections,
-                               bonds, order)
+                               bonds, order, attachments)
     try:
-        validate_choices(instances, choices)
+        validate_choices(instances, choices, lipid_rows)
     except MISOExportError as exc:
         raise AssistantError(f"The model's proposal failed local validation: {exc}") from exc
     return message, choices
@@ -264,7 +347,8 @@ def rejection_note(error: str) -> str:
     """
     return ("LOCAL CHECK FAILED: " + error.strip() +
             " Your previous reply was NOT applied. A carbon can be used by one bond only; "
-            "branches need different carbons, and a residue takes one sugar.")
+            "branches need different carbons, and a residue takes one sugar. A lipid needs "
+            "ester, amide or ether and an attachment to a sugar carbon or a lipid branch.")
 
 
 def failed_reply_for_history(text: str) -> str:

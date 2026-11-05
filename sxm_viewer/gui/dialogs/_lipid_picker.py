@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from sxm_viewer._shared import QtCore, QtWidgets
+from sxm_viewer.utils.miso_yaml import LipidBond, is_sugar, lipid_carbons
 
 # Colors used for built atoms (kept local so the module has no host dependency).
 LIPID_ATOM_COLORS = {"C": "#9e9e9e", "O": "#e53935", "N": "#1e88e5", "H": "#eeeeee"}
@@ -81,14 +82,14 @@ class LipidPickerMixin:
         self.lipid_group = QtWidgets.QGroupBox("Lipids")
         self.lipid_group.setVisible(False)
         lg = QtWidgets.QVBoxLayout(self.lipid_group)
-        self.lipid_table = QtWidgets.QTableWidget(0, 5)
+        self.lipid_table = QtWidgets.QTableWidget(0, 6)
         self.lipid_table.setHorizontalHeaderLabels(
             [f"Start ({ANGSTROM})", f"End ({ANGSTROM})", f"Mid ({ANGSTROM})",
-             "Carbons (0=auto)", "Linkage"])
+             "Carbons (0=auto)", "Linkage", "Attached to"])
         lhdr = self.lipid_table.horizontalHeader()
         for c in range(3):
             lhdr.setSectionResizeMode(c, QtWidgets.QHeaderView.Stretch)
-        for c in (3, 4):
+        for c in (3, 4, 5):
             lhdr.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
         self.lipid_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.lipid_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -122,6 +123,27 @@ class LipidPickerMixin:
             "then drag the handles to adjust.")
         self.lipid_status.setWordWrap(True)
         lg.addWidget(self.lipid_status)
+
+        # How the selected lipid joins the assembly in the MISO YAML.
+        attach = QtWidgets.QHBoxLayout()
+        attach.addWidget(QtWidgets.QLabel("MISO attachment:"))
+        self.lipid_anchor_combo = QtWidgets.QComboBox()
+        self.lipid_anchor_combo.addItem("Sugar carbon", "sugar")
+        self.lipid_anchor_combo.addItem("Branch off a lipid chain", "lipid")
+        self.lipid_anchor_combo.setToolTip(
+            "A lipid starts at a sugar carbon, or branches from the chain of another "
+            "lipid at its Start point (MISO connection_anchor).")
+        self.lipid_attach_sugar = QtWidgets.QComboBox()
+        self.lipid_attach_carbon = QtWidgets.QComboBox()
+        for widget in (self.lipid_anchor_combo, self.lipid_attach_sugar,
+                       self.lipid_attach_carbon):
+            attach.addWidget(widget)
+        attach.addStretch()
+        lg.addLayout(attach)
+        self.lipid_anchor_combo.currentIndexChanged.connect(self._on_lipid_attach_changed)
+        self.lipid_attach_sugar.currentIndexChanged.connect(self._on_lipid_attach_sugar_changed)
+        self.lipid_attach_carbon.currentIndexChanged.connect(self._on_lipid_attach_changed)
+        self._refresh_lipid_attach_ui()
         parent_layout.addWidget(self.lipid_group)
 
     # ------------------------------------------------------------------ rows
@@ -149,8 +171,12 @@ class LipidPickerMixin:
         self._lipids.append({
             "label": f"L{r+1}", "start": None, "end": None, "mid": None,
             "carbons": None, "linkage": "none",
+            "anchor": "sugar", "sugar": None, "carbon": None,
             "atoms": None, "atom_types": None, "bonds": None,
         })
+        it = QtWidgets.QTableWidgetItem(DASH)
+        it.setTextAlignment(QtCore.Qt.AlignCenter)
+        self.lipid_table.setItem(r, 5, it)
         self.lipid_table.setCurrentCell(r, 0)
 
     def _remove_lipid_row(self):
@@ -166,6 +192,7 @@ class LipidPickerMixin:
 
     def _on_lipid_selected(self, row):
         self._lipid_drag = None
+        self._sync_lipid_attach_combos()
         if self.lipid_pick_btn.isChecked():
             self._update_lipid_status()
         self._lipid_redraw()
@@ -200,6 +227,168 @@ class LipidPickerMixin:
     def _selected_lipid(self):
         r = self.lipid_table.currentRow()
         return self._lipids[r] if 0 <= r < len(self._lipids) else None
+
+    # ------------------------------------------------------------------ MISO attachment
+    def _lipid_sugar_units(self):
+        return [(i, inst) for i, inst in enumerate(getattr(self, "_instances", []))
+                if is_sugar(inst)]
+
+    def _lipid_attach_text(self, lip):
+        if lip.get("anchor") == "lipid":
+            return "branch (Start point)"
+        index, carbon = lip.get("sugar"), lip.get("carbon")
+        instances = getattr(self, "_instances", [])
+        if index is None or carbon is None or not 0 <= index < len(instances):
+            return DASH
+        return f"{instances[index]['label']} {carbon}"
+
+    def _update_lipid_attach_cell(self, row):
+        item = self.lipid_table.item(row, 5)
+        if item is not None and 0 <= row < len(self._lipids):
+            item.setText(self._lipid_attach_text(self._lipids[row]))
+
+    def _refresh_lipid_attach_ui(self):
+        """Refill the sugar list after units change and drop attachments that no longer fit."""
+        instances = getattr(self, "_instances", [])
+        for row, lip in enumerate(self._lipids):
+            index = lip.get("sugar")
+            if lip.get("anchor", "sugar") == "sugar" and index is not None:
+                ok = (0 <= index < len(instances) and is_sugar(instances[index])
+                      and lip.get("carbon") in lipid_carbons(instances[index]))
+                if not ok:
+                    lip["sugar"] = lip["carbon"] = None
+            self._update_lipid_attach_cell(row)
+        blockers = [QtCore.QSignalBlocker(self.lipid_attach_sugar)]
+        self.lipid_attach_sugar.clear()
+        self.lipid_attach_sugar.addItem("Choose sugar...", None)
+        for index, inst in self._lipid_sugar_units():
+            self.lipid_attach_sugar.addItem(inst["label"], index)
+        del blockers
+        self._sync_lipid_attach_combos()
+
+    def _fill_lipid_attach_carbons(self):
+        index = self.lipid_attach_sugar.currentData()
+        blocker = QtCore.QSignalBlocker(self.lipid_attach_carbon)
+        self.lipid_attach_carbon.clear()
+        if index is not None and 0 <= index < len(self._instances):
+            self.lipid_attach_carbon.addItems(lipid_carbons(self._instances[index]))
+        del blocker
+
+    def _sync_lipid_attach_combos(self):
+        """Show the selected lipid's attachment in the three controls."""
+        lip = self._selected_lipid()
+        blockers = [QtCore.QSignalBlocker(w) for w in
+                    (self.lipid_anchor_combo, self.lipid_attach_sugar, self.lipid_attach_carbon)]
+        enabled = lip is not None
+        self.lipid_anchor_combo.setEnabled(enabled)
+        if lip is None:
+            self.lipid_attach_sugar.setCurrentIndex(0)
+            self._fill_lipid_attach_carbons()
+        else:
+            self.lipid_anchor_combo.setCurrentIndex(
+                max(0, self.lipid_anchor_combo.findData(lip.get("anchor", "sugar"))))
+            self.lipid_attach_sugar.setCurrentIndex(
+                max(0, self.lipid_attach_sugar.findData(lip.get("sugar"))))
+            self._fill_lipid_attach_carbons()
+            if lip.get("carbon"):
+                self.lipid_attach_carbon.setCurrentIndex(
+                    max(0, self.lipid_attach_carbon.findText(lip["carbon"])))
+        del blockers
+        on_sugar = enabled and self.lipid_anchor_combo.currentData() == "sugar"
+        self.lipid_attach_sugar.setEnabled(on_sugar)
+        self.lipid_attach_carbon.setEnabled(on_sugar)
+
+    def _on_lipid_attach_sugar_changed(self, _index=None):
+        self._fill_lipid_attach_carbons()
+        self._on_lipid_attach_changed()
+
+    def _on_lipid_attach_changed(self, _index=None):
+        row = self.lipid_table.currentRow()
+        if not (0 <= row < len(self._lipids)):
+            return
+        lip = self._lipids[row]
+        lip["anchor"] = self.lipid_anchor_combo.currentData() or "sugar"
+        if lip["anchor"] == "sugar":
+            lip["sugar"] = self.lipid_attach_sugar.currentData()
+            lip["carbon"] = (self.lipid_attach_carbon.currentText() or None
+                             if lip["sugar"] is not None else None)
+        else:
+            lip["sugar"] = lip["carbon"] = None
+        on_sugar = lip["anchor"] == "sugar"
+        self.lipid_attach_sugar.setEnabled(on_sugar)
+        self.lipid_attach_carbon.setEnabled(on_sugar)
+        self._update_lipid_attach_cell(row)
+
+    def _lipid_sites(self):
+        """(sugar index, carbon) pairs already used by lipids, so bonds avoid them."""
+        return {(lip["sugar"], lip["carbon"]) for lip in self._lipids
+                if lip.get("anchor") == "sugar" and lip.get("sugar") is not None
+                and lip.get("carbon")}
+
+    @staticmethod
+    def _point_tuple(point):
+        return None if point is None else (float(point[0]), float(point[1]))
+
+    def _lipid_bonds(self):
+        """The lipid rows as LipidBond objects for the YAML builder."""
+        return [LipidBond(
+            label=lip["label"], anchor=lip.get("anchor", "sugar"),
+            sugar=lip.get("sugar"), sugar_carbon=lip.get("carbon"),
+            start=self._point_tuple(lip.get("start")), end=self._point_tuple(lip.get("end")),
+            mid=self._point_tuple(lip.get("mid")), carbons=lip.get("carbons"),
+            linkage=lip.get("linkage", "none")) for lip in self._lipids]
+
+    def _lipid_context(self):
+        """Allowlisted description of the lipid rows for the assistant."""
+        rows = []
+        for number, lip in enumerate(self._lipids):
+            rows.append({
+                "lipid": number, "label": lip["label"],
+                "start_xy_angstrom": self._point_tuple(lip.get("start")),
+                "end_xy_angstrom": self._point_tuple(lip.get("end")),
+                "mid_xy_angstrom": self._point_tuple(lip.get("mid")),
+                "has_bend": lip.get("mid") is not None,
+                "carbons": lip.get("carbons"), "linkage": lip.get("linkage", "none"),
+                "anchor": lip.get("anchor", "sugar"),
+                "sugar": lip.get("sugar"), "sugar_carbon": lip.get("carbon")})
+        return rows
+
+    def _lipid_yaml_note(self):
+        """Text for the export dialog when lipids are part of the YAML."""
+        if not self._lipids:
+            return ""
+        note = f"\n\nLipids written to the YAML: {len(self._lipids)}."
+        if any(lip.get("mid") is not None for lip in self._lipids):
+            note += ("\nA bend (midpoint) is written, but MISO's chain builder may pull the "
+                     "chain off the bend; check the result.")
+        return note
+
+    def _lipid_assistant_blocker(self):
+        """Why the assistant cannot take the lipid rows yet, or None."""
+        for lip in self._lipids:
+            if lip.get("start") is None or lip.get("end") is None:
+                return (f"Lipid {lip['label']} needs a Start and an End point. Pick them "
+                        "(or remove the row) before using the assistant.")
+        return None
+
+    def _apply_lipid_attachments(self, attachments):
+        """Write assistant (or wizard) attachments into the lipid rows."""
+        for att in attachments:
+            if not 0 <= att.lipid < len(self._lipids):
+                continue
+            lip = self._lipids[att.lipid]
+            lip["anchor"] = att.anchor
+            lip["sugar"] = att.sugar if att.anchor == "sugar" else None
+            lip["carbon"] = att.sugar_carbon if att.anchor == "sugar" else None
+            if att.linkage:
+                lip["linkage"] = att.linkage
+                combo = self.lipid_table.cellWidget(att.lipid, 4)
+                if combo is not None:
+                    blocker = QtCore.QSignalBlocker(combo)
+                    combo.setCurrentText(att.linkage)
+                    del blocker
+            self._update_lipid_attach_cell(att.lipid)
+        self._sync_lipid_attach_combos()
 
     # ------------------------------------------------------------------ picking
     def _on_lipid_pick_toggled(self, active):
@@ -559,14 +748,17 @@ class LipidPickerMixin:
         with open(params_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Lipid", "Start_X", "Start_Y", "End_X", "End_Y",
-                        "Mid_X", "Mid_Y", "Carbons", "Linkage", "N_built_atoms"])
+                        "Mid_X", "Mid_Y", "Carbons", "Linkage", "N_built_atoms",
+                        "Anchor", "Attached_to"])
             for lip in placed_lipids:
                 sx, sy = fmt(lip["start"])
                 ex, ey = fmt(lip["end"])
                 mx, my = fmt(lip["mid"])
                 carbons = lip["carbons"] if lip["carbons"] else "auto"
                 w.writerow([lip["label"], sx, sy, ex, ey, mx, my,
-                            carbons, lip["linkage"], len(lip["atoms"])])
+                            carbons, lip["linkage"], len(lip["atoms"]),
+                            lip.get("anchor", "sugar"),
+                            self._lipid_attach_text(lip).replace(DASH, "")])
 
         with open(atoms_path, "w", newline="") as f:
             w = csv.writer(f)

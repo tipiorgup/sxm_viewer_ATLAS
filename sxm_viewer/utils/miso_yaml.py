@@ -28,6 +28,39 @@ class PeptideBond:
     anomer: str
 
 
+# Linkages MISO's build_linkage_headgroup accepts for lipid chains.
+LIPID_LINKAGES = ("ester", "amide", "ether")
+
+
+@dataclass(frozen=True)
+class LipidAttachment:
+    """Where one lipid row of the GUI joins the assembly (chosen by the user or assistant).
+
+    ``lipid`` is the row number (0 based). ``anchor`` is "sugar" (a carbon of a sugar
+    unit) or "lipid" (a branch off an existing lipid chain). ``linkage`` None keeps
+    the row's own linkage.
+    """
+    lipid: int
+    anchor: str
+    sugar: int | None = None
+    sugar_carbon: str | None = None
+    linkage: str | None = None
+
+
+@dataclass(frozen=True)
+class LipidBond:
+    """One lipid chain as MISO needs it. Points are (x, y) in Angstrom on the image."""
+    label: str
+    anchor: str
+    sugar: int | None
+    sugar_carbon: str | None
+    start: tuple | None        # branch point on the parent chain for a "lipid" anchor
+    end: tuple | None
+    mid: tuple | None
+    carbons: int | None
+    linkage: str
+
+
 # Residues MISO can glycosylate (find_glycosylation_site / create_peptide_sugar_linkage).
 # Trp (C-linked) is deliberately absent: MISO raises "not yet implemented" for it.
 GLYCOSYLATION_TYPES = {"Asn": "N-glycosidic", "Ser": "O-glycosidic",
@@ -76,10 +109,78 @@ def linkage_carbons(instance: dict) -> list[str]:
         key=lambda name: int(name[1:]))
 
 
+def lipid_carbons(instance: dict) -> list[str]:
+    """Mapped ring carbons a lipid may attach to (a missing OH or NH2 only warns in MISO)."""
+    rigid = instance.get("rigid") or {}
+    carbon_map = rigid.get(instance.get("conf_name"), {}).get("carbon_map", {})
+    return sorted((name for name in carbon_map if re.fullmatch(r"C\d+", name)),
+                  key=lambda name: int(name[1:]))
+
+
+def _point_ok(point) -> bool:
+    try:
+        return (len(point) == 2 and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                        and v == v and abs(v) != float("inf") for v in point))
+    except TypeError:
+        return False
+
+
+def validate_lipids(instances: list[dict], lipids, used_sites=()) -> None:
+    """Check lipid attachments against MISO's rules (see lipid_building / pipeline)."""
+    used = set(used_sites)
+    anchored_sugars = set()
+    branched = []
+    for lipid in lipids:
+        name = lipid.label
+        if lipid.linkage not in LIPID_LINKAGES:
+            raise MISOExportError(
+                f"{name}: choose ester, amide or ether. MISO has no 'none' linkage.")
+        for what, point in (("End", lipid.end), ("Start", lipid.start), ("Mid", lipid.mid)):
+            if point is None:
+                if what == "End":
+                    raise MISOExportError(f"{name} has no End point. Pick Start and End first.")
+                continue
+            if not _point_ok(point):
+                raise MISOExportError(f"{name}: the {what} point is not a valid coordinate.")
+        if lipid.carbons is not None and (
+                type(lipid.carbons) is not int or not 2 <= lipid.carbons <= 200):
+            raise MISOExportError(f"{name}: the carbon count must be between 2 and 200 (or auto).")
+        if lipid.anchor == "sugar":
+            index = lipid.sugar
+            if type(index) is not int or not 0 <= index < len(instances):
+                raise MISOExportError(f"{name}: choose the sugar this lipid is attached to.")
+            unit = instances[index]
+            if not is_sugar(unit):
+                raise MISOExportError(f"{name}: {unit['label']} is not a sugar.")
+            if lipid.sugar_carbon not in lipid_carbons(unit):
+                raise MISOExportError(
+                    f"{name}: {lipid.sugar_carbon} is not a mapped carbon of {unit['label']}.")
+            site = (index, lipid.sugar_carbon)
+            if site in used:
+                raise MISOExportError(
+                    f"{name}: {unit['label']} {lipid.sugar_carbon} is already used by another "
+                    "bond or lipid. A carbon takes only one.")
+            used.add(site)
+            anchored_sugars.add(index)
+        elif lipid.anchor == "lipid":
+            branched.append(lipid)
+        else:
+            raise MISOExportError(f"{name}: the anchor must be 'sugar' or 'lipid'.")
+    if branched:
+        if not anchored_sugars:
+            raise MISOExportError(
+                f"{branched[0].label} branches off a lipid chain, but no lipid is attached to "
+                "a sugar yet. Attach another lipid to a sugar carbon first.")
+        if len(anchored_sugars) > 1:
+            raise MISOExportError(
+                "Branched lipids are only supported when all sugar attached lipids sit on ONE "
+                "sugar (MISO branches from the first sugar that carries lipids).")
+
+
 def validate_connections(instances: list[dict],
                          connections: list[SugarConnection],
-                         peptide_bonds=()) -> None:
-    used_sites = set()
+                         peptide_bonds=(), lipid_sites=()) -> None:
+    used_sites = set(lipid_sites)
     for number, link in enumerate(connections, 1):
         if not (0 <= link.donor < len(instances) and
                 0 <= link.acceptor < len(instances)):
@@ -142,7 +243,7 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
                       has_lipids: bool = False,
                       positions_csv: str | None = None,
                       peptide_bonds=(), peptide_order=None,
-                      functional_points=None) -> dict:
+                      functional_points=None, lipids=()) -> dict:
     """MISO input for the sugar and amino acid ``instances``.
 
     Amino acid units become the ``peptide`` section (chain order ``peptide_order``,
@@ -154,7 +255,9 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
     (default: its list index). ``positions_csv`` overrides the default
     ``<stem>_positions.csv`` circle input.
     """
-    if has_lipids or any(not (is_sugar(inst) or is_amino_acid(inst)) for inst in instances):
+    lipids = list(lipids)
+    if (has_lipids and not lipids) or any(
+            not (is_sugar(inst) or is_amino_acid(inst)) for inst in instances):
         raise MISOExportError(
             "MISO YAML export supports sugars and amino acids only. Remove lipid rows "
             "before exporting.")
@@ -205,6 +308,10 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
         molecule_ids[index] = f"{name}_{point}"
 
     validate_connections(instances, connections, peptide_bonds)
+    validate_lipids(instances, lipids, {
+        (link.donor, link.donor_carbon) for link in connections} | {
+        (link.acceptor, link.acceptor_carbon) for link in connections} | {
+        (bond.sugar, bond.sugar_carbon) for bond in peptide_bonds})
     if aa_ids and not peptide_bonds:
         raise MISOExportError(
             "Amino acids are placed but no sugar is bonded to them. Add a sugar to "
@@ -296,6 +403,25 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
             "anomeric_config": bond.anomer,
             "use_spacer": False,
         } for bond in peptide_bonds]
+    if lipids:
+        def xyz(point):
+            return [round(float(point[0]), 6), round(float(point[1]), 6), 0.0]
+
+        entries = []
+        for lip in lipids:
+            entry = {"connection_anchor": lip.anchor}
+            if lip.anchor == "sugar":
+                entry["connection"] = [molecule_ids[lip.sugar], lip.sugar_carbon]
+            elif lip.start is not None:
+                entry["connection_blob"] = xyz(lip.start)
+            entry["direction"] = xyz(lip.end)
+            if lip.mid is not None:
+                entry["midpoint"] = xyz(lip.mid)
+            if lip.carbons:
+                entry["n_carbons"] = int(lip.carbons)
+            entry["linkage"] = lip.linkage
+            entries.append(entry)
+        config["Lipids"] = entries
     if fixed_orientation:
         config["orientation_csv_path"] = f"{stem}_orientations.csv"
     return config

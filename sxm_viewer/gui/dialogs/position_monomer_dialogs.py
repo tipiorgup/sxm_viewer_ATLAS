@@ -1171,9 +1171,6 @@ class PositionMonomerDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDi
     def _assistant_blocker(self):
         if self._lookup_worker is not None:
             return "Wait for the sugar-name lookup to finish first."
-        if self._lipids:
-            return ("This assistant supports sugars and amino acids only; "
-                    "remove lipid rows before using it.")
         return super()._assistant_blocker()
 
     def _functional_point_indices(self):
@@ -1197,6 +1194,7 @@ class PositionMonomerDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDi
         return build_miso_config(
             self._instances, self._connections, self.root_combo.currentData(),
             mode, out_path, self._sxm_path, has_lipids=bool(self._lipids),
+            lipids=self._lipid_bonds(),
             peptide_bonds=self._peptide_bonds,
             peptide_order=self._current_peptide_order() if self._residue_indices() else None,
             functional_points=self._functional_point_indices())
@@ -1235,17 +1233,15 @@ class PositionMonomerDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDi
                 self, "Nothing to export", "Build/place subunits or lipids first.")
             return
         out_path = self.csv_le.text().strip() or "monomers.csv"
-        unsupported = bool(self._lipids)
         config = None
-        if not unsupported:
-            try:
-                config = self._make_miso_config(out_path)
-            except MISOExportError as exc:
-                QtWidgets.QMessageBox.warning(
-                    self, "MISO YAML export",
-                    f"{exc}\n\nNothing was written. To save just the coordinates "
-                    "and orientations, use 'Export coordinates'.")
-                return
+        try:
+            config = self._make_miso_config(out_path)
+        except MISOExportError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "MISO YAML export",
+                f"{exc}\n\nNothing was written. To save just the coordinates "
+                "and orientations, use 'Export coordinates'.")
+            return
         export_errors = (OSError,)
         if config is not None:
             try:
@@ -1267,16 +1263,6 @@ class PositionMonomerDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDi
                 f"Could not complete the MISO export:\n{exc}\n\n"
                 "Some companion files may already have been written. Fix the error and export again.")
             return
-        if unsupported:
-            self.viewer.last_monomer_yaml = None
-            QtWidgets.QMessageBox.warning(
-                self, "CSV exported; YAML not generated",
-                "Saved CSV/image companion files:\n  " + "\n  ".join(written)
-                + "\n\nAutomatic MISO YAML export supports sugars and amino acids only. "
-                  "Lipid rows are included, so no YAML was generated. "
-                  "Any existing YAML at this path was left unchanged; do not reuse "
-                  "it without updating its connectivity and position indices.")
-            return
         written.append(yaml_path.name)
         self.viewer.last_monomer_yaml = str(yaml_path.resolve())
         QtWidgets.QMessageBox.information(
@@ -1284,6 +1270,7 @@ class PositionMonomerDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDi
             f"Saved {len(self._instances)} unit(s):\n  "
             + "\n  ".join(written)
             + f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
+            + self._lipid_yaml_note()
             + "\n\nPlease give the YAML a final inspection (units, root, linkages, "
               "\u03b1/\u03b2, orientation mode) before running MISO. "
               "Open Run MISO to use this YAML and its companion files.")

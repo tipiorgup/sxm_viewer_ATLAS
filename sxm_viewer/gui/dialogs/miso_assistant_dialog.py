@@ -9,13 +9,14 @@ import math
 from ..._shared import QtCore, QtGui, QtWidgets
 from ...utils.miso_assistant import (
     AssistantChoices, AssistantError, PROVIDERS, ServiceConfig, delete_api_key,
-    failed_reply_for_history, molecular_context, parse_reply, read_api_key,
+    failed_reply_for_history, lipids_for, molecular_context, parse_reply, read_api_key,
     rejection_note, request_advice, save_api_key, validate_choices,
 )
 from ...utils.miso_models import profile_for
 from ...utils.miso_yaml import (
-    GLYCOSYLATION_TYPES, AA_ONE_LETTER, MISOExportError, PeptideBond, SugarConnection,
-    default_peptide_order, is_amino_acid, linkage_carbons, validate_connections,
+    GLYCOSYLATION_TYPES, AA_ONE_LETTER, LIPID_LINKAGES, LipidAttachment, MISOExportError,
+    PeptideBond, SugarConnection, default_peptide_order, is_amino_acid, is_sugar,
+    lipid_carbons, linkage_carbons, validate_connections, validate_lipids,
 )
 
 
@@ -54,6 +55,7 @@ class ConnectionSketch(QtWidgets.QWidget):
         self.connections = []
         self.peptide_bonds = []
         self.peptide_order = None
+        self.lipids = []
         self.root = None
         self.fixed_orientation = None
         self.caption = ""
@@ -67,6 +69,11 @@ class ConnectionSketch(QtWidgets.QWidget):
         self.root = root
         self.fixed_orientation = fixed_orientation
         self.caption = caption
+        self.update()
+
+    def set_lipids(self, rows):
+        """Lipid rows (allowlisted dicts with points, attachment and linkage) to draw."""
+        self.lipids = [dict(row) for row in rows or ()]
         self.update()
 
     def set_peptide_order(self, order):
@@ -109,6 +116,12 @@ class ConnectionSketch(QtWidgets.QWidget):
                 ys += [y for _x, y, _s in geo["atoms"].values()]
             xs.append(float(inst["com"][0]))
             ys.append(float(inst["com"][1]))
+        for row in self.lipids:
+            for key in ("start_xy_angstrom", "end_xy_angstrom", "mid_xy_angstrom"):
+                point = row.get(key)
+                if point is not None:
+                    xs.append(float(point[0]))
+                    ys.append(float(point[1]))
         margin, top = 48.0, 34.0
         width = max(1.0, self.width() - 2 * margin)
         height = max(1.0, self.height() - margin - top - 64.0)
@@ -206,6 +219,7 @@ class ConnectionSketch(QtWidgets.QWidget):
             anomer = {"alpha": "\u03b1", "beta": "\u03b2"}.get(bond.anomer, bond.anomer)
             self._draw_bond(painter, start, end, radius, anomer, "#00897b")
 
+        self._draw_lipids(painter, geometries, centres, to_widget)
         self._draw_peptide_chain(painter, centres, extents)
 
         small = QtGui.QFont(painter.font())
@@ -253,7 +267,8 @@ class ConnectionSketch(QtWidgets.QWidget):
         painter.setPen(QtGui.QColor("#606060"))
         legend = ("Drawn as positioned (top view). C1, C2\u2026: carbons that can form a linkage. "
                   "Arrows: donor \u2192 acceptor (\u03b1/\u03b2); green: sugar \u2192 amino acid; "
-                  "purple: peptide chain from N term to C term. Gold: root. Grey: not connected yet.")
+                  "purple: peptide chain from N term to C term; brown: lipid chain. "
+                  "Gold: root. Grey: not connected yet.")
         flags = QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom | QtCore.Qt.TextWordWrap
         needed = painter.fontMetrics().boundingRect(
             QtCore.QRect(0, 0, max(40, self.width() - 16), 1000), flags, legend).height()
@@ -262,6 +277,45 @@ class ConnectionSketch(QtWidgets.QWidget):
         painter.end()
 
     CHAIN_COLOR = "#6a1b9a"
+    LIPID_COLOR = "#6d4c41"
+
+    def _draw_lipids(self, painter, geometries, centres, to_widget):
+        """Each lipid as a brown line from its attachment through the bend to its End."""
+        color = QtGui.QColor(self.LIPID_COLOR)
+        for row in self.lipids:
+            end = row.get("end_xy_angstrom")
+            if end is None:
+                continue
+            origin = None
+            index = row.get("sugar")
+            if (row.get("anchor", "sugar") == "sugar" and type(index) is int
+                    and 0 <= index < len(centres)):
+                origin = self._site_point(geometries, centres, to_widget, index,
+                                          row.get("sugar_carbon"))
+            elif row.get("anchor") == "lipid" and row.get("start_xy_angstrom") is not None:
+                origin = to_widget(*row["start_xy_angstrom"])
+            attached = origin is not None
+            if origin is None and row.get("start_xy_angstrom") is not None:
+                origin = to_widget(*row["start_xy_angstrom"])
+            if origin is None:
+                continue
+            points = [origin]
+            if row.get("mid_xy_angstrom") is not None:
+                points.append(to_widget(*row["mid_xy_angstrom"]))
+            points.append(to_widget(*end))
+            pen = QtGui.QPen(color if attached else QtGui.QColor("#a1887f"), 2.2)
+            if not attached:
+                pen.setStyle(QtCore.Qt.DashLine)
+            painter.setPen(pen)
+            for a, b in zip(points, points[1:-1]):
+                painter.drawLine(a, b)
+            self._draw_bond(painter, points[-2], points[-1], 0.0, "", self.LIPID_COLOR)
+            text = f"{row.get('label', 'L')} {row.get('linkage') or ''}".strip()
+            painter.setPen(color.darker(120))
+            width = painter.fontMetrics().horizontalAdvance(text)
+            x = min(max(points[-1].x() + 6, 4.0), max(4.0, self.width() - width - 4.0))
+            y = min(max(points[-1].y() - 6, 40.0), self.height() - 70.0)
+            painter.drawText(QtCore.QPointF(x, y), text)
 
     def _draw_peptide_chain(self, painter, centres, extents):
         """Arrows N term to C term through the residues, with end labels and numbers."""
@@ -494,7 +548,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
     """An offline question-by-question guide, with opt-in hosted proposals."""
 
     def __init__(self, instances, connections, root, mode, parent=None,
-                 peptide_bonds=(), peptide_order=None):
+                 peptide_bonds=(), peptide_order=None, lipid_rows=()):
         super().__init__(parent)
         self.setWindowTitle("MISO YAML assistant")
         self.resize(1100, 760)
@@ -504,8 +558,11 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.has_peptide = any(is_amino_acid(inst) for inst in self.instances)
         self.peptide_order = (list(peptide_order) if peptide_order is not None
                               else default_peptide_order(self.instances))
+        self.lipid_rows = [dict(row) for row in lipid_rows]
+        self.has_lipids = bool(self.lipid_rows)
         self.context = molecular_context(self.instances, connections, root, mode,
-                                         self.peptide_bonds, self.peptide_order)
+                                         self.peptide_bonds, self.peptide_order,
+                                         self.lipid_rows)
         self.result_choices = None
         self._online_choices = None
         self._history = []
@@ -628,7 +685,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         bond = PeptideBond(sugar, self.pep_carbon.currentText(), residue,
                            self.pep_anomer_combo.currentText())
         try:
-            validate_connections(self.instances, self.connections, self.peptide_bonds + [bond])
+            validate_connections(self.instances, self.connections, self.peptide_bonds + [bond],
+                                 self._lipid_sites())
         except MISOExportError as exc:
             self._error(str(exc))
             return
@@ -666,6 +724,198 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             self._online_choices = replace(choices, peptide_order=list(self.peptide_order))
             self.online_review.setPlainText(self._summary(self._online_choices))
 
+    # ------------------------------------------------------------------ lipids
+    def _build_lipid_page(self):
+        page = QtWidgets.QWidget()
+        form = QtWidgets.QVBoxLayout(page)
+        number = 4 + (1 if self.has_peptide else 0)
+        text = QtWidgets.QLabel(
+            f"{number}. Where is each lipid attached?\n\n"
+            "The lipids are the chains you drew on the image. MISO builds each one from a "
+            "sugar carbon (the head group sits about 3.5 A off that carbon and the chain "
+            "runs to the End point you picked), or as a branch off another lipid chain at "
+            "its Start point. Choose the linkage too: ester, amide or ether. A carbon can "
+            "carry only one bond or lipid. Do not choose by distance alone.")
+        text.setWordWrap(True)
+        form.addWidget(text)
+        fields = QtWidgets.QFormLayout()
+        self.lipid_pick_combo = QtWidgets.QComboBox()
+        for number_, row in enumerate(self.lipid_rows):
+            self.lipid_pick_combo.addItem(row.get("label", f"L{number_ + 1}"), number_)
+        fields.addRow("Lipid:", self.lipid_pick_combo)
+        self.lipid_anchor_choice = QtWidgets.QComboBox()
+        self.lipid_anchor_choice.addItem("Sugar carbon", "sugar")
+        self.lipid_anchor_choice.addItem("Branch off a lipid chain", "lipid")
+        fields.addRow("Attached to:", self.lipid_anchor_choice)
+        self.lipid_sugar_choice = self._unit_combo(self._is_sugar_unit)
+        self.lipid_carbon_choice = QtWidgets.QComboBox()
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.lipid_sugar_choice, 1)
+        row.addWidget(self.lipid_carbon_choice)
+        fields.addRow("Sugar:", row)
+        self.lipid_linkage_choice = QtWidgets.QComboBox()
+        self.lipid_linkage_choice.addItems(["Choose..."] + list(LIPID_LINKAGES))
+        fields.addRow("Linkage:", self.lipid_linkage_choice)
+        form.addLayout(fields)
+        self.lipid_sugar_choice.currentIndexChanged.connect(self._refresh_lipid_carbons)
+        self.lipid_anchor_choice.currentIndexChanged.connect(self._lipid_anchor_changed)
+        self.lipid_pick_combo.currentIndexChanged.connect(self._load_lipid_choice)
+        set_btn = QtWidgets.QPushButton("Set attachment for this lipid")
+        set_btn.clicked.connect(self._set_lipid_attachment)
+        form.addWidget(set_btn)
+        self.lipid_table = QtWidgets.QTableWidget(len(self.lipid_rows), 4)
+        self.lipid_table.setHorizontalHeaderLabels(["Lipid", "Attached to", "Carbon", "Linkage"])
+        self.lipid_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.lipid_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.lipid_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents)
+        form.addWidget(self.lipid_table)
+        self._load_lipid_choice()
+        self._show_lipids()
+        return page
+
+    def _refresh_lipid_carbons(self, _index=None):
+        self.lipid_carbon_choice.clear()
+        index = self.lipid_sugar_choice.currentData()
+        if index is not None:
+            self.lipid_carbon_choice.addItems(lipid_carbons(self.instances[index]))
+
+    def _lipid_anchor_changed(self, _index=None):
+        on_sugar = self.lipid_anchor_choice.currentData() == "sugar"
+        self.lipid_sugar_choice.setEnabled(on_sugar)
+        self.lipid_carbon_choice.setEnabled(on_sugar)
+
+    def _load_lipid_choice(self, _index=None):
+        """Show the chosen lipid's current attachment in the form."""
+        number = self.lipid_pick_combo.currentData()
+        if number is None:
+            return
+        row = self.lipid_rows[number]
+        self.lipid_anchor_choice.setCurrentIndex(
+            max(0, self.lipid_anchor_choice.findData(row.get("anchor", "sugar"))))
+        self.lipid_sugar_choice.setCurrentIndex(
+            max(0, self.lipid_sugar_choice.findData(row.get("sugar"))))
+        self._refresh_lipid_carbons()
+        if row.get("sugar_carbon"):
+            self.lipid_carbon_choice.setCurrentIndex(
+                max(0, self.lipid_carbon_choice.findText(row["sugar_carbon"])))
+        self.lipid_linkage_choice.setCurrentIndex(
+            max(0, self.lipid_linkage_choice.findText(row.get("linkage") or "")))
+        self._lipid_anchor_changed()
+
+    def _lipid_sites(self, skip=None):
+        """Sugar carbons already holding another attached lipid."""
+        return {(row["sugar"], row.get("sugar_carbon"))
+                for number, row in enumerate(self.lipid_rows)
+                if number != skip and row.get("anchor") == "sugar"
+                and row.get("sugar") is not None}
+
+    def _attachment_sites_without_lipids(self):
+        used = {(link.donor, link.donor_carbon) for link in self.connections}
+        used |= {(link.acceptor, link.acceptor_carbon) for link in self.connections}
+        return used | {(bond.sugar, bond.sugar_carbon) for bond in self.peptide_bonds}
+
+    def _attachment_sites(self, skip=None):
+        """Carbons taken by sugar bonds, peptide bonds and other attached lipids."""
+        used = {(link.donor, link.donor_carbon) for link in self.connections}
+        used |= {(link.acceptor, link.acceptor_carbon) for link in self.connections}
+        used |= {(bond.sugar, bond.sugar_carbon) for bond in self.peptide_bonds}
+        return used | self._lipid_sites(skip)
+
+    def _set_lipid_attachment(self):
+        number = self.lipid_pick_combo.currentData()
+        if number is None:
+            self._error("There is no lipid to attach.")
+            return
+        anchor = self.lipid_anchor_choice.currentData()
+        linkage = self.lipid_linkage_choice.currentText()
+        if linkage not in LIPID_LINKAGES:
+            self._error("Choose ester, amide or ether. MISO has no other linkage.")
+            return
+        sugar = self.lipid_sugar_choice.currentData() if anchor == "sugar" else None
+        carbon = (self.lipid_carbon_choice.currentText() or None) if anchor == "sugar" else None
+        candidate = dict(self.lipid_rows[number], anchor=anchor, sugar=sugar,
+                         sugar_carbon=carbon, linkage=linkage)
+        # Check this lipid together with the ones that are already attached, so branch
+        # rules (a lipid on a sugar first, all on one sugar) are seen.
+        others = [row for n, row in enumerate(self.lipid_rows) if n != number
+                  and (row.get("anchor") == "lipid" or row.get("sugar") is not None)]
+        try:
+            validate_lipids(self.instances, lipids_for(others + [candidate], []),
+                            self._attachment_sites_without_lipids())
+        except MISOExportError as exc:
+            self._error(str(exc))
+            return
+        self.lipid_rows[number].update(anchor=anchor, sugar=sugar,
+                                       sugar_carbon=carbon, linkage=linkage)
+        self._show_lipids()
+
+    def _show_lipids(self):
+        if hasattr(self, "lipid_table"):
+            for number, row in enumerate(self.lipid_rows):
+                if row.get("anchor") == "lipid":
+                    where, carbon = "branch off a lipid chain", ""
+                elif row.get("sugar") is not None:
+                    where = self.instances[row["sugar"]]["label"]
+                    carbon = row.get("sugar_carbon") or ""
+                else:
+                    where, carbon = "not set", ""
+                values = (row.get("label", f"L{number + 1}"), where, carbon,
+                          row.get("linkage") or "")
+                for column, value in enumerate(values):
+                    self.lipid_table.setItem(number, column, QtWidgets.QTableWidgetItem(value))
+        self.context["lipids"] = [dict(row) for row in self.lipid_rows]
+        for name in ("offline_sketch", "online_sketch"):
+            sketch = getattr(self, name, None)
+            if sketch is not None:
+                sketch.set_lipids(self.lipid_rows)
+        if hasattr(self, "offline_sketch"):
+            self._refresh_offline_sketch()
+
+    def _lipid_attachments(self):
+        """One LipidAttachment per row that already has an attachment."""
+        result = []
+        for number, row in enumerate(self.lipid_rows):
+            if row.get("anchor") == "lipid" or row.get("sugar") is not None:
+                result.append(LipidAttachment(
+                    number, row["anchor"], row.get("sugar"), row.get("sugar_carbon"),
+                    row.get("linkage")))
+        return result
+
+    def _rows_with(self, choices):
+        """Lipid rows with a proposal's attachments applied (for drawing only)."""
+        rows = [dict(row) for row in self.lipid_rows]
+        for att in choices.lipid_attachments:
+            if 0 <= att.lipid < len(rows):
+                rows[att.lipid].update(anchor=att.anchor, sugar=att.sugar,
+                                       sugar_carbon=att.sugar_carbon)
+                if att.linkage:
+                    rows[att.lipid]["linkage"] = att.linkage
+        return rows
+
+    def _lipid_summary_lines(self, choices):
+        lines = ["\nLipids:"]
+        rows = [dict(row) for row in self.lipid_rows]
+        for att in choices.lipid_attachments:
+            if 0 <= att.lipid < len(rows):
+                rows[att.lipid].update(anchor=att.anchor, sugar=att.sugar,
+                                       sugar_carbon=att.sugar_carbon)
+                if att.linkage:
+                    rows[att.lipid]["linkage"] = att.linkage
+        for number, row in enumerate(rows):
+            label = row.get("label", f"L{number + 1}")
+            if row.get("anchor") == "lipid":
+                where = "branch off a lipid chain"
+            elif row.get("sugar") is not None:
+                where = f"{self.instances[row['sugar']]['label']} {row.get('sugar_carbon')}"
+            else:
+                where = "not attached"
+            bend = ", bent" if row.get("mid_xy_angstrom") is not None else ""
+            carbons = row.get("carbons") or "auto"
+            lines.append(f"{label}: {where}, {row.get('linkage') or 'no linkage'}, "
+                         f"{carbons} carbons{bend}")
+        return lines
+
     def _build_offline(self, root, mode):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
@@ -673,6 +923,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             "No internet, account, or model installation is needed for this guide."))
         self.offline_sketch = ConnectionSketch(self.instances)
         self.offline_sketch.set_peptide_order(self.peptide_order if self.has_peptide else None)
+        self.offline_sketch.set_lipids(self.lipid_rows)
         self.pages = QtWidgets.QStackedWidget()
         first = QtWidgets.QWidget()
         form = QtWidgets.QVBoxLayout(first)
@@ -750,12 +1001,14 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.pages.addWidget(third)
         if self.has_peptide:
             self.pages.addWidget(self._build_peptide_page())
+        if self.has_lipids:
+            self.pages.addWidget(self._build_lipid_page())
         self._show_connections()
 
         fourth = QtWidgets.QWidget()
         form = QtWidgets.QVBoxLayout(fourth)
         form.addWidget(QtWidgets.QLabel(
-            f"{5 if self.has_peptide else 4}. Review every chemical choice before applying. 'Export CSV + MISO input YAML' "
+            f"{4 + int(self.has_peptide) + int(self.has_lipids)}. Review every chemical choice before applying. 'Export CSV + MISO input YAML' "
             "then writes the YAML; give it a final inspection before running MISO."))
         self.offline_review = QtWidgets.QPlainTextEdit()
         self.offline_review.setReadOnly(True)
@@ -817,7 +1070,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         link = SugarConnection(donor, self.donor_carbon.currentText(), acceptor,
                                self.acceptor_carbon.currentText(), self.anomer_combo.currentText())
         try:
-            validate_connections(self.instances, self.connections + [link])
+            validate_connections(self.instances, self.connections + [link],
+                                 self.peptide_bonds, self._lipid_sites())
         except MISOExportError as exc:
             self._error(str(exc))
             return
@@ -836,8 +1090,9 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             raise MISOExportError("Choose a root and an orientation mode explicitly.")
         choices = AssistantChoices(
             root, mode, list(self.connections), list(self.peptide_bonds),
-            list(self.peptide_order) if self.has_peptide else None)
-        validate_choices(self.instances, choices)
+            list(self.peptide_order) if self.has_peptide else None,
+            self._lipid_attachments())
+        validate_choices(self.instances, choices, self.lipid_rows)
         return choices
 
     def _summary(self, choices):
@@ -865,6 +1120,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
                 lines.append(f"{self.instances[bond.sugar]['label']} {bond.sugar_carbon} -> "
                              f"{residue['label']} ({bond.anomer}, "
                              f"{GLYCOSYLATION_TYPES.get(residue['name'], '?')})")
+        if self.has_lipids:
+            lines.extend(self._lipid_summary_lines(choices))
         return "\n".join(lines)
 
     def _next(self):
@@ -933,6 +1190,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         row.addWidget(self.send_btn)
         self.online_sketch = ConnectionSketch(self.instances)
         self.online_sketch.set_peptide_order(self.peptide_order if self.has_peptide else None)
+        self.online_sketch.set_lipids(self.lipid_rows)
         self.online_sketch.set_plan(self.connections, self.context.get("root"),
                                     self.context.get("fixed_orientation"),
                                     "Current settings (no proposal yet)",
@@ -1047,7 +1305,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             self._error(error)
             return
         try:
-            message, choices = parse_reply(text, self.instances)
+            message, choices = parse_reply(text, self.instances, self.lipid_rows)
         except AssistantError as exc:
             self.online_status.setText(str(exc))
             self.transcript.appendPlainText("Local validation: " + str(exc))
@@ -1064,6 +1322,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self._online_choices = choices
         if choices is not None:
             self.online_review.setPlainText(self._summary(choices))
+            self.online_sketch.set_lipids(self._rows_with(choices))
             self.online_sketch.set_plan(choices.connections, choices.root, choices.fixed_orientation,
                                         "Proposal - NOT applied until you approve",
                                         choices.peptide_bonds)
@@ -1080,7 +1339,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         if self.has_peptide:
             choices = replace(choices, peptide_order=list(self.peptide_order))
         try:
-            validate_choices(self.instances, choices)
+            validate_choices(self.instances, choices, self.lipid_rows)
         except MISOExportError as exc:
             self._error(str(exc))
             return
