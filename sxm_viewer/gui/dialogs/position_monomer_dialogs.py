@@ -11,6 +11,7 @@ from ...utils.sugar_lookup import (
 from ...utils.miso_yaml import MISOExportError, build_miso_config
 from ._sxm_image_loader import load_demo_image
 from ._miso_connection_panel import MISOConnectionMixin
+from ._canvas_zoom import CanvasZoom, zoom_buttons
 
 
 # The engine filters base labels; specific chairs are filtered locally afterward.
@@ -411,7 +412,10 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self._lipids = []         # parallel to lipid table rows
         self._lipid_engine = None
         self._lipid_cid = None
-        self._lipid_stage = 0     # 0=start, 1=end, 2=mid
+        self._lipid_stage = 0     # 0=click start, 1=click end, 2=adjust by dragging
+        self._lipid_extra_cids = []   # motion/release connections while picking
+        self._lipid_drag = None       # {"row", "key", "moved"} while a handle is dragged
+        self._lipid_last_build = 0.0
 
         loaded = load_demo_image(viewer)
         self._img = loaded["img"]
@@ -588,13 +592,17 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self.lipid_pick_btn.toggled.connect(self._on_lipid_pick_toggled)
         clr_lip = QtWidgets.QPushButton("Clear points")
         clr_lip.clicked.connect(self._clear_lipid_points)
+        straight_lip = QtWidgets.QPushButton("Straighten")
+        straight_lip.setToolTip("Remove the bend (the Mid point) of the selected lipid.")
+        straight_lip.clicked.connect(self._straighten_lipid)
         lbtn.addWidget(add_lip)
         lbtn.addWidget(rm_lip)
         lbtn.addWidget(self.lipid_pick_btn)
         lbtn.addWidget(clr_lip)
+        lbtn.addWidget(straight_lip)
         lbtn.addStretch()
         lg.addLayout(lbtn)
-        self.lipid_status = QtWidgets.QLabel("Add a lipid, then Pick points → click Start, End, (Mid).")
+        self.lipid_status = QtWidgets.QLabel("Add a lipid, switch Pick points on, click Start then End, then drag the handles to adjust.")
         self.lipid_status.setWordWrap(True)
         lg.addWidget(self.lipid_status)
         col.addWidget(self.lipid_group)
@@ -660,7 +668,10 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self._canvas.setMinimumHeight(340)
         self._canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
         self._canvas.installEventFilter(self)
-        layout.addWidget(NavigationToolbar(self._canvas, self))
+        self._nav_toolbar = NavigationToolbar(self._canvas, self)
+        layout.addWidget(self._nav_toolbar)
+        self._zoom_ctl = CanvasZoom(self._canvas, self._ax, self._img.shape, self._nav_toolbar)
+        zoom_buttons(layout, self._zoom_ctl, self)
         layout.addWidget(self._canvas, stretch=1)
 
     def _on_include_aa_toggled(self, checked):
@@ -707,6 +718,9 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self._redraw_overlay()
 
     def _on_lipid_selected(self, row):
+        self._lipid_drag = None
+        if self.lipid_pick_btn.isChecked():
+            self._update_lipid_status()
         self._redraw_overlay()
 
     def _lipid_row_of_widget(self, widget):
@@ -729,6 +743,19 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self._rebuild_lipid_geometry(self._lipids[row])
         self._redraw_overlay()
 
+    HANDLE_TOLERANCE_PX = 12.0
+
+    @staticmethod
+    def _lipid_stage_of(lip):
+        """0: click Start, 1: click End, 2: both set, adjust by dragging handles."""
+        if lip is None or lip.get("start") is None:
+            return 0
+        return 1 if lip.get("end") is None else 2
+
+    def _selected_lipid(self):
+        r = self.lipid_table.currentRow()
+        return self._lipids[r] if 0 <= r < len(self._lipids) else None
+
     def _on_lipid_pick_toggled(self, active):
         canvas = getattr(self, "_canvas", None)
         if canvas is None:
@@ -740,21 +767,34 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 self.place_btn.setChecked(False)
             if self.lipid_table.currentRow() < 0 and self._lipids:
                 self.lipid_table.setCurrentCell(0, 0)
-            self._lipid_stage = 0
+            self._lipid_stage = self._lipid_stage_of(self._selected_lipid())
             self._lipid_cid = canvas.mpl_connect("button_press_event", self._on_lipid_canvas_click)
+            self._lipid_extra_cids = [
+                canvas.mpl_connect("motion_notify_event", self._on_lipid_canvas_motion),
+                canvas.mpl_connect("button_release_event", self._on_lipid_canvas_release)]
             self.lipid_pick_btn.setText("Pick points: ON")
             self._update_lipid_status()
         else:
-            if self._lipid_cid is not None:
-                canvas.mpl_disconnect(self._lipid_cid)
-                self._lipid_cid = None
+            for cid in [self._lipid_cid, *self._lipid_extra_cids]:
+                if cid is not None:
+                    canvas.mpl_disconnect(cid)
+            self._lipid_cid = None
+            self._lipid_extra_cids = []
+            self._lipid_drag = None
             self.lipid_pick_btn.setText("Pick points: OFF")
+        self._redraw_overlay()
 
     def _update_lipid_status(self):
-        stage_name = ["Start", "End", "Mid (optional)"][min(self._lipid_stage, 2)]
         r = self.lipid_table.currentRow()
-        who = self._lipids[r]["label"] if 0 <= r < len(self._lipids) else "?"
-        self.lipid_status.setText(f"{who}: next click sets {stage_name}.")
+        lip = self._lipids[r] if 0 <= r < len(self._lipids) else None
+        who = lip["label"] if lip is not None else "?"
+        self._lipid_stage = self._lipid_stage_of(lip)
+        text = [f"{who}: click the Start point (head group end).",
+                f"{who}: click the End point (tail tip).",
+                f"{who}: drag the square ends or the diamond handle to adjust the fit. "
+                "Dragging the diamond bends the chain; 'Straighten' removes the bend."][
+                    self._lipid_stage]
+        self.lipid_status.setText(text)
 
     def _clear_lipid_points(self):
         r = self.lipid_table.currentRow()
@@ -764,10 +804,57 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         lip["start"] = lip["end"] = lip["mid"] = None
         lip["atoms"] = lip["atom_types"] = lip["bonds"] = None
         for c in range(3):
-            self.lipid_table.item(r, c).setText("—")
-        self._lipid_stage = 0
+            self.lipid_table.item(r, c).setText("\u2014")
         self._update_lipid_status()
         self._redraw_overlay()
+
+    def _straighten_lipid(self):
+        lip = self._selected_lipid()
+        if lip is None or lip["mid"] is None:
+            return
+        lip["mid"] = None
+        self.lipid_table.item(self.lipid_table.currentRow(), 2).setText("\u2014")
+        self._rebuild_lipid_geometry(lip)
+        self._update_lipid_status()
+        self._redraw_overlay()
+
+    def _event_to_ang(self, event):
+        """Event position in Angstrom, not snapped to the pixel grid."""
+        H, W = self._img.shape
+        col = min(max(float(event.xdata), 0.0), W - 1.0)
+        row = min(max(float(event.ydata), 0.0), H - 1.0)
+        orig_y = (row + 1.0) if self._scan_dir == "down" else (H - 1.0 - row)
+        return [col * self._px[0] * 10.0, orig_y * self._px[1] * 10.0]
+
+    def _lipid_handles(self, lip):
+        """{key: (x_ang, y_ang)} of the draggable points; the bend handle defaults
+        to the middle of Start and End until the user drags it."""
+        handles = {}
+        if lip.get("start") is not None:
+            handles["start"] = lip["start"]
+        if lip.get("end") is not None:
+            handles["end"] = lip["end"]
+        if "start" in handles and "end" in handles:
+            handles["mid"] = lip["mid"] if lip.get("mid") is not None else [
+                (lip["start"][0] + lip["end"][0]) / 2.0, (lip["start"][1] + lip["end"][1]) / 2.0]
+        return handles
+
+    def _lipid_handle_at(self, lip, event):
+        """Key of the handle under the cursor (screen distance), or None."""
+        best, best_distance = None, self.HANDLE_TOLERANCE_PX
+        for key, (x_ang, y_ang) in self._lipid_handles(lip).items():
+            col, row = self._ang_to_pixel(x_ang, y_ang)
+            sx, sy = self._ax.transData.transform((col, row))
+            distance = float(np.hypot(sx - event.x, sy - event.y))
+            if distance <= best_distance:
+                best, best_distance = key, distance
+        return best
+
+    def _set_lipid_point(self, row, key, point):
+        lip = self._lipids[row]
+        lip[key] = point
+        column = ("start", "end", "mid").index(key)
+        self.lipid_table.item(row, column).setText(f"{point[0]:.2f}, {point[1]:.2f}")
 
     def _on_lipid_canvas_click(self, event):
         if event.inaxes is None or event.button != 1:
@@ -778,15 +865,71 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         if not (0 <= r < len(self._lipids)):
             QtWidgets.QMessageBox.information(self, "No lipid", "Select a lipid row first.")
             return
-        x_ang, y_ang, _h = self._pixel_to_ang(event.xdata, event.ydata)
         lip = self._lipids[r]
-        key = ("start", "end", "mid")[min(self._lipid_stage, 2)]
-        lip[key] = [x_ang, y_ang]
-        self.lipid_table.item(r, min(self._lipid_stage, 2)).setText(f"{x_ang:.2f}, {y_ang:.2f}")
-        self._lipid_stage = min(self._lipid_stage + 1, 3)
+        key = self._lipid_handle_at(lip, event)
+        if key is not None:                      # grab a handle to adjust the fit
+            self._lipid_drag = {"row": r, "key": key, "moved": False}
+            return
+        stage = self._lipid_stage_of(lip)
+        if stage >= 2:
+            self._update_lipid_status()
+            return
+        self._set_lipid_point(r, ("start", "end")[stage], self._event_to_ang(event))
         self._rebuild_lipid_geometry(lip)
         self._update_lipid_status()
         self._redraw_overlay()
+
+    def _on_lipid_canvas_motion(self, event):
+        drag = self._lipid_drag
+        if drag is None or event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        import time
+        drag["moved"] = True
+        self._set_lipid_point(drag["row"], drag["key"], self._event_to_ang(event))
+        lip = self._lipids[drag["row"]]
+        now = time.monotonic()
+        if now - self._lipid_last_build >= 0.06:      # live fit, throttled
+            self._lipid_last_build = now
+            self._rebuild_lipid_geometry(lip)
+        self._redraw_overlay()
+
+    def _on_lipid_canvas_release(self, event):
+        drag, self._lipid_drag = self._lipid_drag, None
+        if drag is None:
+            return
+        if drag["moved"]:
+            self._rebuild_lipid_geometry(self._lipids[drag["row"]])
+            self._update_lipid_status()
+            self._redraw_overlay()
+
+    C_C_BOND = 1.54
+
+    def _chain_through_mid(self, L, start, mid, end, n_carbons=None):
+        """Backbone that really passes through ``mid``.
+
+        MISO's two segment builder places the chain through the waypoint and then
+        runs one FABRIK pass towards ``end`` only, which drags the chain off the
+        waypoint. Here each half is fitted on its own: Start to Mid, then from where
+        the first half ended to End. Long enough halves reach their target exactly.
+        """
+        start, mid, end = (np.asarray(p, dtype=float) for p in (start, mid, end))
+        d1 = float(np.linalg.norm(mid - start))
+        d2 = float(np.linalg.norm(end - mid))
+        if n_carbons:
+            total = max(4, int(n_carbons))
+            n1 = max(2, int(round(total * d1 / max(d1 + d2, 1e-9))))
+            n2 = max(2, total - n1)
+        else:
+            n1 = max(2, int(np.ceil(d1 / self.C_C_BOND)))
+            n2 = max(2, int(np.ceil(d2 / self.C_C_BOND)))
+        first = [np.asarray(c, dtype=float) for c in
+                 L.build_lipid_backbone(start, mid, None, use_fabrik=True,
+                                        n_carbons=n1)["chain_carbons"]]
+        anchor = first[-1]
+        second = [np.asarray(c, dtype=float) for c in
+                  L.build_lipid_backbone(anchor, end, None, use_fabrik=True,
+                                         n_carbons=n2)["chain_carbons"]]
+        return first + second
 
     def _rebuild_lipid_geometry(self, lip):
         """Build head-group + zig-zag backbone via MISO lipid_building."""
@@ -831,8 +974,11 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
                     atoms.append(np.asarray(hg[bkey], dtype=float))
                     atom_types.append(_elem_from_key(bkey))
                     bonds.append((bmain, len(atoms) - 1))
-            bb = L.build_lipid_backbone(cur, end, mid, use_fabrik=True, n_carbons=n_carbons)
-            chain = [np.asarray(c, dtype=float) for c in bb["chain_carbons"]]
+            if mid is None:
+                bb = L.build_lipid_backbone(cur, end, None, use_fabrik=True, n_carbons=n_carbons)
+                chain = [np.asarray(c, dtype=float) for c in bb["chain_carbons"]]
+            else:
+                chain = self._chain_through_mid(L, cur, mid, end, n_carbons)
         except Exception as exc:
             self.lipid_status.setText(f"⚠ lipid build failed: {exc}")
             return
@@ -1397,6 +1543,18 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
         sel = self.lipid_table.currentRow() if hasattr(self, "lipid_table") else -1
         for idx, lip in enumerate(self._lipids):
             is_sel = idx == sel
+            if is_sel and self.lipid_pick_btn.isChecked():
+                handles = self._lipid_handles(lip)
+                if "mid" in handles:
+                    guide = [self._ang_to_pixel(*handles[k]) for k in ("start", "mid", "end")]
+                    g, = ax.plot([p[0] for p in guide], [p[1] for p in guide], "--",
+                                 color="#ffe082", lw=1.0, zorder=23, alpha=0.9)
+                    self._overlay_artists.append(g)
+                    if lip.get("mid") is None:      # draggable bend handle, not yet used
+                        c, rw = guide[1]
+                        h, = ax.plot([c], [rw], marker="D", mfc="white", mec="#fb8c00",
+                                     mew=1.6, ms=11, zorder=26)
+                        self._overlay_artists.append(h)
             # start / end / mid markers
             for key, color in (("start", "#43a047"), ("end", "#e53935"), ("mid", "#fb8c00")):
                 p = lip.get(key)
@@ -1790,6 +1948,7 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 canvas.mpl_disconnect(self._place_cid)
             if self._func_cid is not None:
                 canvas.mpl_disconnect(self._func_cid)
-            if self._lipid_cid is not None:
-                canvas.mpl_disconnect(self._lipid_cid)
+            for cid in [self._lipid_cid, *self._lipid_extra_cids]:
+                if cid is not None:
+                    canvas.mpl_disconnect(cid)
         super().closeEvent(event)

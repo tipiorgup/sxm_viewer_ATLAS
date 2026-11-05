@@ -7,6 +7,7 @@ from ..._shared import QtCore, QtWidgets
 from ...utils.miso_yaml import MISOExportError, build_miso_config
 from ...utils.sugar_lookup import SugarLookupError, parse_sugar_description
 from ._miso_connection_panel import MISOConnectionMixin
+from ._canvas_zoom import CanvasZoom, zoom_buttons
 from .position_monomer_dialogs import (
     ANOMERS, ATOM_COLORS, ATOM_SIZE, RING_TYPES, _SugarLookupWorker,
     build_aa_template, build_sugar_template, euler_to_matrix, import_monomer_engine,
@@ -334,45 +335,22 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self._pick_canvas = FigureCanvas(self._fig)
         self._pick_canvas.setMinimumHeight(360)
         toolbar = NavigationToolbar(self._pick_canvas, self)
+        self._nav_toolbar = toolbar
         layout.addWidget(toolbar)
-
-        zrow = QtWidgets.QHBoxLayout()
-        for label, slot in (("Reset view", self._reset_view),
-                            ("Zoom out", self._zoom_out),
-                            ("Zoom in", self._zoom_in)):
-            b = QtWidgets.QPushButton(label)
-            b.clicked.connect(slot)
-            zrow.addWidget(b)
-        zrow.addStretch()
-        layout.addLayout(zrow)
+        self._zoom_ctl = CanvasZoom(self._pick_canvas, self._ax, self._img.shape, toolbar)
+        zoom_buttons(layout, self._zoom_ctl, self)
 
         layout.addWidget(self._pick_canvas, stretch=1)
 
     def _reset_view(self):
-        if self._img is None:
-            return
-        h, w = self._img.shape
-        self._ax.set_xlim(-0.5, w - 0.5)
-        self._ax.set_ylim(-0.5, h - 0.5)   # origin='lower'
-        self._pick_canvas.draw_idle()
-
-    def _zoom(self, factor):
-        ax = getattr(self, "_ax", None)
-        if ax is None:
-            return
-        x0, x1 = ax.get_xlim()
-        y0, y1 = ax.get_ylim()
-        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        hw, hh = (x1 - x0) / 2.0 * factor, (y1 - y0) / 2.0 * factor
-        ax.set_xlim(cx - hw, cx + hw)
-        ax.set_ylim(cy - hh, cy + hh)
-        self._pick_canvas.draw_idle()
+        if self._img is not None:
+            self._zoom_ctl.reset()
 
     def _zoom_out(self):
-        self._zoom(2.0)
+        self._zoom_ctl.zoom(2.0)
 
     def _zoom_in(self):
-        self._zoom(0.5)
+        self._zoom_ctl.zoom(0.5)
 
     # ------------------------------------------------------------------ picking
     def _on_pick_toggled(self, active):
