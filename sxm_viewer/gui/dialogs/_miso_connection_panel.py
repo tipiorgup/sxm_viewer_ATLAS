@@ -136,6 +136,24 @@ class MISOConnectionMixin:
         order_buttons.addStretch()
         order_row.addLayout(order_buttons)
         box.addLayout(order_row)
+        from .miso_assistant_dialog import ConnectionSketch
+        self.chain_sketch = ConnectionSketch(self._instances)
+        self.chain_sketch.setMinimumSize(360, 220)
+        box.addWidget(self.chain_sketch)
+        self.root_combo.currentIndexChanged.connect(self._refresh_chain_sketch)
+        self.orientation_combo.currentIndexChanged.connect(self._refresh_chain_sketch)
+
+    def _refresh_chain_sketch(self):
+        """Redraw the plan with the peptide chain arrows (N term to C term)."""
+        sketch = getattr(self, "chain_sketch", None)
+        if sketch is None:
+            return
+        sketch.instances = self._instances
+        sketch.set_plan(self._connections, self.root_combo.currentData(),
+                        self.orientation_combo.currentData(), "Peptide chain",
+                        self._peptide_bonds)
+        sketch.set_peptide_order(self._current_peptide_order()
+                                 if self._residue_indices() else None)
 
     def _residue_indices(self):
         return [i for i, inst in enumerate(self._instances) if is_amino_acid(inst)]
@@ -182,6 +200,7 @@ class MISOConnectionMixin:
                       self._instances[bond.residue]["label"], bond.anomer)
             for column, value in enumerate(values):
                 self.peptide_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+        self._refresh_chain_sketch()
 
     def _fill_order_list(self):
         self.order_list.clear()
@@ -189,6 +208,7 @@ class MISOConnectionMixin:
             item = QtWidgets.QListWidgetItem(f"{number}. {self._instances[index]['label']}")
             item.setData(QtCore.Qt.UserRole, index)
             self.order_list.addItem(item)
+        self._refresh_chain_sketch()
 
     def _move_residue(self, step):
         row = self.order_list.currentRow()
@@ -292,6 +312,7 @@ class MISOConnectionMixin:
                       self._instances[link.acceptor]["label"], link.acceptor_carbon, link.anomer)
             for column, value in enumerate(values):
                 self.connection_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+        self._refresh_chain_sketch()
 
     def _assistant_blocker(self):
         """Message explaining why the assistant cannot open yet, or None."""

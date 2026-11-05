@@ -53,6 +53,7 @@ class ConnectionSketch(QtWidgets.QWidget):
         self.instances = instances
         self.connections = []
         self.peptide_bonds = []
+        self.peptide_order = None
         self.root = None
         self.fixed_orientation = None
         self.caption = ""
@@ -66,6 +67,11 @@ class ConnectionSketch(QtWidgets.QWidget):
         self.root = root
         self.fixed_orientation = fixed_orientation
         self.caption = caption
+        self.update()
+
+    def set_peptide_order(self, order):
+        """Residue unit indices from N term to C term, or None for no chain drawing."""
+        self.peptide_order = list(order) if order else None
         self.update()
 
     ELEMENT_COLORS = {"C": "#303030", "O": "#e53935", "N": "#1e88e5",
@@ -105,7 +111,7 @@ class ConnectionSketch(QtWidgets.QWidget):
             ys.append(float(inst["com"][1]))
         margin, top = 48.0, 34.0
         width = max(1.0, self.width() - 2 * margin)
-        height = max(1.0, self.height() - margin - top - 40.0)
+        height = max(1.0, self.height() - margin - top - 64.0)
         span = max(max(xs) - min(xs), max(ys) - min(ys), 4.0 if any(geometries) else 1e-9)
         scale = min(width, height) / span
         cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
@@ -151,6 +157,7 @@ class ConnectionSketch(QtWidgets.QWidget):
         used |= {(bond.sugar, bond.sugar_carbon) for bond in valid_peptide}
 
         label_tops = []
+        extents = []
         for index, (inst, geo, centre) in enumerate(zip(self.instances, geometries, centres)):
             is_root = index == self.root
             color = QtGui.QColor("steelblue" if index in linked or is_root else "#a0a0a0")
@@ -181,6 +188,7 @@ class ConnectionSketch(QtWidgets.QWidget):
                 painter.setBrush(QtCore.Qt.NoBrush)
                 painter.drawEllipse(centre, extent + 4, extent + 4)
             label_tops.append(centre.y() - extent - 4)
+            extents.append(extent)
 
         for link in valid:
             start = self._site_point(geometries, centres, to_widget, link.donor, link.donor_carbon)
@@ -197,6 +205,8 @@ class ConnectionSketch(QtWidgets.QWidget):
             radius = 11.0 if geometries[bond.sugar] is None else 5.0
             anomer = {"alpha": "\u03b1", "beta": "\u03b2"}.get(bond.anomer, bond.anomer)
             self._draw_bond(painter, start, end, radius, anomer, "#00897b")
+
+        self._draw_peptide_chain(painter, centres, extents)
 
         small = QtGui.QFont(painter.font())
         small.setPointSizeF(max(6.5, small.pointSizeF() - 1.5))
@@ -242,11 +252,46 @@ class ConnectionSketch(QtWidgets.QWidget):
         painter.setFont(font)
         painter.setPen(QtGui.QColor("#606060"))
         legend = ("Drawn as positioned (top view). C1, C2\u2026: carbons that can form a linkage. "
-                  "Arrows: donor \u2192 acceptor (\u03b1/\u03b2); green: sugar \u2192 amino acid. "
-                  "Gold: root. Grey: not connected yet.")
-        painter.drawText(QtCore.QRectF(8, self.height() - 56, self.width() - 16, 52),
-                         QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter | QtCore.Qt.TextWordWrap, legend)
+                  "Arrows: donor \u2192 acceptor (\u03b1/\u03b2); green: sugar \u2192 amino acid; "
+                  "purple: peptide chain from N term to C term. Gold: root. Grey: not connected yet.")
+        flags = QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom | QtCore.Qt.TextWordWrap
+        needed = painter.fontMetrics().boundingRect(
+            QtCore.QRect(0, 0, max(40, self.width() - 16), 1000), flags, legend).height()
+        painter.drawText(QtCore.QRectF(8, self.height() - needed - 4,
+                                       self.width() - 16, needed), flags, legend)
         painter.end()
+
+    CHAIN_COLOR = "#6a1b9a"
+
+    def _draw_peptide_chain(self, painter, centres, extents):
+        """Arrows N term to C term through the residues, with end labels and numbers."""
+        order = [i for i in (self.peptide_order or []) if 0 <= i < len(centres)]
+        if not order:
+            return
+        for a, b in zip(order, order[1:]):
+            self._draw_bond(painter, centres[a], centres[b],
+                            max(extents[a], 8.0) * 0.6, "", self.CHAIN_COLOR)
+        font = QtGui.QFont(painter.font())
+        font.setBold(True)
+        painter.setFont(font)
+        color = QtGui.QColor(self.CHAIN_COLOR)
+        ends = {order[0]: "N term"}
+        ends[order[-1]] = "C term" if len(order) > 1 else "N term / C term"
+        for position, index in enumerate(order, 1):
+            centre = centres[index]
+            text = f"{position}" + (f"  {ends[index]}" if index in ends else "")
+            box = painter.fontMetrics().boundingRect(text).adjusted(-4, -1, 4, 1)
+            box.moveCenter(QtCore.QPoint(int(centre.x()),
+                                         int(centre.y() + extents[index] + 12)))
+            box.moveLeft(max(box.left(), 2))
+            box.moveRight(min(box.right(), self.width() - 4))
+            is_end = index in ends
+            painter.setPen(QtGui.QPen(color, 1.2))
+            painter.setBrush(QtGui.QColor(243, 229, 245, 240) if is_end
+                             else QtGui.QColor(255, 255, 255, 215))
+            painter.drawRoundedRect(QtCore.QRectF(box), 3, 3)
+            painter.setPen(color.darker(120))
+            painter.drawText(box, QtCore.Qt.AlignCenter, text)
 
     @staticmethod
     def _site_point(geometries, centres, to_widget, index, carbon):
@@ -272,6 +317,8 @@ class ConnectionSketch(QtWidgets.QWidget):
         right = QtCore.QPointF(tip.x() - ux * size + uy * size * 0.5, tip.y() - uy * size - ux * size * 0.5)
         painter.setBrush(color)
         painter.drawPolygon(QtGui.QPolygonF([tip, left, right]))
+        if not label:
+            return
         mid = QtCore.QPointF((tail.x() + tip.x()) / 2, (tail.y() + tip.y()) / 2)
         box = painter.fontMetrics().boundingRect(label).adjusted(-3, -1, 3, 1)
         visible = math.hypot(tip.x() - tail.x(), tip.y() - tail.y())
@@ -567,6 +614,10 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             lst.clear()
             for number, index in enumerate(self.peptide_order, 1):
                 lst.addItem(f"{number}. {self.instances[index]['label']}")
+        for name in ("offline_sketch", "online_sketch"):
+            sketch = getattr(self, name, None)
+            if sketch is not None:
+                sketch.set_peptide_order(self.peptide_order if self.has_peptide else None)
         self._refresh_offline_sketch()
 
     def _add_peptide_bond(self):
@@ -621,6 +672,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         layout.addWidget(QtWidgets.QLabel(
             "No internet, account, or model installation is needed for this guide."))
         self.offline_sketch = ConnectionSketch(self.instances)
+        self.offline_sketch.set_peptide_order(self.peptide_order if self.has_peptide else None)
         self.pages = QtWidgets.QStackedWidget()
         first = QtWidgets.QWidget()
         form = QtWidgets.QVBoxLayout(first)
@@ -880,6 +932,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         row.addWidget(self.message_edit, 1)
         row.addWidget(self.send_btn)
         self.online_sketch = ConnectionSketch(self.instances)
+        self.online_sketch.set_peptide_order(self.peptide_order if self.has_peptide else None)
         self.online_sketch.set_plan(self.connections, self.context.get("root"),
                                     self.context.get("fixed_orientation"),
                                     "Current settings (no proposal yet)",
