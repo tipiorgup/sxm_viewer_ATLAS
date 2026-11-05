@@ -8,6 +8,7 @@ from ...utils.miso_yaml import MISOExportError, build_miso_config
 from ...utils.sugar_lookup import SugarLookupError, parse_sugar_description
 from ._miso_connection_panel import MISOConnectionMixin
 from ._canvas_zoom import CanvasZoom, zoom_buttons
+from ._lipid_picker import LipidPickerMixin
 from .position_monomer_dialogs import (
     ANOMERS, ATOM_COLORS, ATOM_SIZE, RING_TYPES, _SugarLookupWorker,
     build_aa_template, build_sugar_template, euler_to_matrix, import_monomer_engine,
@@ -15,7 +16,7 @@ from .position_monomer_dialogs import (
 )
 
 
-class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
+class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDialog):
     """Pick XY positions and heights exactly as the MISO demo (stream.py).
 
     The image, pixel size and coordinate formula are taken from the demo's
@@ -63,6 +64,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self._pick_cid = None
         self._points = []                # (orig_x, orig_y, x_ang, y_ang, height, col, row)
         self._marker_artists = []
+        self._init_lipid_state()         # lipid builder (shared with Position monomers)
         self._img = None                 # originalimg (Angstrom) from load_sxm_file
         self._px = (1.0, 1.0)            # Pixelsize nm/px
         self._scan_dir = ""
@@ -217,8 +219,12 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             "Show the Type column. An amino acid is placed at its C-alpha point.")
         self.aa_chk.toggled.connect(self._on_aa_toggled)
         types_row.addWidget(self.aa_chk)
-        self.lipid_chk = QtWidgets.QCheckBox("Include lipids (coming soon)")
-        self.lipid_chk.setEnabled(False)
+        self.lipid_chk = QtWidgets.QCheckBox("Include lipids")
+        self.lipid_chk.setToolTip(
+            "Add lipid chains defined by a Start and End point on the image, with an "
+            "optional draggable bend. Lipids are exported as CSV files, not in the YAML.")
+        self.lipid_chk.setEnabled(loaded)
+        self.lipid_chk.toggled.connect(self._on_include_lipids_toggled)
         types_row.addWidget(self.lipid_chk)
         layout.addLayout(types_row)
 
@@ -277,6 +283,8 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             self.spin[key] = sb
         rot_layout.addStretch()
         layout.addWidget(rot_group)
+
+        self._build_lipid_group(layout)
 
         self._build_connection_ui(layout)
 
@@ -359,6 +367,8 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             self.pick_btn.setChecked(False)
             return
         if active:
+            if self.lipid_pick_btn.isChecked():
+                self.lipid_pick_btn.setChecked(False)
             self._pick_cid = canvas.mpl_connect("button_press_event", self._on_canvas_click)
             self.pick_btn.setText("Pick mode: ON")
         else:
@@ -852,6 +862,23 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 if artists is not None:
                     artists.append(sc)
 
+    # ------------------------------------------------------------------ lipid host hooks
+    def _lipid_canvas(self):
+        return getattr(self, "_pick_canvas", None)
+
+    def _lipid_axes(self):
+        return self._ax
+
+    def _lipid_redraw(self):
+        self._draw_markers()
+
+    def _lipid_artists(self):
+        return self._marker_artists
+
+    def _lipid_release_other_pick(self):
+        if self.pick_btn.isChecked():
+            self.pick_btn.setChecked(False)
+
     def _draw_markers(self):
         ax = getattr(self, "_ax", None)
         canvas = getattr(self, "_pick_canvas", None)
@@ -867,6 +894,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                               textcoords="offset points", color="#ffee00",
                               fontsize=8, zorder=21)
             self._marker_artists.extend([dot, lbl])
+        self._draw_lipids(ax, atom_colors=ATOM_COLORS)
         canvas.draw_idle()
 
     def _clear_markers(self):
@@ -883,6 +911,9 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             return "Wait for the sugar-name lookup to finish first."
         if self._instances and not self._sugars_current():
             return "Sugar entries changed since the last build; click Build monomers again."
+        if self._lipids:
+            return ("This assistant supports sugars and amino acids only; "
+                    "remove lipid rows before using it.")
         return super()._assistant_blocker()
 
     def _make_miso_config(self, out_path):
@@ -893,6 +924,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         return build_miso_config(
             self._instances, self._connections, self.root_combo.currentData(),
             mode, out_path, self._sxm_path, positions_csv=out_path,
+            has_lipids=bool(self._lipids),
             peptide_bonds=self._peptide_bonds,
             peptide_order=self._current_peptide_order() if self._residue_indices() else None)
 
@@ -917,8 +949,10 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         if self._img is None:
             QtWidgets.QMessageBox.warning(self, "No image", self._load_error or "Image not loaded.")
             return
-        if not self._points:
-            QtWidgets.QMessageBox.warning(self, "No points", "Add at least one point first.")
+        placed_lipids = self._placed_lipids()
+        if not self._points and not placed_lipids:
+            QtWidgets.QMessageBox.warning(
+                self, "No points", "Add at least one point (or build a lipid) first.")
             return
         if self._lookup_worker is not None:
             QtWidgets.QMessageBox.warning(
@@ -930,6 +964,9 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         has_amino = use_sugars and any(inst["kind"] == "aa" for inst in self._instances)
         config = None
         export_errors = (OSError,)
+        lipid_blocks_yaml = with_yaml and bool(self._lipids)
+        if lipid_blocks_yaml:
+            with_yaml = False
         if with_yaml:
             if not use_sugars:
                 QtWidgets.QMessageBox.warning(
@@ -967,6 +1004,8 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                     writer.writerow([i, ox, oy, x, y, z, 0.0])
             self._export_npz(out_path)
             self._export_png(out_path)
+            lipid_files = (self._export_lipids_csv(out_path, placed_lipids)
+                           if placed_lipids else [])
             if use_sugars:
                 extra.append(self._export_orientations(out_path))
                 pickle_path = self._export_monomer_pickle(out_path)
@@ -992,6 +1031,12 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             message += ("\n\nNote: monomer entries are not built (or changed since the last "
                         "build), so no orientations were saved. Click Build monomers "
                         "and export again to include them.")
+        if lipid_files:
+            message += "\n\nLipids:\n  " + "\n  ".join(Path(p).name for p in lipid_files)
+        if lipid_blocks_yaml:
+            message += ("\n\nNo MISO YAML was generated: automatic YAML export supports "
+                        "sugars and amino acids only and lipid rows are present. Any existing "
+                        "YAML at this path was left unchanged.")
         if config is not None:
             self.viewer.last_monomer_yaml = str(yaml_path.resolve())
             message += (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
@@ -1055,6 +1100,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         ax = fig.add_subplot(111)
         ax.imshow(self._img, cmap="magma", origin="lower", interpolation="nearest")
         self._draw_monomers(ax)
+        self._draw_lipids_export(ax, ATOM_COLORS)
         for i, ((ox, oy, x_ang, y_ang, _z, col, row), text) in enumerate(
                 zip(self._points, self._point_labels())):
             ax.plot(col, row, marker="o", color="#2196f3", ms=6, mec="white", mew=0.7, zorder=20)
@@ -1083,4 +1129,5 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         canvas = getattr(self, "_pick_canvas", None)
         if self._pick_cid is not None and canvas is not None:
             canvas.mpl_disconnect(self._pick_cid)
+        self._disconnect_lipid_events(canvas)
         super().closeEvent(event)
