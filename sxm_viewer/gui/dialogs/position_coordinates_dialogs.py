@@ -34,12 +34,12 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
 
     TABLE_HEADERS = ["#", "X (Å)", "Y (Å)", "Height (Å)", "Name",
                      "Sugar / SMILES / residue", "Ring type", "Anomer",
-                     "Type", "Calpha point"]
+                     "Type"]
     COL_NAME, COL_SUGAR, COL_RING, COL_ANOMER = 4, 5, 6, 7
-    # The two amino acid columns are appended (logical 8 and 9) so the existing
-    # column numbers stay valid; they are moved next to the coordinates visually.
-    COL_TYPE, COL_LINK = 8, 9
-    TYPE_SUGAR, TYPE_AA, TYPE_FUNC = "Sugar", "Amino acid", "Functional pt"
+    # The Type column is appended (logical 8) so the existing column numbers stay
+    # valid; it is moved next to the coordinates visually.
+    COL_TYPE = 8
+    TYPE_SUGAR, TYPE_AA = "Sugar", "Amino acid"
 
     def __init__(self, viewer, parent=None):
         super().__init__(parent or viewer)
@@ -209,8 +209,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         types_row.addWidget(QtWidgets.QLabel("Optional monomers: Sugars"))
         self.aa_chk = QtWidgets.QCheckBox("Include amino acids")
         self.aa_chk.setToolTip(
-            "Show the Type column. An amino acid is placed at its C-alpha point; its "
-            "side-chain (functional) point is another picked point linked to it.")
+            "Show the Type column. An amino acid is placed at its C-alpha point.")
         self.aa_chk.toggled.connect(self._on_aa_toggled)
         types_row.addWidget(self.aa_chk)
         self.lipid_chk = QtWidgets.QCheckBox("Include lipids (coming soon)")
@@ -222,9 +221,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             "Optional: for any point, type a sugar name (e.g. 'D chair 4C1 glucose', "
             "'chair KDO') or a SMILES, then click Build monomers. Points left blank "
             "are exported as plain coordinates. With 'Include amino acids', set Type to "
-            "'Amino acid' and type a residue (N or Asn) at the C-alpha point; pick the "
-            "side-chain point as a separate point with Type 'Functional pt' and the "
-            "number of its residue's point in 'Calpha point'.")
+            "'Amino acid' and type a residue (N or Asn) at the C-alpha point.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -236,12 +233,10 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_SUGAR, QtWidgets.QHeaderView.Interactive)
         self.table.setColumnWidth(self.COL_SUGAR, 190)
-        # Show Type and Calpha point right after the coordinates; hidden until the
-        # 'Include amino acids' box is ticked, so sugar-only use looks unchanged.
+        # Show Type right after the coordinates; hidden until the 'Include amino
+        # acids' box is ticked, so sugar-only use looks unchanged.
         header.moveSection(header.visualIndex(self.COL_TYPE), 4)
-        header.moveSection(header.visualIndex(self.COL_LINK), 5)
         self.table.setColumnHidden(self.COL_TYPE, True)
-        self.table.setColumnHidden(self.COL_LINK, True)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked
                                    | QtWidgets.QAbstractItemView.EditKeyPressed
@@ -439,23 +434,12 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             combo.currentTextChanged.connect(self._update_build_status)
             self.table.setCellWidget(index, col, combo)
         type_combo = QtWidgets.QComboBox()
-        type_combo.addItems([self.TYPE_SUGAR, self.TYPE_AA, self.TYPE_FUNC])
+        type_combo.addItems([self.TYPE_SUGAR, self.TYPE_AA])
         type_combo.setToolTip(
-            "Sugar: sugar name or SMILES.  Amino acid: residue at its C-alpha point.  "
-            "Functional pt: the side-chain point of an amino acid, linked by point number.")
+            "Sugar: sugar name or SMILES.  Amino acid: residue at its C-alpha point.")
         type_combo.currentTextChanged.connect(
             lambda _text, combo=type_combo: self._on_type_changed(combo))
         self.table.setCellWidget(index, self.COL_TYPE, type_combo)
-        link = QtWidgets.QSpinBox()
-        # Wide fixed range: a link to a missing point is reported at build time
-        # instead of being silently clamped onto another residue.
-        link.setRange(-1, 9999)
-        link.setSpecialValueText("none")
-        link.setValue(-1)
-        link.setEnabled(False)
-        link.setToolTip("Point number of the amino acid this side-chain point belongs to.")
-        link.valueChanged.connect(self._on_link_changed)
-        self.table.setCellWidget(index, self.COL_LINK, link)
 
     def _refresh_table(self):
         self.count_lbl.setText(f"Points: {len(self._points)}")
@@ -476,7 +460,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
 
     # ------------------------------------------------------------------ sugars
     def _type_of(self, row):
-        """Row type: Sugar (default), Amino acid or Functional pt."""
+        """Row type: Sugar (default) or Amino acid."""
         combo = self.table.cellWidget(row, self.COL_TYPE)
         return combo.currentText() if combo is not None else self.TYPE_SUGAR
 
@@ -509,37 +493,9 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 entries.append((r, text))
         return entries
 
-    def _functional_entries(self):
-        """(point, linked amino acid point or -1) for every Functional pt row."""
-        return [(r, self.table.cellWidget(r, self.COL_LINK).value())
-                for r in range(self.table.rowCount())
-                if self._type_of(r) == self.TYPE_FUNC]
-
     def _monomer_state(self):
         """Everything a build depends on; compared with the state at build time."""
-        return (self._sugar_entries(), self._aa_entries(), self._functional_entries())
-
-    def _functional_problems(self):
-        """First problem with the functional point links, or None."""
-        aa_points = {r for r, _text in self._aa_entries()}
-        owner = {}
-        for r, link in self._functional_entries():
-            if link < 0:
-                return f"Point {r}: choose the point number of the amino acid it belongs to."
-            if link == r or link not in aa_points:
-                return (f"Point {r}: point {link} is not an amino acid row with a residue "
-                        "typed. Set Type to 'Amino acid' there first.")
-            if link in owner:
-                return (f"Points {owner[link]} and {r} are both functional points of the "
-                        f"residue at point {link}. A residue has one functional point.")
-            owner[link] = r
-        return None
-
-    def _functional_links(self):
-        """{functional point: amino acid point} for the valid links (used for drawing)."""
-        aa_points = {r for r, _text in self._aa_entries()}
-        return {r: link for r, link in self._functional_entries()
-                if link in aa_points and link != r}
+        return (self._sugar_entries(), self._aa_entries())
 
     def _sugars_current(self):
         """True when built monomers still match the table entries."""
@@ -554,14 +510,13 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                                for r in range(self.table.rowCount())):
             QtWidgets.QMessageBox.warning(
                 self, "Amino acids",
-                "Some points are set to Amino acid or Functional pt. Set them back to "
+                "Some points are set to Amino acid. Set them back to "
                 "Sugar before hiding the amino acid columns.")
             self.aa_chk.blockSignals(True)
             self.aa_chk.setChecked(True)
             self.aa_chk.blockSignals(False)
             return
         self.table.setColumnHidden(self.COL_TYPE, not checked)
-        self.table.setColumnHidden(self.COL_LINK, not checked)
 
     def _on_type_changed(self, combo):
         row = next((r for r in range(self.table.rowCount())
@@ -576,25 +531,15 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         text_item = self.table.item(row, self.COL_SUGAR)
         self.table.blockSignals(True)
         try:
-            # Amino acid names come from the residue; functional points have neither.
+            # Amino acid names come from the residue.
             name_item.setFlags(editable if kind == self.TYPE_SUGAR else locked)
-            text_item.setFlags(locked if kind == self.TYPE_FUNC else editable)
-            if kind == self.TYPE_FUNC:
-                name_item.setText("")
-                text_item.setText("")
             text_item.setToolTip({
                 self.TYPE_SUGAR: "Sugar name or SMILES, e.g. chair KDO or D chair 4C1 glucose.",
-                self.TYPE_AA: "Residue at this C-alpha point, e.g. N or Asn.",
-                self.TYPE_FUNC: "Not used for a functional point."}[kind])
+                self.TYPE_AA: "Residue at this C-alpha point, e.g. N or Asn."}[kind])
         finally:
             self.table.blockSignals(False)
         self.table.cellWidget(row, self.COL_RING).setEnabled(kind == self.TYPE_SUGAR)
         self.table.cellWidget(row, self.COL_ANOMER).setEnabled(kind == self.TYPE_SUGAR)
-        self.table.cellWidget(row, self.COL_LINK).setEnabled(kind == self.TYPE_FUNC)
-        self._update_build_status()
-        self._draw_markers()
-
-    def _on_link_changed(self, _value):
         self._update_build_status()
         self._draw_markers()
 
@@ -641,10 +586,6 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 "Type a sugar name or SMILES (or, with 'Include amino acids', a residue) in "
                 "the 'Sugar / SMILES / residue' column of at least one point first. "
                 "Assigning monomers is optional.")
-            return
-        problem = self._functional_problems()
-        if problem:
-            QtWidgets.QMessageBox.warning(self, "Functional point", problem)
             return
         requests = []
         for r, _name, text, ring, anom in entries:
@@ -749,10 +690,6 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         entries = self._assign_names(self._sugar_entries())
         if entries is None:
             return
-        problem = self._functional_problems()
-        if problem:
-            QtWidgets.QMessageBox.warning(self, "Functional point", problem)
-            return
         aa_defs = []
         for r, text in self._aa_entries():
             aa_name, aa_smiles = resolve_aa(text)
@@ -793,7 +730,6 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         failures = []
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            owner_of = {link: r for r, link in self._functional_entries()}
             aa_templates = {}
             for r, aa_name, aa_smiles in aa_defs:
                 if aa_name not in aa_templates:
@@ -815,8 +751,6 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                     "com": [x_ang, y_ang, height],
                     "euler": list(old["euler"]) if same else [0.0, 0.0, 0.0],
                     "func_pos": None,
-                    # The picked point that holds this residue's side-chain point.
-                    "functional_point": owner_of.get(r),
                 })
             for r, name, text, ring, anom in entries:
                 key = (text, ring, anom)
@@ -912,26 +846,8 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
 
     def _point_labels(self):
         names = {inst["position"]: inst["name"] for inst in self._instances}
-        links = self._functional_links()
-        return [f"{i} {names[i]}" if i in names
-                else f"{i} func of {links[i]}" if i in links else str(i)
+        return [f"{i} {names[i]}" if i in names else str(i)
                 for i in range(len(self._points))]
-
-    def _draw_functional_links(self, ax, artists=None, lw=1.0):
-        """Dashed line from each side-chain point to its amino acid's point."""
-        for func, ca in self._functional_links().items():
-            if func >= len(self._points) or ca >= len(self._points):
-                continue
-            f_col, f_row = self._points[func][5:7]
-            c_col, c_row = self._points[ca][5:7]
-            ln, = ax.plot([c_col, f_col], [c_row, f_row], "--", color="#00e5ff",
-                          lw=lw, zorder=19, alpha=0.9)
-            if artists is not None:
-                artists.append(ln)
-
-    def _point_style(self, index, links):
-        """(marker, color) of a picked point: triangles for side-chain points."""
-        return ("^", "#00e5ff") if index in links else ("o", "#2196f3")
 
     def _draw_monomers(self, ax, active=None, artists=None):
         for inst in self._instances:
@@ -961,12 +877,9 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             return
         self._clear_markers()
         self._draw_monomers(ax, self._selected_instance(), self._marker_artists)
-        self._draw_functional_links(ax, self._marker_artists)
-        links = self._functional_links()
         for i, ((ox, oy, x_ang, y_ang, _z, col, row), text) in enumerate(
                 zip(self._points, self._point_labels())):
-            marker, color = self._point_style(i, links)
-            dot, = ax.plot([col], [row], marker=marker, color=color,
+            dot, = ax.plot([col], [row], marker="o", color="#2196f3",
                            ms=7, mec="white", mew=0.8, zorder=20)
             lbl = ax.annotate(text, xy=(col, row), xytext=(4, 4),
                               textcoords="offset points", color="#ffee00",
@@ -1099,10 +1012,9 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             self.viewer.last_monomer_yaml = None
             message += ("\n\nNo MISO YAML was generated: automatic YAML export supports "
                         "sugars only, and amino acids are present. The orientations CSV "
-                        "lists each residue's C-alpha point (column Point) and its "
-                        "side-chain point (column Functional_Point) for the peptide section "
-                        "(ca_position, functional_position). Any existing YAML at this path "
-                        "was left unchanged; do not reuse it without updating it.")
+                        "lists each residue's C-alpha point (column Point). Any existing "
+                        "YAML at this path was left unchanged; do not reuse it without "
+                        "updating it.")
         if config is not None:
             self.viewer.last_monomer_yaml = str(yaml_path.resolve())
             message += (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
@@ -1129,16 +1041,12 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         """Orientation CSV keyed by the point index used in the YAML."""
         import csv
         ori_path = f"{Path(out_path).with_suffix('')}_orientations.csv"
-        # Sugar only exports keep the original columns; the extra column appears
-        # only when amino acids are present.
-        with_amino = any(inst["kind"] == "aa" for inst in self._instances)
         with open(ori_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Point", "Instance", "Type", "Conformer", "SMILES",
                         "Rot_X (deg)", "Rot_Y (deg)", "Rot_Z (deg)",
                         "quat_x", "quat_y", "quat_z", "quat_w",
-                        "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"]
-                       + (["Functional_Point"] if with_amino else []))
+                        "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"])
             for inst in self._instances:
                 Rm = euler_to_matrix(*inst["euler"])
                 q = matrix_to_quaternion(Rm)
@@ -1147,9 +1055,6 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                 row += [f"{v:.4f}" for v in inst["euler"]]
                 row += [f"{q[0]:.8f}", f"{q[1]:.8f}", f"{q[2]:.8f}", f"{q[3]:.8f}"]
                 row += [f"{v:.8f}" for v in Rm.flatten()]
-                if with_amino:
-                    point = inst.get("functional_point")
-                    row.append("" if point is None else point)
                 w.writerow(row)
         return ori_path
 
@@ -1173,12 +1078,9 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         ax = fig.add_subplot(111)
         ax.imshow(self._img, cmap="magma", origin="lower", interpolation="nearest")
         self._draw_monomers(ax)
-        self._draw_functional_links(ax)
-        links = self._functional_links()
         for i, ((ox, oy, x_ang, y_ang, _z, col, row), text) in enumerate(
                 zip(self._points, self._point_labels())):
-            marker, color = self._point_style(i, links)
-            ax.plot(col, row, marker=marker, color=color, ms=6, mec="white", mew=0.7, zorder=20)
+            ax.plot(col, row, marker="o", color="#2196f3", ms=6, mec="white", mew=0.7, zorder=20)
             ax.annotate(text, xy=(col, row), xytext=(4, 4),
                         textcoords="offset points", color="#ffee00", fontsize=7, zorder=21)
         ax.set_xlabel("col (px)")
