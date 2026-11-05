@@ -304,6 +304,40 @@ def build_sugar_template(engine, smiles, ring, anom):
             "atom_types": atom_types, "bonds": bonds, "rigid": rigid}
 
 
+def build_aa_template(smiles, name):
+    """Single lowest-energy conformer for an amino acid (embed + MMFF).
+
+    The anchor (COM) is the C-alpha atom, because MISO places and rotates each
+    residue by treating the picked point as the C-alpha. Shared by the Position
+    monomers and Position coordinates dialogs. Returns None on failure.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        mol = Chem.AddHs(mol)
+        if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:
+            return None
+        try:
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+        except Exception:
+            AllChem.UFFOptimizeMolecule(mol, maxIters=500)
+        # Locate the side-chain functional group (e.g. the ring in Phe) and the
+        # C-alpha on the explicit-H mol before RemoveHs strips the hydrogens.
+        functional_atom_indices = _find_functional_atom_indices(mol, name)
+        ca_atom_index = _find_ca_atom(mol, name)
+        if ca_atom_index is None:
+            print(f"amino-acid build warning for {name}: Calpha not found, "
+                  f"falling back to whole-residue mass centroid as anchor")
+        return PositionMonomerDialog._template_from_mol(
+            mol, name, functional_atom_indices, ca_atom_index)
+    except Exception as exc:
+        print(f"amino-acid build failed for {name} ({smiles}): {exc}")
+        return None
+
+
 def import_lipid_engine():
     """Import MISO's lipid_building module (needs MISO/ on sys.path as a package)."""
     repo = Path(__file__).resolve().parents[3]
@@ -1095,35 +1129,7 @@ class PositionMonomerDialog(MISOConnectionMixin, QtWidgets.QDialog):
 
     def _build_aa_template(self, smiles, name):
         """Single lowest-energy conformer for an amino acid (embed + MMFF)."""
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
-        try:
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                return None
-            mol = Chem.AddHs(mol)
-            if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:
-                return None
-            try:
-                AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
-            except Exception:
-                AllChem.UFFOptimizeMolecule(mol, maxIters=500)
-            # Locate the side-chain functional group (e.g. the ring in Phe)
-            # and the Cα atom on the explicit-H mol before RemoveHs strips
-            # them. The Cα becomes the template's anchor (COM) instead of
-            # the whole residue's mass centroid, since MISO places/rotates
-            # the residue by treating this point as Cα; for an asymmetric
-            # residue like Phe the two differ enough to visibly displace the
-            # ring if the mass centroid were used instead.
-            functional_atom_indices = _find_functional_atom_indices(mol, name)
-            ca_atom_index = _find_ca_atom(mol, name)
-            if ca_atom_index is None:
-                print(f"amino-acid build warning for {name}: Cα not found, "
-                      f"falling back to whole-residue mass centroid as anchor")
-            return self._template_from_mol(mol, name, functional_atom_indices, ca_atom_index)
-        except Exception as exc:
-            print(f"amino-acid build failed for {name} ({smiles}): {exc}")
-            return None
+        return build_aa_template(smiles, name)
 
     # ------------------------------------------------------------------ geometry
     def _ang_to_pixel(self, x_ang, y_ang):

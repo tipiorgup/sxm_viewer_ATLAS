@@ -9,7 +9,8 @@ from ...utils.sugar_lookup import SugarLookupError, parse_sugar_description
 from ._miso_connection_panel import MISOConnectionMixin
 from .position_monomer_dialogs import (
     ANOMERS, ATOM_COLORS, ATOM_SIZE, RING_TYPES, _SugarLookupWorker,
-    build_sugar_template, euler_to_matrix, import_monomer_engine, matrix_to_quaternion,
+    build_aa_template, build_sugar_template, euler_to_matrix, import_monomer_engine,
+    matrix_to_quaternion, resolve_aa,
 )
 
 
@@ -32,8 +33,13 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
     """
 
     TABLE_HEADERS = ["#", "X (Å)", "Y (Å)", "Height (Å)", "Name",
-                     "Sugar name / SMILES", "Ring type", "Anomer"]
+                     "Sugar / SMILES / residue", "Ring type", "Anomer",
+                     "Type", "Calpha point"]
     COL_NAME, COL_SUGAR, COL_RING, COL_ANOMER = 4, 5, 6, 7
+    # The two amino acid columns are appended (logical 8 and 9) so the existing
+    # column numbers stay valid; they are moved next to the coordinates visually.
+    COL_TYPE, COL_LINK = 8, 9
+    TYPE_SUGAR, TYPE_AA, TYPE_FUNC = "Sugar", "Amino acid", "Functional pt"
 
     def __init__(self, viewer, parent=None):
         super().__init__(parent or viewer)
@@ -201,8 +207,11 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
 
         types_row = QtWidgets.QVBoxLayout()
         types_row.addWidget(QtWidgets.QLabel("Optional monomers: Sugars"))
-        self.aa_chk = QtWidgets.QCheckBox("Include amino acids (coming soon)")
-        self.aa_chk.setEnabled(False)
+        self.aa_chk = QtWidgets.QCheckBox("Include amino acids")
+        self.aa_chk.setToolTip(
+            "Show the Type column. An amino acid is placed at its C-alpha point; its "
+            "side-chain (functional) point is another picked point linked to it.")
+        self.aa_chk.toggled.connect(self._on_aa_toggled)
         types_row.addWidget(self.aa_chk)
         self.lipid_chk = QtWidgets.QCheckBox("Include lipids (coming soon)")
         self.lipid_chk.setEnabled(False)
@@ -212,7 +221,10 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         hint = QtWidgets.QLabel(
             "Optional: for any point, type a sugar name (e.g. 'D chair 4C1 glucose', "
             "'chair KDO') or a SMILES, then click Build monomers. Points left blank "
-            "are exported as plain coordinates.")
+            "are exported as plain coordinates. With 'Include amino acids', set Type to "
+            "'Amino acid' and type a residue (N or Asn) at the C-alpha point; pick the "
+            "side-chain point as a separate point with Type 'Functional pt' and the "
+            "number of its residue's point in 'Calpha point'.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -224,6 +236,12 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_SUGAR, QtWidgets.QHeaderView.Interactive)
         self.table.setColumnWidth(self.COL_SUGAR, 190)
+        # Show Type and Calpha point right after the coordinates; hidden until the
+        # 'Include amino acids' box is ticked, so sugar-only use looks unchanged.
+        header.moveSection(header.visualIndex(self.COL_TYPE), 4)
+        header.moveSection(header.visualIndex(self.COL_LINK), 5)
+        self.table.setColumnHidden(self.COL_TYPE, True)
+        self.table.setColumnHidden(self.COL_LINK, True)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked
                                    | QtWidgets.QAbstractItemView.EditKeyPressed
@@ -243,7 +261,7 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         build_row.addWidget(self.build_status, 1)
         layout.addLayout(build_row)
 
-        rot_group = QtWidgets.QGroupBox("Rotation of the selected point's sugar")
+        rot_group = QtWidgets.QGroupBox("Rotation of the selected point's monomer")
         rot_layout = QtWidgets.QHBoxLayout(rot_group)
         self.spin = {}
         for key, label in (("rx", "RX"), ("ry", "RY"), ("rz", "RZ")):
@@ -420,6 +438,24 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             combo.addItems(values)
             combo.currentTextChanged.connect(self._update_build_status)
             self.table.setCellWidget(index, col, combo)
+        type_combo = QtWidgets.QComboBox()
+        type_combo.addItems([self.TYPE_SUGAR, self.TYPE_AA, self.TYPE_FUNC])
+        type_combo.setToolTip(
+            "Sugar: sugar name or SMILES.  Amino acid: residue at its C-alpha point.  "
+            "Functional pt: the side-chain point of an amino acid, linked by point number.")
+        type_combo.currentTextChanged.connect(
+            lambda _text, combo=type_combo: self._on_type_changed(combo))
+        self.table.setCellWidget(index, self.COL_TYPE, type_combo)
+        link = QtWidgets.QSpinBox()
+        # Wide fixed range: a link to a missing point is reported at build time
+        # instead of being silently clamped onto another residue.
+        link.setRange(-1, 9999)
+        link.setSpecialValueText("none")
+        link.setValue(-1)
+        link.setEnabled(False)
+        link.setToolTip("Point number of the amino acid this side-chain point belongs to.")
+        link.valueChanged.connect(self._on_link_changed)
+        self.table.setCellWidget(index, self.COL_LINK, link)
 
     def _refresh_table(self):
         self.count_lbl.setText(f"Points: {len(self._points)}")
@@ -439,10 +475,17 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         self._refresh_table()
 
     # ------------------------------------------------------------------ sugars
+    def _type_of(self, row):
+        """Row type: Sugar (default), Amino acid or Functional pt."""
+        combo = self.table.cellWidget(row, self.COL_TYPE)
+        return combo.currentText() if combo is not None else self.TYPE_SUGAR
+
     def _sugar_entries(self):
-        """(point, name, text, ring, anomer) for every row with sugar text."""
+        """(point, name, text, ring, anomer) for every sugar row with text."""
         entries = []
         for r in range(self.table.rowCount()):
+            if self._type_of(r) != self.TYPE_SUGAR:
+                continue
             text_item = self.table.item(r, self.COL_SUGAR)
             text = text_item.text().strip() if text_item else ""
             if not text:
@@ -454,32 +497,132 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             entries.append((r, name, text, ring, anom))
         return entries
 
+    def _aa_entries(self):
+        """(point, residue text) for every amino acid row with a residue typed."""
+        entries = []
+        for r in range(self.table.rowCount()):
+            if self._type_of(r) != self.TYPE_AA:
+                continue
+            item = self.table.item(r, self.COL_SUGAR)
+            text = item.text().strip() if item else ""
+            if text:
+                entries.append((r, text))
+        return entries
+
+    def _functional_entries(self):
+        """(point, linked amino acid point or -1) for every Functional pt row."""
+        return [(r, self.table.cellWidget(r, self.COL_LINK).value())
+                for r in range(self.table.rowCount())
+                if self._type_of(r) == self.TYPE_FUNC]
+
+    def _monomer_state(self):
+        """Everything a build depends on; compared with the state at build time."""
+        return (self._sugar_entries(), self._aa_entries(), self._functional_entries())
+
+    def _functional_problems(self):
+        """First problem with the functional point links, or None."""
+        aa_points = {r for r, _text in self._aa_entries()}
+        owner = {}
+        for r, link in self._functional_entries():
+            if link < 0:
+                return f"Point {r}: choose the point number of the amino acid it belongs to."
+            if link == r or link not in aa_points:
+                return (f"Point {r}: point {link} is not an amino acid row with a residue "
+                        "typed. Set Type to 'Amino acid' there first.")
+            if link in owner:
+                return (f"Points {owner[link]} and {r} are both functional points of the "
+                        f"residue at point {link}. A residue has one functional point.")
+            owner[link] = r
+        return None
+
+    def _functional_links(self):
+        """{functional point: amino acid point} for the valid links (used for drawing)."""
+        aa_points = {r for r, _text in self._aa_entries()}
+        return {r: link for r, link in self._functional_entries()
+                if link in aa_points and link != r}
+
     def _sugars_current(self):
         """True when built monomers still match the table entries."""
-        return bool(self._instances) and self._built_entries == self._sugar_entries()
+        return bool(self._instances) and self._built_entries == self._monomer_state()
 
     def _on_table_item_changed(self, item):
         if item.column() in (self.COL_NAME, self.COL_SUGAR):
             self._update_build_status()
 
+    def _on_aa_toggled(self, checked):
+        if not checked and any(self._type_of(r) != self.TYPE_SUGAR
+                               for r in range(self.table.rowCount())):
+            QtWidgets.QMessageBox.warning(
+                self, "Amino acids",
+                "Some points are set to Amino acid or Functional pt. Set them back to "
+                "Sugar before hiding the amino acid columns.")
+            self.aa_chk.blockSignals(True)
+            self.aa_chk.setChecked(True)
+            self.aa_chk.blockSignals(False)
+            return
+        self.table.setColumnHidden(self.COL_TYPE, not checked)
+        self.table.setColumnHidden(self.COL_LINK, not checked)
+
+    def _on_type_changed(self, combo):
+        row = next((r for r in range(self.table.rowCount())
+                    if self.table.cellWidget(r, self.COL_TYPE) is combo), None)
+        if row is None:
+            return
+        kind = combo.currentText()
+        editable = (QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+                    | QtCore.Qt.ItemIsEditable)
+        locked = QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+        name_item = self.table.item(row, self.COL_NAME)
+        text_item = self.table.item(row, self.COL_SUGAR)
+        self.table.blockSignals(True)
+        try:
+            # Amino acid names come from the residue; functional points have neither.
+            name_item.setFlags(editable if kind == self.TYPE_SUGAR else locked)
+            text_item.setFlags(locked if kind == self.TYPE_FUNC else editable)
+            if kind == self.TYPE_FUNC:
+                name_item.setText("")
+                text_item.setText("")
+            text_item.setToolTip({
+                self.TYPE_SUGAR: "Sugar name or SMILES, e.g. chair KDO or D chair 4C1 glucose.",
+                self.TYPE_AA: "Residue at this C-alpha point, e.g. N or Asn.",
+                self.TYPE_FUNC: "Not used for a functional point."}[kind])
+        finally:
+            self.table.blockSignals(False)
+        self.table.cellWidget(row, self.COL_RING).setEnabled(kind == self.TYPE_SUGAR)
+        self.table.cellWidget(row, self.COL_ANOMER).setEnabled(kind == self.TYPE_SUGAR)
+        self.table.cellWidget(row, self.COL_LINK).setEnabled(kind == self.TYPE_FUNC)
+        self._update_build_status()
+        self._draw_markers()
+
+    def _on_link_changed(self, _value):
+        self._update_build_status()
+        self._draw_markers()
+
     def _update_build_status(self, *_args):
         if not hasattr(self, "build_status"):
             return
-        entries = self._sugar_entries()
+        sugars, amino = self._sugar_entries(), self._aa_entries()
         if self._lookup_worker is not None:
             return
-        if not entries:
+        has_amino = bool(amino) or any(inst["kind"] == "aa" for inst in self._instances)
+        noun = "Monomer" if has_amino else "Sugar"
+        if not sugars and not amino:
             if self._instances:
-                text = "Sugar entries were cleared; exports will contain coordinates only."
+                text = f"{noun} entries were cleared; exports will contain coordinates only."
             else:
                 text = "No monomers assigned (optional)."
         elif not self._instances or self._built_entries is None:
-            text = f"{len(entries)} point(s) have sugar entries; click Build monomers."
-        elif self._built_entries != entries:
-            text = "Sugar entries changed since the last build; click Build monomers again."
+            text = (f"{len(sugars) + len(amino)} point(s) have "
+                    f"{noun.lower()} entries; click Build monomers.")
+        elif self._built_entries != self._monomer_state():
+            text = f"{noun} entries changed since the last build; click Build monomers again."
         else:
-            text = (f"Built {len(self._instances)} sugar unit(s) at point(s) "
-                    + ", ".join(str(inst["position"]) for inst in self._instances) + ".")
+            n_sugar = sum(1 for inst in self._instances if inst["kind"] == "sugar")
+            text = f"Built {n_sugar} sugar unit(s)"
+            if has_amino:
+                text += f" and {len(self._instances) - n_sugar} amino acid(s)"
+            text += (" at point(s) "
+                     + ", ".join(str(inst["position"]) for inst in self._instances) + ".")
         self.build_status.setText(text)
 
     @staticmethod
@@ -492,11 +635,16 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         if self._lookup_worker is not None:
             return
         entries = self._sugar_entries()
-        if not entries:
+        if not entries and not self._aa_entries():
             QtWidgets.QMessageBox.warning(
                 self, "Nothing to build",
-                "Type a sugar name or SMILES in the 'Sugar name / SMILES' column of at "
-                "least one point first. Assigning monomers is optional.")
+                "Type a sugar name or SMILES (or, with 'Include amino acids', a residue) in "
+                "the 'Sugar / SMILES / residue' column of at least one point first. "
+                "Assigning monomers is optional.")
+            return
+        problem = self._functional_problems()
+        if problem:
+            QtWidgets.QMessageBox.warning(self, "Functional point", problem)
             return
         requests = []
         for r, _name, text, ring, anom in entries:
@@ -601,16 +749,41 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         entries = self._assign_names(self._sugar_entries())
         if entries is None:
             return
-        try:
-            engine = import_monomer_engine()
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(
-                self, "MISO engine", f"Could not import monomer builder:\n{exc}")
+        problem = self._functional_problems()
+        if problem:
+            QtWidgets.QMessageBox.warning(self, "Functional point", problem)
             return
+        aa_defs = []
+        for r, text in self._aa_entries():
+            aa_name, aa_smiles = resolve_aa(text)
+            if aa_name is None:
+                QtWidgets.QMessageBox.warning(
+                    self, "Amino acid",
+                    f"Point {r}: '{text}' is not one of the 20 standard residues. "
+                    "Use a 1 or 3 letter code, for example N or Asn.")
+                return
+            aa_defs.append((r, aa_name, aa_smiles))
+        clash = {name for _r, name, *_ in entries} & {name for _r, name, _s in aa_defs}
+        if clash:
+            QtWidgets.QMessageBox.warning(
+                self, "Names",
+                f"The sugar name '{sorted(clash)[0]}' is also a residue name. Give the "
+                "sugar a different Name.")
+            return
+        engine = None
+        if entries:
+            try:
+                engine = import_monomer_engine()
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(
+                    self, "MISO engine", f"Could not import monomer builder:\n{exc}")
+                return
         self.table.blockSignals(True)
         try:
             for r, name, *_ in entries:
                 self.table.item(r, self.COL_NAME).setText(name)
+            for r, aa_name, _smiles in aa_defs:
+                self.table.item(r, self.COL_NAME).setText(aa_name)
         finally:
             self.table.blockSignals(False)
 
@@ -620,6 +793,31 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         failures = []
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
+            owner_of = {link: r for r, link in self._functional_entries()}
+            aa_templates = {}
+            for r, aa_name, aa_smiles in aa_defs:
+                if aa_name not in aa_templates:
+                    aa_templates[aa_name] = build_aa_template(aa_smiles, aa_name)
+                tmpl = aa_templates[aa_name]
+                if tmpl is None:
+                    failures.append(f"point {r}: {aa_name}")
+                    continue
+                _ox, _oy, x_ang, y_ang, height, *_rest = self._points[r]
+                old = previous.get(r)
+                same = old is not None and old["kind"] == "aa" and old["name"] == aa_name
+                instances.append({
+                    "label": f"{aa_name}.{r}", "name": aa_name, "kind": "aa",
+                    "position": r, "smiles": aa_smiles, "ring": "n/a", "anomer": "n/a",
+                    "conf_name": tmpl["conf_name"],
+                    "rel": tmpl["rel"], "atom_types": tmpl["atom_types"],
+                    "bonds": tmpl["bonds"], "rigid": None,
+                    "functional_rel": tmpl.get("functional_rel"),
+                    "com": [x_ang, y_ang, height],
+                    "euler": list(old["euler"]) if same else [0.0, 0.0, 0.0],
+                    "func_pos": None,
+                    # The picked point that holds this residue's side-chain point.
+                    "functional_point": owner_of.get(r),
+                })
             for r, name, text, ring, anom in entries:
                 key = (text, ring, anom)
                 if key not in templates:
@@ -630,7 +828,8 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                     continue
                 _ox, _oy, x_ang, y_ang, height, *_rest = self._points[r]
                 old = previous.get(r)
-                same = old is not None and (old["smiles"], old["ring"], old["anomer"]) == key
+                same = (old is not None and old["kind"] == "sugar"
+                        and (old["smiles"], old["ring"], old["anomer"]) == key)
                 instances.append({
                     "label": f"{name}.{r}", "name": name, "kind": "sugar",
                     "position": r,
@@ -646,11 +845,19 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
+        instances.sort(key=lambda inst: inst["position"])
         self._instances = instances
-        self._built_entries = self._sugar_entries()
+        self._built_entries = self._monomer_state()
         self._reset_connections()
         self._refresh_table()
-        msg = f"Built {len(instances)} sugar unit(s) for {len(entries)} point(s) with sugar entries."
+        n_amino = len(aa_defs)
+        if n_amino:
+            msg = (f"Built {sum(1 for i in instances if i['kind'] == 'sugar')} sugar unit(s) "
+                   f"and {sum(1 for i in instances if i['kind'] == 'aa')} amino acid(s) "
+                   f"for {len(entries) + n_amino} point(s).")
+        else:
+            msg = (f"Built {len(instances)} sugar unit(s) for {len(entries)} point(s) "
+                   "with sugar entries.")
         if failures:
             msg += ("\n\nCould not build (no matching conformer):\n  "
                     + "\n  ".join(failures))
@@ -705,8 +912,26 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
 
     def _point_labels(self):
         names = {inst["position"]: inst["name"] for inst in self._instances}
-        return [f"{i} {names[i]}" if i in names else str(i)
+        links = self._functional_links()
+        return [f"{i} {names[i]}" if i in names
+                else f"{i} func of {links[i]}" if i in links else str(i)
                 for i in range(len(self._points))]
+
+    def _draw_functional_links(self, ax, artists=None, lw=1.0):
+        """Dashed line from each side-chain point to its amino acid's point."""
+        for func, ca in self._functional_links().items():
+            if func >= len(self._points) or ca >= len(self._points):
+                continue
+            f_col, f_row = self._points[func][5:7]
+            c_col, c_row = self._points[ca][5:7]
+            ln, = ax.plot([c_col, f_col], [c_row, f_row], "--", color="#00e5ff",
+                          lw=lw, zorder=19, alpha=0.9)
+            if artists is not None:
+                artists.append(ln)
+
+    def _point_style(self, index, links):
+        """(marker, color) of a picked point: triangles for side-chain points."""
+        return ("^", "#00e5ff") if index in links else ("o", "#2196f3")
 
     def _draw_monomers(self, ax, active=None, artists=None):
         for inst in self._instances:
@@ -736,8 +961,12 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             return
         self._clear_markers()
         self._draw_monomers(ax, self._selected_instance(), self._marker_artists)
-        for (ox, oy, x_ang, y_ang, _z, col, row), text in zip(self._points, self._point_labels()):
-            dot, = ax.plot([col], [row], marker="o", color="#2196f3",
+        self._draw_functional_links(ax, self._marker_artists)
+        links = self._functional_links()
+        for i, ((ox, oy, x_ang, y_ang, _z, col, row), text) in enumerate(
+                zip(self._points, self._point_labels())):
+            marker, color = self._point_style(i, links)
+            dot, = ax.plot([col], [row], marker=marker, color=color,
                            ms=7, mec="white", mew=0.8, zorder=20)
             lbl = ax.annotate(text, xy=(col, row), xytext=(4, 4),
                               textcoords="offset points", color="#ffee00",
@@ -800,18 +1029,20 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             return
         out_path = self.csv_le.text().strip() or "circle_input.csv"
         use_sugars = self._sugars_current()
-        stale = bool(self._sugar_entries()) and not use_sugars
+        stale = bool(self._sugar_entries() or self._aa_entries()) and not use_sugars
+        has_amino = use_sugars and any(inst["kind"] == "aa" for inst in self._instances)
         config = None
         export_errors = (OSError,)
         if with_yaml:
             if not use_sugars:
                 QtWidgets.QMessageBox.warning(
                     self, "MISO YAML export",
-                    ("Sugar entries are not built or changed since the last build. "
+                    ("Monomer entries are not built or changed since the last build. "
                      "Click Build monomers first." if stale else
                      "Assign sugars to points and click Build monomers first.")
                     + "\n\nUse Export coordinates to save the points without a YAML.")
                 return
+        if with_yaml and not has_amino:
             try:
                 config = self._make_miso_config(out_path)
             except MISOExportError as exc:
@@ -841,7 +1072,9 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
             self._export_png(out_path)
             if use_sugars:
                 extra.append(self._export_orientations(out_path))
-                extra.append(self._export_monomer_pickle(out_path))
+                pickle_path = self._export_monomer_pickle(out_path)
+                if pickle_path:
+                    extra.append(pickle_path)
             if config is not None:
                 with open(yaml_path, "w", encoding="utf-8") as handle:
                     yaml.safe_dump(config, handle, sort_keys=False, allow_unicode=True)
@@ -855,12 +1088,21 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
                    f"NPZ: {Path(out_path).with_suffix('.npz').name}\n"
                    f"PNG: {Path(out_path).with_suffix('.png').name}")
         if extra:
-            message += (f"\n\nSugar orientations and geometry ({len(self._instances)} "
+            kind_label = "Monomer" if has_amino else "Sugar"
+            message += (f"\n\n{kind_label} orientations and geometry ({len(self._instances)} "
                         "unit(s)):\n  " + "\n  ".join(Path(p).name for p in extra))
         if stale:
-            message += ("\n\nNote: sugar entries are not built (or changed since the last "
-                        "build), so no sugar orientations were saved. Click Build monomers "
+            message += ("\n\nNote: monomer entries are not built (or changed since the last "
+                        "build), so no orientations were saved. Click Build monomers "
                         "and export again to include them.")
+        if with_yaml and has_amino:
+            self.viewer.last_monomer_yaml = None
+            message += ("\n\nNo MISO YAML was generated: automatic YAML export supports "
+                        "sugars only, and amino acids are present. The orientations CSV "
+                        "lists each residue's C-alpha point (column Point) and its "
+                        "side-chain point (column Functional_Point) for the peptide section "
+                        "(ca_position, functional_position). Any existing YAML at this path "
+                        "was left unchanged; do not reuse it without updating it.")
         if config is not None:
             self.viewer.last_monomer_yaml = str(yaml_path.resolve())
             message += (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
@@ -872,6 +1114,8 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
     def _export_monomer_pickle(self, out_path):
         """{name: rigid} so MISO reuses the exact built geometry."""
         import pickle
+        if not any(inst["kind"] == "sugar" for inst in self._instances):
+            return None  # amino acids only: MISO builds those from the peptide sequence
         monomer_data = {}
         for inst in self._instances:
             if inst.get("rigid") is not None:
@@ -885,20 +1129,27 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         """Orientation CSV keyed by the point index used in the YAML."""
         import csv
         ori_path = f"{Path(out_path).with_suffix('')}_orientations.csv"
+        # Sugar only exports keep the original columns; the extra column appears
+        # only when amino acids are present.
+        with_amino = any(inst["kind"] == "aa" for inst in self._instances)
         with open(ori_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Point", "Instance", "Type", "Conformer", "SMILES",
                         "Rot_X (deg)", "Rot_Y (deg)", "Rot_Z (deg)",
                         "quat_x", "quat_y", "quat_z", "quat_w",
-                        "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"])
+                        "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22"]
+                       + (["Functional_Point"] if with_amino else []))
             for inst in self._instances:
                 Rm = euler_to_matrix(*inst["euler"])
                 q = matrix_to_quaternion(Rm)
-                row = [inst["position"], inst["label"], "sugar", inst["conf_name"],
+                row = [inst["position"], inst["label"], inst["kind"], inst["conf_name"],
                        inst["smiles"]]
                 row += [f"{v:.4f}" for v in inst["euler"]]
                 row += [f"{q[0]:.8f}", f"{q[1]:.8f}", f"{q[2]:.8f}", f"{q[3]:.8f}"]
                 row += [f"{v:.8f}" for v in Rm.flatten()]
+                if with_amino:
+                    point = inst.get("functional_point")
+                    row.append("" if point is None else point)
                 w.writerow(row)
         return ori_path
 
@@ -922,8 +1173,12 @@ class PositionCoordinatesDialog(MISOConnectionMixin, QtWidgets.QDialog):
         ax = fig.add_subplot(111)
         ax.imshow(self._img, cmap="magma", origin="lower", interpolation="nearest")
         self._draw_monomers(ax)
-        for (ox, oy, x_ang, y_ang, _z, col, row), text in zip(self._points, self._point_labels()):
-            ax.plot(col, row, marker="o", color="#2196f3", ms=6, mec="white", mew=0.7, zorder=20)
+        self._draw_functional_links(ax)
+        links = self._functional_links()
+        for i, ((ox, oy, x_ang, y_ang, _z, col, row), text) in enumerate(
+                zip(self._points, self._point_labels())):
+            marker, color = self._point_style(i, links)
+            ax.plot(col, row, marker=marker, color=color, ms=6, mec="white", mew=0.7, zorder=20)
             ax.annotate(text, xy=(col, row), xytext=(4, 4),
                         textcoords="offset points", color="#ffee00", fontsize=7, zorder=21)
         ax.set_xlabel("col (px)")
