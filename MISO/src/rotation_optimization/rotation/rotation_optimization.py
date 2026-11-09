@@ -13,6 +13,10 @@ Main entry points called by structure/building_chain.py
 find_rotation_FULL_3D_QUATERNION
     Single-bond or multi-bond 3D rotation search (no orientation constraint).
 
+find_rotation_with_face
+    Same search, but the requested face (+1 / -1) is part of the QUEST
+    objective and checked on every candidate.  Used for face enumeration.
+
 find_rotation_1D_Z_AXIS
     Z-axis spin search for rings constrained to lie flat on the surface.
 
@@ -89,57 +93,132 @@ def solve_wahba_quest(observations, references, weights=None):
     eigenvalues, eigenvectors = np.linalg.eigh(K)
     q = eigenvectors[:, -1]
     rot = R.from_quat([q[1], q[2], q[3], q[0]])
-    return rot.as_matrix()
+    # K is Shuster's matrix, whose top eigenvector is the quaternion of the
+    # passive attitude matrix A (reference -> body).  Read as an active
+    # rotation by scipy it is the INVERSE of the rotation that maps the
+    # observations onto the references, so it must be transposed.  Without
+    # the transpose every QUEST candidate was misoriented (verified against
+    # Rotation.align_vectors, see tests/test_face_diversity.py).
+    return rot.as_matrix().T
 
 
 # ============================================================================
 # Geometric primitives
 # ============================================================================
 
-def flip_molecule_coordinates(mol_data, com):
+def ring_atom_order(mol_data):
     """
-    Mirror molecule through the Y = COM[1] plane (reflect face).
+    Ring atom indices in a fixed traversal order.
 
-    Returns
-    -------
-    dict  copy of mol_data with flipped absolute_coordinates.
+    Pyranoses: O5, C1, C2, C3, C4, C5 (from carbon_map).  Other rings fall
+    back to 'all_ring_carbons', which follows the RDKit ring traversal.
+    Returns None when no ring of at least five atoms is known.
     """
+    cmap = mol_data.get('carbon_map', {})
+    if cmap.get('ring_oxygen') is not None and all(f'C{i}' in cmap for i in range(1, 6)):
+        return [cmap['ring_oxygen']] + [cmap[f'C{i}'] for i in range(1, 6)]
+    ring = list(cmap.get('all_ring_carbons', []))
+    return ring if len(ring) >= 5 else None
+
+
+def oriented_ring_normal(mol_data):
+    """
+    Unit ring normal whose sign follows the ring atom order.
+
+    The normal is the sum of cross products of consecutive centred ring
+    positions, so it turns with the molecule and never flips sign on its
+    own.  The SVD normal used elsewhere has an arbitrary sign, which makes
+    it useless for telling the two faces of a monomer apart.
+
+    Computed from absolute_coordinates, so it is valid even when
+    relative_coordinates are stale.
+    """
+    order = ring_atom_order(mol_data)
+    if order is None:
+        return None
+    coords = np.asarray(mol_data['absolute_coordinates'], dtype=float)[order]
+    centred = coords - coords.mean(axis=0)
+    n = np.zeros(3)
+    for i in range(len(centred)):
+        n += np.cross(centred[i], centred[(i + 1) % len(centred)])
+    norm = np.linalg.norm(n)
+    return n / norm if norm > 1e-9 else None
+
+
+def face_sign(mol_data, min_abs=0.0):
+    """
+    Which face of a monomer points up (+z, away from the surface).
+
+    +1 when the oriented ring normal has a positive z component, -1 when
+    negative, 0 when |n_z| < min_abs (ring too close to edge on for the face
+    to be meaningful) or when the monomer has no ring.
+
+    Face labels used in face states: '0' = +1, '1' = -1.
+    """
+    n = oriented_ring_normal(mol_data)
+    if n is None or abs(n[2]) < min_abs:
+        return 0
+    return 1 if n[2] > 0 else -1
+
+
+def flip_molecule_coordinates(mol_data, com, axis='x'):
+    """
+    Turn a monomer over: a proper 180 degree rotation about an in plane axis
+    through *com*.
+
+    The previous version negated one coordinate, which is a mirror
+    (determinant -1) and turned every D sugar into its L enantiomer.  It also
+    left relative_coordinates and the quaternion untouched, so code reading
+    relative_coordinates still saw the unturned molecule.  All three fields
+    are now updated together.
+
+    Parameters
+    ----------
+    axis : 'x' or 'y'   in plane axis to turn about.
+    """
+    if axis == 'x':
+        flip = np.diag([1.0, -1.0, -1.0])
+    elif axis == 'y':
+        flip = np.diag([-1.0, 1.0, -1.0])
+    else:
+        raise ValueError("axis must be 'x' or 'y'")
+
+    com_arr = np.asarray(com, dtype=float)
+    rel = np.asarray(mol_data['absolute_coordinates'], dtype=float) - com_arr
+    rel = rel @ flip.T
+
     mol_flipped = mol_data.copy()
-    coords = np.array(mol_data['absolute_coordinates'])
-    com_arr = np.array(com)
-    coords_flipped = coords.copy()
-    coords_flipped[:, 1] = 2 * com_arr[1] - coords[:, 1]
-    mol_flipped['absolute_coordinates'] = coords_flipped.tolist()
+    mol_flipped['COM'] = com_arr.tolist()
+    mol_flipped['absolute_coordinates'] = (rel + com_arr).tolist()
+    mol_flipped['relative_coordinates'] = rel.tolist()
+    if 'quaternion' in mol_data:
+        new_rot = R.from_matrix(flip) * R.from_quat(np.asarray(mol_data['quaternion']))
+        mol_flipped['quaternion'] = new_rot.as_quat().tolist()
     return mol_flipped
 
 
-def generate_uniform_rotations(n_samples):
+def generate_uniform_rotations(n_samples, seed=None):
     """
-    Generate quasi-uniform rotation matrices via Fibonacci sphere sampling.
+    Draw rotation matrices uniformly (Haar measure) from SO(3).
+
+    The previous version put the axes on a fixed Fibonacci sphere and drew
+    only the angle, uniformly on [0, 2 pi]: every run reused the same axes
+    and small rotations were oversampled.
 
     Parameters
     ----------
     n_samples : int
+    seed : int, np.random.Generator or None
+        Same seed, same rotations.  None draws fresh entropy.
 
     Returns
     -------
     list[np.ndarray]  each shape (3, 3)
     """
-    phi = (1 + np.sqrt(5)) / 2
-    rotations = []
-    for i in range(n_samples):
-        y = 1 - (i / max(n_samples - 1, 1)) * 2
-        radius = np.sqrt(max(0.0, 1 - y * y))
-        theta = 2 * np.pi * i / phi
-        axis = np.array([np.cos(theta) * radius, y, np.sin(theta) * radius])
-        norm = np.linalg.norm(axis)
-        if norm > 1e-6:
-            axis /= norm
-            angle = np.random.uniform(0, 2 * np.pi)
-            rotations.append(R.from_rotvec(angle * axis).as_matrix())
-        else:
-            rotations.append(np.eye(3))
-    return rotations
+    if n_samples <= 0:
+        return []
+    rng = np.random.default_rng(seed)
+    return list(R.random(n_samples, random_state=rng).as_matrix())
 
 
 def get_ring_positions(mol):
@@ -386,6 +465,31 @@ def line_segments_intersect_2D(p1, p2, p3, p4):
     return (0 <= t <= 1) and (0 <= s <= 1)
 
 
+def _leaving_hydroxyl(chain_mol, coords, target_pos):
+    """
+    Indices of the hydroxyl (O and its H) on the acceptor atom at *target_pos*.
+
+    create_glycosidic_bond removes this OH when the bridge is formed, so a
+    new bond crossing it in projection is not a real crossing.  The ring
+    oxygen is never treated as leaving.  Needs 'atom_types'; returns an
+    empty set without them.
+    """
+    types = chain_mol.get('atom_types')
+    if types is None or len(types) != len(coords):
+        return set()
+    ring_o = chain_mol.get('carbon_map', {}).get('ring_oxygen')
+    d_t = np.linalg.norm(coords - np.asarray(target_pos, dtype=float), axis=1)
+    if d_t.min() > 0.05:          # target is a coordinate, not an atom of this molecule
+        return set()
+    oxygens = [i for i, t in enumerate(types)
+               if t == 'O' and i != ring_o and d_t[i] < 1.6]
+    leaving = set(oxygens)
+    for o in oxygens:
+        d_o = np.linalg.norm(coords - coords[o], axis=1)
+        leaving.update(i for i, t in enumerate(types) if t == 'H' and d_o[i] < 1.15)
+    return leaving
+
+
 def calculate_bond_intersection_penalty(new_mol, new_carbon_idx, target_pos,
                                         existing_chain, existing_linkages=None,
                                         debug=False):
@@ -401,18 +505,34 @@ def calculate_bond_intersection_penalty(new_mol, new_carbon_idx, target_pos,
     if not existing_chain:
         return 0.0
 
-    new_donor = np.array(new_mol['absolute_coordinates'][new_carbon_idx])[:2]
-    new_target = np.array(target_pos)[:2]
+    new_donor3 = np.asarray(new_mol['absolute_coordinates'][new_carbon_idx], dtype=float)
+    new_target3 = np.asarray(target_pos, dtype=float).ravel()[:3]
+    new_donor = new_donor3[:2]
+    new_target = new_target3[:2]
     if np.linalg.norm(new_target - new_donor) < 0.01:
         return 0.0
+
+    def _is_endpoint(p):
+        # A segment that starts or ends on the new bond's own atoms only
+        # touches it there.  Counting that as a crossing rejected every
+        # rotation for every molecule-to-molecule linkage, because the
+        # acceptor's bonds at the target carbon always share that endpoint.
+        p = np.asarray(p, dtype=float)
+        return (np.linalg.norm(p - new_target3) < 0.05 or
+                np.linalg.norm(p - new_donor3) < 0.05)
 
     penalty = 0.0
 
     for chain_mol in existing_chain:
         coords = np.array(chain_mol['absolute_coordinates'])
+        leaving = _leaving_hydroxyl(chain_mol, coords, new_target3)
         for i in range(len(coords)):
             for j in range(i + 1, len(coords)):
                 if np.linalg.norm(coords[i] - coords[j]) < 2.0:
+                    if _is_endpoint(coords[i]) or _is_endpoint(coords[j]):
+                        continue
+                    if i in leaving or j in leaving:
+                        continue
                     p1, p2 = coords[i][:2], coords[j][:2]
                     if np.linalg.norm(p2 - p1) < 0.01:
                         continue
@@ -444,6 +564,10 @@ def calculate_bond_intersection_penalty(new_mol, new_carbon_idx, target_pos,
                 a_pos = np.array(a_mol['absolute_coordinates'][a_idx])[:2]
 
             if np.linalg.norm(a_pos - d_pos) < 0.01:
+                continue
+            # same reason as _is_endpoint: shared atoms touch, they do not cross
+            if any(np.linalg.norm(p - q) < 0.05 for p in (d_pos, a_pos)
+                   for q in (new_donor, new_target)):
                 continue
             if line_segments_intersect_2D(new_donor, new_target, d_pos, a_pos):
                 penalty += 1000.0
@@ -924,6 +1048,145 @@ def find_rotation_FULL_3D_QUATERNION(template, mol_carbon, target_mol, target_ca
 
     return find_rotation_QUEST_then_UNIFORM_3D(
         template, bonds, existing_chain, fixed_com, n_samples)
+
+
+def find_rotation_with_face(template, mol_carbon, target_mol, target_carbon,
+                            existing_chain, fixed_com, face, n_samples=500,
+                            additional_bonds=None, seed=None,
+                            clash_factor=0.6, face_weights=(1.0, 3.0, 10.0),
+                            face_min_abs=0.05, max_passing_samples=None):
+    """
+    3D rotation search that REQUIRES a given face to point up.
+
+    Same arguments and return value as find_rotation_FULL_3D_QUATERNION, plus
+    *face* (+1 or -1, see face_sign).  The centre of mass stays at *fixed_com*
+    and the monomer is only rotated, so the template is moved as a rigid body.
+
+    Why the face has to be inside the objective
+    -------------------------------------------
+    Seeding QUEST with a turned over template does not work: a monomer has
+    three rotational degrees of freedom and QUEST returns the same optimum
+    whatever the starting orientation, so both "faces" collapse onto one
+    structure.  Here the oriented ring normal is added to Wahba's problem as
+    one more observation, with reference (0, 0, face), so the solver itself
+    trades bond alignment against the requested face.  Every candidate is
+    then checked with face_sign and dropped if the face is wrong.
+
+    For a monomer with a single linkage this also fixes the spin about the
+    linkage axis, which one bond vector alone leaves undetermined.
+
+    Search
+    ------
+    1. QUEST for every bond weight variant x every weight in *face_weights*.
+    2. If none of those pass the hard filters (ring clearance, bond
+       intersections), Haar uniform samples drawn with *seed*, keeping only
+       those that present the requested face.
+    3. Best passing candidate by _score_candidate.  If nothing passes, the
+       best candidate with the right face is returned and
+       params['filters_passed'] is False, so the caller still gets the face
+       it asked for.
+
+    Returns
+    -------
+    tuple (best_mol, best_distance, params_dict), or (None, inf, params) when
+    the monomer has no ring to define a face.
+    """
+    if face not in (1, -1):
+        raise ValueError(f"face must be +1 or -1, got {face!r}")
+
+    com = np.asarray(fixed_com, dtype=float)
+
+    # Fresh copy: COM pinned, relative coordinates rebuilt from absolute ones.
+    tmpl = template.copy()
+    abs_coords = np.asarray(template['absolute_coordinates'], dtype=float)
+    rel = abs_coords - com
+    tmpl['COM'] = com.tolist()
+    tmpl['relative_coordinates'] = rel.tolist()
+    if 'quaternion' not in tmpl:
+        tmpl['quaternion'] = [0.0, 0.0, 0.0, 1.0]
+
+    n_body = oriented_ring_normal(tmpl)
+    if n_body is None:
+        return None, float('inf'), {'method': 'no_ring', 'face': face}
+
+    # Bonds, exactly as find_rotation_FULL_3D_QUATERNION builds them.
+    def _target_pos(tgt, tgt_c):
+        if isinstance(tgt, dict) and 'carbon_map' in tgt:
+            return np.asarray(tgt['absolute_coordinates'][tgt['carbon_map'][tgt_c]], dtype=float)
+        return np.asarray(tgt, dtype=float)
+
+    bonds = [{'donor_idx': template['carbon_map'][mol_carbon], 'donor_name': mol_carbon,
+              'target': target_mol, 'target_pos': _target_pos(target_mol, target_carbon),
+              'target_carbon': target_carbon}]
+    for ab in additional_bonds or []:
+        bonds.append({'donor_idx': template['carbon_map'][ab['donor_carbon']],
+                      'donor_name': ab['donor_carbon'], 'target': ab['target'],
+                      'target_pos': _target_pos(ab['target'], ab.get('target_carbon')),
+                      'target_carbon': ab.get('target_carbon')})
+
+    observations, references = [], []
+    for b in bonds:
+        o = rel[b['donor_idx']]
+        r = b['target_pos'] - com
+        if np.linalg.norm(o) < 1e-6 or np.linalg.norm(r) < 1e-6:
+            continue
+        observations.append(o / np.linalg.norm(o))
+        references.append(r / np.linalg.norm(r))
+    observations.append(n_body)
+    references.append(np.array([0.0, 0.0, float(face)]))
+    n_bond_obs = len(observations) - 1
+
+    candidates = []
+
+    def _consider(rot, method, variant):
+        mol = rotate_molecule_around_com(tmpl, rot)
+        mol['COM'] = com.tolist()
+        if face_sign(mol, face_min_abs) != face:
+            return False
+        filt = apply_all_filters(mol, bonds, existing_chain, None, clash_factor)
+        distance, collision, score = _score_candidate(mol, bonds, existing_chain, clash_factor)
+        candidates.append({'mol': mol, 'rotation': rot, 'distance': distance,
+                           'collision_penalty': collision, 'score': score,
+                           'passes': filt['passes'], 'method': method,
+                           'variant': variant})
+        return filt['passes']
+
+    # 1. QUEST with the face inside the objective
+    if n_bond_obs > 0:
+        for w_bonds, desc in generate_quest_weight_variants(n_bond_obs):
+            for wf in face_weights:
+                weights = np.append(w_bonds, wf)
+                rot = solve_wahba_quest(observations, references, weights)
+                _consider(rot, 'QUEST_face', f'{desc}_face{wf:g}')
+    else:
+        # no usable bond vector: just put the requested face up
+        rot = solve_wahba_quest([n_body], [references[-1]])
+        _consider(rot, 'QUEST_face', 'normal_only')
+
+    # 2. Seeded uniform fallback, face checked
+    if not any(c['passes'] for c in candidates):
+        n_pass = 0
+        for i, rot in enumerate(generate_uniform_rotations(n_samples, seed=seed)):
+            if _consider(rot, 'UNIFORM_face', f'sample_{i}'):
+                n_pass += 1
+                if max_passing_samples and n_pass >= max_passing_samples:
+                    break
+
+    if not candidates:
+        return None, float('inf'), {'method': 'no_candidate_with_face', 'face': face}
+
+    passing = [c for c in candidates if c['passes']]
+    pool = passing if passing else candidates
+    best = min(pool, key=lambda c: c['score'])
+    best['mol']['face_sign'] = face
+
+    params = {'method': best['method'], 'variant': best['variant'], 'face': face,
+              'filters_passed': bool(passing), 'n_candidates': len(candidates),
+              'n_passing': len(passing), 'score': best['score']}
+    if not passing:
+        print(f"  WARNING: no rotation with face {face:+d} passed the hard filters; "
+              f"using the best face {face:+d} candidate anyway")
+    return best['mol'], best['distance'], params
 
 
 def find_rotation_1D_Z_AXIS(template, donor_c, target, acceptor_c,

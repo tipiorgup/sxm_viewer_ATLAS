@@ -30,6 +30,49 @@ def _compute_ring_normal(mol_data, coords):
     return vh[-1], centroid  # unit normal (SVD guarantees unit length), centroid
 
 
+def _linkage_carbon_sites(mol_data, carbon_name, coords, c_pos):
+    """
+    (leaving_O_position, implicit_H_site) for a linkage carbon; either may be None.
+
+    The H site is where a hydrogen will be added later: opposite the sum of
+    the unit vectors to the carbon's three heavy neighbours (leaving O
+    included), 1.09 A out.  Only defined when the carbon has exactly three
+    heavy neighbours and no explicit H.
+    """
+    leaving = _leaving_oxygen_position(mol_data, carbon_name, coords, c_pos)
+    types = mol_data.get('atom_types')
+    if types is None or len(types) != len(coords):
+        return leaving, None
+    xyz = np.asarray(coords, dtype=float)
+    d = np.linalg.norm(xyz - c_pos, axis=1)
+    heavy = [i for i, t in enumerate(types) if t != 'H' and 0.5 < d[i] < 1.65]
+    has_h = any(t == 'H' and 0.5 < d[i] < 1.2 for i, t in enumerate(types))
+    if len(heavy) != 3 or has_h:
+        return leaving, None
+    s_ = sum((xyz[i] - c_pos) / d[i] for i in heavy)
+    if np.linalg.norm(s_) < 1e-6:
+        return leaving, None
+    return leaving, c_pos - 1.09 * s_ / np.linalg.norm(s_)
+
+
+def _leaving_oxygen_position(mol_data, carbon_name, coords, c_pos):
+    """Position of the hydroxyl oxygen on ``carbon_name`` that the bridge
+    replaces, or None.  Quiet version of _resolve_oh_to_remove."""
+    oh_map = mol_data.get('oh_map')
+    if oh_map and carbon_name in oh_map and oh_map[carbon_name][0] is not None:
+        return np.asarray(coords[oh_map[carbon_name][0]], dtype=float)
+    ring_o = mol_data.get('carbon_map', {}).get('ring_oxygen')
+    types = mol_data.get('atom_types')
+    best, best_d = None, 1.6
+    for i, p in enumerate(coords):
+        if i == ring_o or (types is not None and i < len(types) and types[i] != 'O'):
+            continue
+        d = np.linalg.norm(np.asarray(p) - c_pos)
+        if 0.5 < d < best_d and (types is not None):
+            best, best_d = i, d
+    return None if best is None else np.asarray(coords[best], dtype=float)
+
+
 def _scan_oh_by_distance(mol_data, coords, c_pos):
     """LEGACY coordinate-based hydroxyl detection — fallback only.
 
@@ -173,7 +216,44 @@ def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, ano
             print(f"  Post-check: flipped oxygen to correct side for {anomeric} (was {oxygen_side:+.3f})")
         else:
             print(f"  Post-check: oxygen on correct side for {anomeric} (side={oxygen_side:+.3f})")
-    
+
+    # Stereo-preserving side choice.  The check above tests the side of the
+    # ACCEPTOR ring with an SVD normal of arbitrary sign, so it picks the side
+    # at random: in testing it inverted the acceptor carbon (glucose C4 -> a
+    # galactose) or the donor anomeric carbon.  The bridging oxygen replaces
+    # the two hydroxyl oxygens that are removed, so of the two geometrically
+    # valid positions keep the one closer to them; that keeps the
+    # configuration of both carbons as built in the templates.
+    sites = [_linkage_carbon_sites(mol1_data, carbon1_name, coords1, c1_pos),
+             _linkage_carbon_sites(mol2_data, carbon2_name, coords2, c2_pos)]
+    leaving = [st[0] for st in sites if st[0] is not None]
+    h_sites = [st[1] for st in sites if st[1] is not None]
+    if leaving and height > 1e-6:
+        # Every point on the circle of radius `height` around the C...C axis
+        # satisfies both C-O bond lengths.  Take the one that best replaces
+        # the hydroxyl oxygens being removed (smallest of the larger of the
+        # two distances, so neither carbon is sacrificed for the other) and
+        # keep clear of the site where each carbon's implicit H will be
+        # added; a bridging O on that site lets the H land on top of it and
+        # inverts the carbon.
+        base = c1_pos + projection_dist * c1_to_c2_norm
+        u = perpendicular - np.dot(perpendicular, c1_to_c2_norm) * c1_to_c2_norm
+        u /= np.linalg.norm(u)
+        v = np.cross(c1_to_c2_norm, u)
+        angles = np.radians(np.arange(0.0, 360.0, 5.0))
+        circle = base + height * (np.cos(angles)[:, None] * u + np.sin(angles)[:, None] * v)
+
+        def _cost(p_):
+            c = max(np.linalg.norm(p_ - q) for q in leaving)
+            c += 10.0 * sum(max(0.0, 1.6 - np.linalg.norm(p_ - h)) for h in h_sites)
+            return c
+
+        cost = np.array([_cost(c) for c in circle])
+        before = _cost(oxygen_pos)
+        oxygen_pos = circle[int(np.argmin(cost))]
+        print(f"  Stereo placement: bridging O put where the replaced hydroxyl O atoms were "
+              f"(cost {before:.2f} -> {cost.min():.2f})")
+
     # Verify geometry
     o_c1_dist = np.linalg.norm(oxygen_pos - c1_pos)
     o_c2_dist = np.linalg.norm(oxygen_pos - c2_pos)

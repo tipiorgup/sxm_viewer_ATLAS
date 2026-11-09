@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -10,6 +11,24 @@ class MISORunnerDialog(QtWidgets.QDialog):
     """Run the MISO pipeline (module_B.py) with a YAML config + CSV + NPZ."""
 
     _MISO_DIR = Path(__file__).resolve().parents[3] / "MISO"
+    # Options this GUI may pass, used when module_B.py cannot be read.
+    _LEGACY_FLAGS = frozenset({"--input_file", "--iterations", "--n_polymers",
+                               "--phase1_kicks", "--debug_checkpoints"})
+
+    @classmethod
+    def _supported_flags(cls):
+        """Command line options module_B.py declares, so a newer or older MISO engine that
+        dropped or renamed an option is not sent an argument it rejects (exit code 2)."""
+        script = cls._MISO_DIR / "module_B.py"
+        try:
+            text = script.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return set(cls._LEGACY_FLAGS)
+        flags = set(re.findall(r"""add_argument\(\s*(?:["']-[\w-]+["']\s*,\s*)*["'](--[\w-]+)["']""",
+                               text))
+        flags |= set(re.findall(r"""["'](--[\w-]+)["']""",
+                                " ".join(re.findall(r"add_argument\([^)]*\)", text, re.S))))
+        return flags or set(cls._LEGACY_FLAGS)
 
     def __init__(self, viewer, parent=None):
         super().__init__(parent or viewer)
@@ -63,6 +82,11 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self.debug_chk = QtWidgets.QCheckBox(
             "Debugging option (save intermediate structures: pre-opt, "
             "post-phase1, post-phase2)")
+        if "--debug_checkpoints" not in self._supported_flags():
+            self.debug_chk.setEnabled(False)
+            self.debug_chk.setChecked(False)
+            self.debug_chk.setToolTip(
+                "This MISO version no longer has the checkpoint option.")
         root.addWidget(self.debug_chk)
 
         # Parameters
@@ -321,10 +345,16 @@ class MISORunnerDialog(QtWidgets.QDialog):
             "--input_file", self._tmp_yaml.name,
             "--iterations", str(self.iter_spin.value()),
             "--n_polymers", str(self.poly_spin.value()),
-            "--phase1_kicks",
         ]
-        if self.debug_chk.isChecked():
-            args.append("--debug_checkpoints")
+        supported = self._supported_flags()
+        for flag, wanted in (("--phase1_kicks", True),
+                             ("--debug_checkpoints", self.debug_chk.isChecked())):
+            if not wanted:
+                continue
+            if flag in supported:
+                args.append(flag)
+            else:
+                self._append(f"[MISO] This MISO version has no {flag} option; skipped.")
         self._last_cfg = dict(cfg)
         self._last_settings = {
             "iterations": self.iter_spin.value(),
@@ -332,7 +362,8 @@ class MISORunnerDialog(QtWidgets.QDialog):
             "compression_steps": self.comp_spin.value(),
             "gravity": self.gravity_spin.value(),
             "use_fixed_orientation": bool(cfg.get("use_fixed_orientation")),
-            "debug_checkpoints": self.debug_chk.isChecked(),
+            "debug_checkpoints": ("--debug_checkpoints" in supported
+                                  and self.debug_chk.isChecked()),
         }
         self._stopped_by_user = False
         self.why_btn.setEnabled(False)

@@ -9,6 +9,29 @@ from .bonds_creation import (
 )
 from ..geometry.geometry_utils import calculate_alignment_rotation
 from .building_chain import add_hydrogens_with_openbabel
+from . import pdb_export
+
+
+def _assign_residues_safe(combined_rw, processed_mols):
+    """Name sugar residues right after combine, before any atom removals.
+
+    Failures here must never break the SDF pipeline — the residue map is only
+    used by the (optional) coarse-grained export, so on any error we log and
+    carry on with the molecule unnamed.
+    """
+    try:
+        pdb_export.assign_sugar_residues(combined_rw, processed_mols)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"  ! residue naming skipped (CG export will be unavailable): {exc}")
+
+
+def _finalize_residues_safe(final_mol):
+    """Name grown-on fragments and read back the unit -> atom_indices map."""
+    try:
+        return pdb_export.finalize_residue_info(final_mol)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"  ! residue finalization skipped (CG export unavailable): {exc}")
+        return None
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -682,10 +705,10 @@ def enforce_trans_configuration(mol_rw, bonds_created, conf):
             
             if c_neighbors and n_neighbors:
                 dihedral_atoms = [c_neighbors[0], sugar_c, peptide_n, n_neighbors[0]]
-
+                
                 # Do the trans enforcement
                 rdMolTransforms.SetDihedralRad(conf, *dihedral_atoms, np.pi)
-
+                
                 # Store the enforced atoms info
                 enforced_atom_sets.append({
                     'bond_type': 'direct_CN',
@@ -696,59 +719,9 @@ def enforce_trans_configuration(mol_rw, bonds_created, conf):
                     'target_angle': 180.0,
                     'atom_labels': [f"atom_{i}" for i in dihedral_atoms]
                 })
-
+                
                 print(f"  ✓ Trans enforced on dihedral: {dihedral_atoms}")
-
-        elif bond_info['type'] == 'CO_linkage':
-            # O-glycosidic bonds were never reported here, so downstream
-            # consumers (the phase 2-3 trans torsion restraint, and the ring
-            # rigid-body boundary that stops a ring's substituent walk at a
-            # glycosidic joint) never saw these atoms at all: an O-glycosidic
-            # bond got no restraint through optimization, and a ring on the
-            # sugar side of one got no boundary to stop its rigid-body
-            # expansion at, letting it absorb whatever's attached. Report
-            # both dihedrals (sugar_c-bridge_o and bridge_o-peptide_o), same
-            # pattern as direct_CN above.
-            sugar_c = bond_info['sugar_c']
-            bridge_o = bond_info['bridge_o']
-            peptide_o = bond_info['peptide_o']
-
-            c_atom = mol_rw.GetAtomWithIdx(sugar_c)
-            peptide_o_atom = mol_rw.GetAtomWithIdx(peptide_o)
-
-            c_neighbors = [n.GetIdx() for n in c_atom.GetNeighbors() if n.GetIdx() != bridge_o]
-            peptide_o_neighbors = [n.GetIdx() for n in peptide_o_atom.GetNeighbors() if n.GetIdx() != bridge_o]
-
-            if c_neighbors:
-                dihedral_atoms = [c_neighbors[0], sugar_c, bridge_o, peptide_o]
-                rdMolTransforms.SetDihedralRad(conf, *dihedral_atoms, np.pi)
-                enforced_atom_sets.append({
-                    'bond_type': 'CO_linkage',
-                    'aa_type': bond_info.get('aa_type', 'Unknown'),
-                    'dihedral_atoms': dihedral_atoms,
-                    'sugar_carbon': sugar_c,
-                    'bridge_oxygen': bridge_o,
-                    'peptide_oxygen': peptide_o,
-                    'target_angle': 180.0,
-                    'atom_labels': [f"atom_{i}" for i in dihedral_atoms]
-                })
-                print(f"  ✓ Trans enforced on dihedral: {dihedral_atoms}")
-
-            if peptide_o_neighbors:
-                dihedral_atoms = [sugar_c, bridge_o, peptide_o, peptide_o_neighbors[0]]
-                rdMolTransforms.SetDihedralRad(conf, *dihedral_atoms, np.pi)
-                enforced_atom_sets.append({
-                    'bond_type': 'CO_linkage',
-                    'aa_type': bond_info.get('aa_type', 'Unknown'),
-                    'dihedral_atoms': dihedral_atoms,
-                    'sugar_carbon': sugar_c,
-                    'bridge_oxygen': bridge_o,
-                    'peptide_oxygen': peptide_o,
-                    'target_angle': 180.0,
-                    'atom_labels': [f"atom_{i}" for i in dihedral_atoms]
-                })
-                print(f"  ✓ Trans enforced on dihedral: {dihedral_atoms}")
-
+    
     return enforced_atom_sets
 
 def set_trans_dihedral_CN_bond(mol_rw, conf, carbon_idx, nitrogen_idx):
@@ -1250,6 +1223,10 @@ def export_complete_structure_with_petn_and_lipids(
     # Step 2: Combine molecules
     combined_rw = combine_molecules(processed_mols)
 
+    # Name sugar residues now, while carbon_map's local indices are still valid
+    # (later removals shift indices but MonomerInfo travels with the atoms).
+    _assign_residues_safe(combined_rw, processed_mols)
+
     # Step 3: Add glycosidic bonds
     add_glycosidic_bonds(combined_rw, glycosidic_bonds, linkage_definitions, processed_mols)
 
@@ -1336,8 +1313,9 @@ def export_complete_structure_with_petn_and_lipids(
         print(f"\nFinal molecule statistics:")
         print(f"  Total atoms: {final_mol.GetNumAtoms()}")
         print(f"  Total bonds: {final_mol.GetNumBonds()}")
-    
-    return final_mol
+
+    residue_index = _finalize_residues_safe(final_mol)
+    return final_mol, residue_index
 
 def export_complete_glycopeptide(
     chain_dict,
@@ -1368,6 +1346,9 @@ def export_complete_glycopeptide(
 
     # Step 2: Combine sugar molecules
     combined_rw = combine_molecules(processed_mols)
+
+    # Name sugar residues now, before removals shift local indices.
+    _assign_residues_safe(combined_rw, processed_mols)
 
     # Step 3: Add glycosidic bonds (sugar-sugar)
     add_glycosidic_bonds(combined_rw, glycosidic_bonds, linkage_definitions, processed_mols)
@@ -1478,8 +1459,9 @@ def export_complete_glycopeptide(
         # print(f"\n✓ Saved to {filename}.sdf")
         print(f"  Total atoms: {final_mol.GetNumAtoms()}")
         print(f"  Total bonds: {final_mol.GetNumBonds()}")
-    
-    return final_mol, enforced_atoms
+
+    residue_index = _finalize_residues_safe(final_mol)
+    return final_mol, enforced_atoms, residue_index
 
 def snapshot_ring_positions(chain_dict):
     """
@@ -1778,63 +1760,35 @@ def restore_glycopeptide_positions(final_mol, molecule_data_dict, peptide_data, 
     # Match by ORDER, not proximity (peptide built sequentially)
     # Cα index i in molecule corresponds to residue i in sequence
     matched_pairs = [(i, i) for i in range(len(ca_indices))]
-
-    # STEP 1: Rigidly align the WHOLE peptide fragment (all residues at
-    # once, one Kabsch fit) onto the target Cα positions, instead of
-    # translating each residue independently. build_peptide_with_rdkit_ca
-    # already places each residue correctly before bonding; what disturbs
-    # that here is the trans-dihedral enforcement on the glycosidic bond
-    # (elsewhere in this export step), which rotates the whole attached
-    # peptide fragment as one rigid body around an axis anchored to the
-    # sugar's own (not perfectly flat) ring geometry. A single rigid fit
-    # of the fragment corrects that without breaking the peptide bonds
-    # between residues, which independent per-residue translation would
-    # (find_residue_atoms stops exactly at those bonds, so two residues
-    # translated by different vectors stretch the bond between them).
-    current_ca_all = np.array(
-        [[*conf.GetAtomPosition(ca_indices[i])] for i in range(len(ca_indices))],
-        dtype=float
-    )
-    target_ca_all = np.array(
-        [exp_residues[i]['ca_position'] for i in range(len(ca_indices))],
-        dtype=float
-    )
-    cur_center = current_ca_all.mean(axis=0)
-    tgt_center = target_ca_all.mean(axis=0)
-    H = (current_ca_all - cur_center).T @ (target_ca_all - tgt_center)
-    U, _, Vt = np.linalg.svd(H)
-    d = np.linalg.det(Vt.T @ U.T)
-    rot = Vt.T @ np.diag([1, 1, d]) @ U.T
-
-    peptide_atoms = set()
-    for ca_idx in ca_indices:
-        peptide_atoms.update(find_residue_atoms(final_mol, ca_idx))
-    for atom_idx in peptide_atoms:
-        pos = conf.GetAtomPosition(atom_idx)
-        pos_arr = np.array([pos.x, pos.y, pos.z])
-        new_pos = rot @ (pos_arr - cur_center) + tgt_center
-        conf.SetAtomPosition(atom_idx, tuple(new_pos))
-
-    rmsd = np.sqrt(np.mean(np.sum(
-        ((rot @ (current_ca_all - cur_center).T).T + tgt_center - target_ca_all) ** 2, axis=1)))
-    print(f"\n  Rigid whole-peptide alignment applied ({len(ca_indices)} Cα, RMSD: {rmsd:.3f} Å)")
-
-    # Restore each residue's side-chain orientation (safe per-residue: only
-    # moves side-chain atoms relative to their own, now-aligned Cα)
+    
+    # Restore each residue
     for curr_idx, exp_idx in matched_pairs:
         ca_idx = ca_indices[curr_idx]
         residue_aa = exp_residues[exp_idx]['aa']
-
+        
+        # Get current and target Cα positions
         pos = conf.GetAtomPosition(ca_idx)
         current_ca = np.array([pos.x, pos.y, pos.z])
         target_ca = np.array(exp_residues[exp_idx]['ca_position'])
-
+        
         print(f"\n  Residue {exp_idx} ({residue_aa}):")
-        print(f"    Aligned Cα: [{current_ca[0]:.3f}, {current_ca[1]:.3f}, {current_ca[2]:.3f}]")
+        print(f"    Current Cα: [{current_ca[0]:.3f}, {current_ca[1]:.3f}, {current_ca[2]:.3f}]")
         print(f"    Target Cα:  [{target_ca[0]:.3f}, {target_ca[1]:.3f}, {target_ca[2]:.3f}]")
-
+        
+        # Find all atoms in this residue
         residue_atoms = find_residue_atoms(final_mol, ca_idx)
-
+        
+        # STEP 1: Translate so Cα is at target position
+        translation = target_ca - current_ca
+        
+        for atom_idx in residue_atoms:
+            pos = conf.GetAtomPosition(atom_idx)
+            pos_arr = np.array([pos.x, pos.y, pos.z])
+            new_pos = pos_arr + translation
+            conf.SetAtomPosition(atom_idx, tuple(new_pos))
+        
+        print(f"    Translation: {np.linalg.norm(translation):.3f} Å")
+        
         # STEP 2: Rotate side chain toward functional_position using centroid
         # (func_idx from residue_info is stale after mol combination — use centroid instead)
         target_func = exp_residues[exp_idx].get('functional_position')

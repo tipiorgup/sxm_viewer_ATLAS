@@ -4,8 +4,6 @@ import argparse
 import pickle
 from contextlib import contextmanager
 import pipeline as lpf
-from rdkit import Chem
-from rdkit.Chem import AllChem
 from rdkit.Geometry import rdGeometry
 import numpy as np
 
@@ -124,11 +122,25 @@ def parse_arguments():
         help="Enable stochastic kicks during phase 1 minimization to escape torsional local minima"
     )
     parser.add_argument(
-        "--debug_checkpoints",
-        action="store_true",
-        default=False,
-        help="Save intermediate SDF structures (pre-opt, post-phase1, post-phase2) "
-             "in addition to the final optimized structure, for debugging"
+        "--faces",
+        choices=["enumerate", "legacy"],
+        default="enumerate",
+        help="enumerate: each polymer is built in a different face state "
+             "(which face of every ring points up: 00, 01, 10, 11 for a dimer). "
+             "legacy: previous behaviour, polymers differ only by random fallback sampling."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for face state sampling and fallback rotations (default: 0)"
+    )
+    parser.add_argument(
+        "--duplicate_rmsd",
+        type=float,
+        default=0.25,
+        help="Assembled polymers closer than this RMSD (Angstrom) to an earlier "
+             "polymer are reported as duplicates (default: 0.25)"
     )
     args = parser.parse_args()
     return args
@@ -157,22 +169,6 @@ def main():
     conformers_selection = config.get('conformer_selection', {}).get('strategy', 'lowest_energy')
     base_name = os.path.splitext(os.path.basename(config['sxm_file']))[0]
     circles, brightness = lpf.load_circle_data(config['circle_input_path'])
-
-    # Optional fixed-orientation mode: use manually-placed COM + rotation from
-    # the SXM-viewer 'Position monomer' tool instead of MISO's rotation search.
-    use_fixed_orientation = bool(config.get('use_fixed_orientation', False))
-    orientations = None
-    orientation_csv_path = config.get('orientation_csv_path', None)
-    if orientation_csv_path:
-        orientations = lpf.load_orientations(orientation_csv_path)
-        print(f"\n✓ Loaded {len(orientations)} fixed orientations from {orientation_csv_path}")
-    if use_fixed_orientation and not orientations:
-        print("\n⚠ use_fixed_orientation is set but no orientation_csv_path was loaded; "
-              "monomers keep their default pose.")
-
-    # Optional: reuse exact monomer geometry exported by the GUI instead of
-    # regenerating conformers (keeps the placed conformer identical).
-    monomer_data_path = config.get('monomer_data_path', None)
 
     stm_npz_path = config.get('stm_grid_path', None)
     if stm_npz_path is not None and os.path.exists(stm_npz_path):
@@ -205,37 +201,15 @@ def main():
 
     if sugars:
         with timer.section("Phase 1: Monomer Building (shared)", level=0):
-            if monomer_data_path:
-                # Reuse exact per-sugar geometry from the SXM-viewer export instead
-                # of regenerating conformers, so the placed pose is reproduced.
-                with timer.section("  Load monomer data (skip regeneration)", level=1):
-                    with open(monomer_data_path, 'rb') as f:
-                        monomer_data = pickle.load(f)
-                    print(f"\n✓ Loaded monomer geometry for {len(monomer_data)} "
-                          f"monomer(s) from {monomer_data_path} (conformer "
-                          f"regeneration skipped)")
-                    # Export (collect_molecules) still needs an RDKit Mol per
-                    # sugar type for topology/bonds; the pickle only carries
-                    # positions, so embed one cheap conformer per sugar here
-                    # instead of the full multi-conformer search skipped above.
-                    # Atom order matches monomer_data (same SMILES, no AddHs,
-                    # deterministic parsing), positions get overwritten later.
-                    conformers = {}
-                    for sugar_name, smiles in sugars.items():
-                        template_mol = Chem.MolFromSmiles(smiles)
-                        AllChem.EmbedMolecule(template_mol, randomSeed=42)
-                        conformers[sugar_name] = {'_template': {'molecule': template_mol}}
-            else:
-                with timer.section("  Conformer generation", level=1):
-                    conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
-                with timer.section("  Conformer analysis", level=1):
-                    lpf.analyze_conformers(conformers)
-                with timer.section("  Monomer data extraction", level=1):
-                    monomer_data = lpf.extract_monomer_data(conformers)
+            with timer.section("  Conformer generation", level=1):
+                conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
+            with timer.section("  Conformer analysis", level=1):
+                lpf.analyze_conformers(conformers)
+            with timer.section("  Monomer data extraction", level=1):
+                monomer_data = lpf.extract_monomer_data(conformers)
             with timer.section("  Translation to experimental positions", level=1):
                 translated_conformers, carbon_vectors = lpf.translate_conformers_to_positions(
-                    monomer_data, config['experimental_positions'], circles,
-                    orientations=orientations
+                    monomer_data, config['experimental_positions'], circles
                 )
             with timer.section("  Build molecule dict", level=1):
                 molecule_data_dict, mol_name_to_conformer = lpf.build_molecule_dict(
@@ -258,6 +232,32 @@ def main():
     # ========================================================================
 
     all_polymer_results = []
+
+    # ------------------------------------------------------------------------
+    # Face states: one per polymer, so polymers differ structurally
+    # ------------------------------------------------------------------------
+    face_states = None
+    face_mol_order = []
+    assembled_coords = []          # (polymer_idx, label, coords) for duplicate checks
+    if sugars and args.faces == "enumerate":
+        face_mol_order, face_states = lpf.plan_face_states(
+            molecule_data_dict, config, args.n_polymers, seed=args.seed)
+        n_distinct = len(face_states)
+        print("\n" + "="*70)
+        print("FACE STATES")
+        print("="*70)
+        print(f"  Monomer order: {' '.join(face_mol_order)}   ('0' = face +1 up, '1' = face -1 up)")
+        if n_distinct < args.n_polymers:
+            print(f"  Only {n_distinct} distinct face states exist; "
+                  f"generating {n_distinct} polymers instead of {args.n_polymers}")
+            args.n_polymers = n_distinct
+        with open(f"{base_name}_face_states.csv", "w") as fh:
+            fh.write("polymer,label," + ",".join(face_mol_order) + "\n")
+            for i, st in enumerate(face_states, 1):
+                label = lpf.building_chain.face_state_label(st, face_mol_order)
+                print(f"  Polymer {i}: {label}")
+                fh.write(f"{i},{label}," + ",".join(str(st[m]) for m in face_mol_order) + "\n")
+        print(f"  Saved: {base_name}_face_states.csv")
 
     for polymer_idx in range(1, args.n_polymers + 1):
 
@@ -282,10 +282,29 @@ def main():
                 with timer.section(f"{tag} Phase 2: Structure Assembly", level=2):
                     if sugars:
                         with timer.section(f"{tag}   Chain building (rotation/alignment)", level=3):
+                            face_state = face_states[polymer_idx - 1] if face_states else None
                             chain_dict, bonds_glyco, sorted_linkages = lpf.build_glycan_chain(
                                 molecule_data_dict, config, args.iterations,
-                                use_fixed_orientation=use_fixed_orientation
+                                face_state=face_state,
+                                seed=args.seed * 1000 + polymer_idx
                             )
+                            if face_state is not None:
+                                label = lpf.building_chain.face_state_label(face_state, face_mol_order)
+                                got = {m: lpf.building_chain.face_sign(chain_dict[m])
+                                       for m in face_mol_order if m in chain_dict}
+                                got_label = ''.join('1' if got.get(m, 1) == -1 else '0'
+                                                    for m in face_mol_order)
+                                print(f"\n  Face state requested {label}, assembled {got_label}"
+                                      + ("" if got_label == label else "   <-- MISMATCH"))
+                                coords = lpf.chain_coordinates(chain_dict, face_mol_order)
+                                for prev_idx, prev_label, prev in assembled_coords:
+                                    if prev.shape == coords.shape:
+                                        rmsd = float(np.sqrt(((prev - coords) ** 2).sum(axis=1).mean()))
+                                        if rmsd < args.duplicate_rmsd:
+                                            print(f"  WARNING: polymer {polymer_idx} ({label}) is within "
+                                                  f"{rmsd:.2f} A of polymer {prev_idx} ({prev_label}): "
+                                                  f"near duplicate")
+                                assembled_coords.append((polymer_idx, label, coords))
                         with timer.section(f"{tag}   Phosphate linkages", level=3):
                             phosphate_bonds_with_names, unbonded_monomers = lpf.add_phosphate_linkages(
                                 config, molecule_data_dict, chain_dict
@@ -304,7 +323,7 @@ def main():
                         all_lipids = []
 
                     with timer.section(f"{tag}   Peptide building", level=3):
-                        peptide_data = lpf.build_peptide(config, circles, orientations=orientations)
+                        peptide_data = lpf.build_peptide(config, circles)
                         print(f"DEBUG peptide_data: {peptide_data}")
 
                     with timer.section(f"{tag}   Peptide linkages", level=3):
@@ -324,7 +343,7 @@ def main():
                     with timer.section(f"{tag}   Structure export (SDF)", level=3):
                         if sugars:
                             if peptide_data is not None:
-                                final_no_h, enforced_atoms = lpf.export_structure(
+                                final_no_h, enforced_atoms, residue_index = lpf.export_structure(
                                     chain_dict, mol_name_to_conformer, bonds_glyco,
                                     [tuple(link) for link in config.get('glycosidic_bonds', [])],
                                     phosphate_bonds_with_names, petn_linkages, all_lipids,
@@ -332,7 +351,7 @@ def main():
                                     name, conformers_selection
                                 )
                             else:
-                                final_no_h = lpf.export_structure(
+                                final_no_h, residue_index = lpf.export_structure(
                                     chain_dict, mol_name_to_conformer, bonds_glyco,
                                     [tuple(link) for link in config.get('glycosidic_bonds', [])],
                                     phosphate_bonds_with_names, petn_linkages, all_lipids,
@@ -342,8 +361,10 @@ def main():
                                 enforced_atoms = []
                         else:
                             # pure cyclic peptide, no sugars
+                            from rdkit import Chem
                             final_no_h = peptide_data['rdkit_mol']
                             enforced_atoms = []
+                            residue_index = None
                             Chem.MolToPDBFile(final_no_h, f"{name}_cyclic_peptide.pdb")
                             print(f"  Saved: {name}_cyclic_peptide.pdb")
 
@@ -407,15 +428,13 @@ def main():
                             initial_ring_coms=initial_ring_coms,
                             stm_npy_path=stm_npz_path,
                             enable_phase1_kicks=args.phase1_kicks,
-                            torsion_constraints=torsion_constraints,
-                            save_debug_checkpoints=args.debug_checkpoints
+                            torsion_constraints=torsion_constraints
                         )
 
                     with timer.section(f"{tag}   Save results", level=3):
                         lpf.save_optimization_results(
                             final_with_h, optimized_mol, success,
-                            name, conformers_selection,
-                            save_debug_checkpoints=args.debug_checkpoints
+                            name, conformers_selection, residue_index
                         )
 
             # Store results

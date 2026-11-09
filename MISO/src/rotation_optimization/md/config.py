@@ -101,16 +101,6 @@ class OptimizationConfig:
     constrained_ring_com_limit : float  (Å)
     free_ring_com_limit : float  (Å)
 
-    Ring rigidity (hard MMFF distance/angle constraints on each ring's own
-    bonds, applied in every optimisation phase; not a separate integrator —
-    ring atoms still move under the same per-atom dynamics as everything
-    else, translation/rotation/center-of-mass motion untouched, only their
-    own bonds are made far stiffer than an unconstrained MMFF bond/angle)
-    ------------------------------------------------------------------
-    ring_rigid_bond_tolerance : float  (Å)
-    ring_rigid_angle_tolerance : float  (degrees)
-    ring_rigid_force_constant : float  (kcal mol⁻¹)
-
     Minimisation
     ------------
     minimize_interval : int
@@ -172,40 +162,6 @@ class OptimizationConfig:
     ring_tolerance_angle: float = DEFAULT_ANGLE_TOLERANCE
     check_rings_interval: int = DEFAULT_CHECK_RINGS_INTERVAL
     constrained_ring_com_limit: float = DEFAULT_CONSTRAINED_RING_COM_LIMIT
-
-    # Ring rigidity (hard bond/angle constraints, not a separate integrator)
-    ring_rigid_bond_tolerance: float = 0.02
-    ring_rigid_angle_tolerance: float = 2.0
-    ring_rigid_force_constant: float = 10000.0
-    # Phase 1 chunks the 1500-iteration minimization budget into this many
-    # pieces, recentering every ring's COM back onto its original position
-    # (a hard projection, not a spring -- see recenter_ring_bead) between
-    # each. A ring is free to drift within one chunk, whatever helps the
-    # minimizer resolve strain, but is snapped back exactly once the chunk
-    # ends. The snap itself can introduce a fresh clash at the ring/bead
-    # boundary (the just-relaxed neighborhood gets shoved by the
-    # correction), which the *next* chunk's minimization then has to
-    # absorb -- so this isn't simply "fewer chunks converge better" the
-    # way plain (non-recentering) bursting is. Measured on a real tangled
-    # structure: final energy was worse at both extremes (1 chunk: 528,660;
-    # 150 chunks: 10,880) than in the middle (30 chunks: 5,472), since too
-    # few chunks means one huge unrelaxed snap at the very end, and too
-    # many means each individual burst is too short to make real progress
-    # (the same line-search-reset problem that broke the old 375x4 Avogadro
-    # pattern). 30 was the best of the values tried; not fully swept.
-    phase1_recenter_chunks: int = 30
-    # Fraction of gravity/slab compression force a ring's own interior atoms
-    # feel during phase 2 (0-1). The rest of that weight, by not being
-    # applied there, effectively falls on the flexible inter-residue
-    # linkages instead, so compression flattens the structure by bending
-    # those joints rather than pushing on the now-rigid ring interiors.
-    # Kept low because the soft COM restraint's own stiffness is bounded by
-    # the shared max_velocity cap: once a ring atom is displaced, raising
-    # restraint stiffness barely speeds its correction, but cutting the
-    # force reaching it in the first place does (measured: 0.1 -> 0.02
-    # dropped worst-case ring COM drift on a real 8-ring test structure
-    # from 0.72 to 0.62 A, tightening the glycosidic bond closure too).
-    ring_compression_weight_scale: float = 0.02
     free_ring_com_limit: float = DEFAULT_FREE_RING_COM_LIMIT
 
     # Minimisation
@@ -253,11 +209,6 @@ class OptimizationConfig:
     save_images: bool = False
     image_interval: int = DEFAULT_IMAGE_INTERVAL
     output_name: str = "optimization"
-
-    # Debugging: save an SDF at the end of each optimization phase (phase1
-    # relaxation, phase2 compression) in addition to the final structure, so
-    # ring/geometry issues can be traced to the phase that introduced them.
-    save_debug_checkpoints: bool = False
 
 
 @dataclass

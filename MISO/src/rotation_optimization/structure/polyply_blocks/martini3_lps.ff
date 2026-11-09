@@ -1,0 +1,36 @@
+; Custom Martini 3 blocks for LPS grown-on groups not in polyply's stock
+; library: phosphate (PO4) and phosphoethanolamine (PEN).
+;
+; Lipid tails are NOT here - they reuse polyply's stock PE block (one C1 bead
+; per ~4 carbons; standard Martini alkane bonds/angles/dihedrals).
+;
+; Bead types / charges follow standard Martini 3 conventions:
+;   phosphate  -> single Q5 bead, charge -1
+;   PEtN       -> Q5 (PO4) + Q4 (NH3) beads, +-1 zwitterion, bonded
+
+; ------------------------------------------------------------------
+; Phosphate: one charged bead
+; ------------------------------------------------------------------
+[ moleculetype ]
+; name  nrexcl
+PO4     1
+
+[ atoms ]
+; nr type resnr residue atom cgnr charge mass
+1  Q5   1   PO4   P1   1  -1.0  72.0
+
+; ------------------------------------------------------------------
+; Phosphoethanolamine (PEtN): phosphate + ethanolamine amine
+; ------------------------------------------------------------------
+[ moleculetype ]
+; name  nrexcl
+PEN     1
+
+[ atoms ]
+; nr type resnr residue atom cgnr charge mass
+1  Q5   1   PEN   PO4  1  -1.0  72.0
+2  Q4   1   PEN   NH3  2   1.0  72.0
+
+[ bonds ]
+; i  j  funct  b0(nm)   k
+1  2  1  0.370  7000

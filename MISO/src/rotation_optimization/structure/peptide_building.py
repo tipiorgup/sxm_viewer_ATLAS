@@ -236,15 +236,6 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
         aa_mol = Chem.MolFromSmiles(aa_smiles[aa])
         aa_mol = Chem.AddHs(aa_mol)
         AllChem.EmbedMolecule(aa_mol, randomSeed=42)
-        # Raw ETKDG embed gives plausible bond lengths but leaves steric
-        # clashes (side chain vs backbone) unresolved; relax them here so
-        # Phase 1 optimization starts from a sane geometry instead of one it
-        # has to fight through. Mirrors what sugars already get via
-        # generate_monomer_conformers / the GUI's _build_aa_template.
-        try:
-            AllChem.MMFFOptimizeMolecule(aa_mol, maxIters=500)
-        except Exception:
-            AllChem.UFFOptimizeMolecule(aa_mol, maxIters=500)
 
         # Tag every atom with its residue index so the per-residue placement
         # path can recover membership after CombineMols/RemoveAtom shuffles
@@ -263,19 +254,7 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
             functional_idx = 'centroid'  # Will calculate after positioning
         elif functional_type:
             functional_idx = find_functional_group_atom(aa_mol, aa, functional_type)
-
-        # Rigidly place this residue (backbone + side chain together, one
-        # rigid body) at its experimental Ca + functional-group direction,
-        # instead of leaving it wherever the embed happened to put it and
-        # relying on a later, independent per-residue translation that
-        # breaks the peptide bond to its neighbor. A proper rotation only,
-        # so internal geometry and stereochemistry are preserved exactly.
-        functional_atom_indices = _resolve_functional_atoms(aa_mol, aa, functional_type)
-        _place_residue_rigid(
-            aa_mol, ca_idx, functional_atom_indices,
-            res_data['ca_position'], res_data.get('functional_position')
-        )
-
+        
         if i == 0:
             peptide = aa_mol
             residue_info.append({
@@ -307,16 +286,14 @@ def build_peptide_with_rdkit_ca(aa_sequence, residue_data, cyclic=False, linker_
             
             peptide = editable.GetMol()
             Chem.SanitizeMol(peptide)
-            # No re-embed here (either path): each residue was already
-            # rigidly placed at its experimental Ca + functional direction
-            # above, CombineMols carries those coordinates through as-is.
-            # Re-embedding the combined molecule would throw that placement
-            # away and replace it with an arbitrary new geometry, exactly
-            # what broke this before. The new peptide bond just formed may
-            # not sit at a perfect 1.33 A (two independently-placed rigid
-            # residues generally won't line up exactly), same situation as
-            # the glycosidic bond elsewhere in this pipeline; Phase 4
-            # optimization reconciles that, it does not need a pre-embed.
+            if not big_chain:
+                # Small path (unchanged): re-embed the whole growing peptide so
+                # Kabsch positioning has distinct, globally-consistent Cα coords.
+                peptide = Chem.AddHs(peptide)
+                AllChem.EmbedMolecule(peptide, randomSeed=42)
+            # Big path: skip the whole-peptide embed. The combined conformer
+            # carries each residue's individually-embedded coordinates through
+            # CombineMols; per-residue placement re-positions them afterwards.
 
             # Adjust indices
             if functional_idx != 'centroid' and functional_idx is not None:
@@ -492,120 +469,6 @@ def find_functional_group_atom(mol, aa, functional_type):
     
     return None
 
-
-def _resolve_functional_atoms(mol, aa, functional_type):
-    """Atom indices whose centroid is the side-chain functional point, or
-    None if the residue has no side-chain functional group or it can't be
-    located. Ring centroid uses the largest ring, mirroring
-    calculate_ring_centroid's convention.
-    """
-    if functional_type is None:
-        return None
-    if functional_type == 'ring_centroid':
-        rings = mol.GetRingInfo().AtomRings()
-        if not rings:
-            return None
-        return list(max(rings, key=len))
-    idx = find_functional_group_atom(mol, aa, functional_type)
-    return [idx] if idx is not None else None
-
-
-def _backbone_neighbors(mol, ca_idx):
-    """(backbone_n_idx, backbone_c_idx) bonded directly to Ca, or None for
-    either that isn't found. The carbonyl C is identified by its double
-    bonded O so a side-chain root carbon (e.g. Cb) is never mistaken for it.
-    """
-    ca_atom = mol.GetAtomWithIdx(ca_idx)
-    backbone_n, backbone_c = None, None
-    for nb in ca_atom.GetNeighbors():
-        if nb.GetSymbol() == 'N':
-            backbone_n = nb.GetIdx()
-        elif nb.GetSymbol() == 'C':
-            for nn in nb.GetNeighbors():
-                if nn.GetSymbol() == 'O':
-                    bond = mol.GetBondBetweenAtoms(nb.GetIdx(), nn.GetIdx())
-                    if bond and bond.GetBondTypeAsDouble() == 2.0:
-                        backbone_c = nb.GetIdx()
-                        break
-    return backbone_n, backbone_c
-
-
-def _svd_normal(points):
-    """Unit normal of the best-fit plane through points (least squares for
-    >3 points, exact for 3). None if there are too few points or they're
-    collinear/degenerate.
-    """
-    pts = np.asarray(points, dtype=float)
-    if len(pts) < 3:
-        return None
-    centered = pts - pts.mean(axis=0)
-    if np.linalg.matrix_rank(centered, tol=1e-6) < 2:
-        return None
-    _, _, vt = np.linalg.svd(centered)
-    normal = vt[-1]
-    norm = np.linalg.norm(normal)
-    return normal / norm if norm > 1e-9 else None
-
-
-def _place_residue_rigid(mol, ca_idx, functional_atom_indices, target_ca, target_func):
-    """Rigidly translate+rotate mol (in place) so its Ca lands on target_ca
-    and, if target_func is given, the Ca->functional direction aligns with
-    the target direction. Two composed proper rotations only, never a
-    reflection and never an axis-drop projection, so bond lengths, angles
-    and ring pucker are preserved exactly, only the residue's pose changes.
-
-    Ca position (2 dof, flattened to the surface) + direction angle (1 dof)
-    pins a flat placement but leaves one more rotational dof undetermined:
-    how the residue's own reference plane (its ring, for ring-bearing side
-    chains, or its N-Ca-C backbone otherwise) is tipped relative to the
-    surface. That's resolved first, by leveling the reference plane's own
-    best-fit normal onto the surface normal (Z), before the remaining
-    in-plane spin is used to match the functional direction. Atoms outside
-    the reference plane keep whatever true out-of-plane offset the relaxed
-    conformer gave them; nothing is forced onto Z=0.
-    """
-    conf = mol.GetConformer()
-    n_atoms = mol.GetNumAtoms()
-    ca_pos = np.array([*conf.GetAtomPosition(ca_idx)], dtype=float)
-    target_ca_arr = np.array(target_ca, dtype=float)
-    positions = np.array([[*conf.GetAtomPosition(i)] for i in range(n_atoms)], dtype=float)
-
-    if functional_atom_indices and len(functional_atom_indices) >= 3:
-        plane_atoms = list(functional_atom_indices)
-    else:
-        backbone_n, backbone_c = _backbone_neighbors(mol, ca_idx)
-        plane_atoms = [ca_idx] + [i for i in (backbone_n, backbone_c) if i is not None]
-
-    normal = _svd_normal(positions[plane_atoms]) if len(plane_atoms) >= 3 else None
-    if normal is not None:
-        if normal[2] < 0:
-            normal = -normal  # smaller rotation than flipping to the -Z lobe
-        level_rot = R.align_vectors(np.array([[0.0, 0.0, 1.0]]), np.array([normal]))[0]
-        level_mat = level_rot.as_matrix()
-    else:
-        level_mat = np.eye(3)
-
-    leveled = (positions - ca_pos) @ level_mat.T
-
-    angle = 0.0
-    if target_func is not None and functional_atom_indices:
-        current_vec = leveled[functional_atom_indices].mean(axis=0)[:2]
-        target_vec = (np.array(target_func, dtype=float) - target_ca_arr)[:2]
-        if np.linalg.norm(current_vec) > 1e-6 and np.linalg.norm(target_vec) > 1e-6:
-            cv = current_vec / np.linalg.norm(current_vec)
-            tv = target_vec / np.linalg.norm(target_vec)
-            angle = np.arctan2(np.cross(cv, tv), np.dot(cv, tv))
-
-    cos_a, sin_a = np.cos(angle), np.sin(angle)
-    spin_mat = np.array([[cos_a, -sin_a, 0.0],
-                          [sin_a, cos_a, 0.0],
-                          [0.0, 0.0, 1.0]])
-
-    final_positions = leveled @ spin_mat.T + target_ca_arr
-    for i in range(n_atoms):
-        conf.SetAtomPosition(i, final_positions[i].tolist())
-
-
 def _collect_hydroxyl(mol, carboxyl_c):
     """Return [O(H) idx, H idx] for the single-bonded -OH on a carboxyl carbon."""
     c_term_oh = []
@@ -682,7 +545,17 @@ def _get_side_chain_atoms_linear(mol, ca_idx):
     Stops at backbone N and backbone C=O so only true side-chain atoms are returned.
     """
     ca_atom = mol.GetAtomWithIdx(ca_idx)
-    backbone_n, backbone_c = _backbone_neighbors(mol, ca_idx)
+    backbone_n, backbone_c = None, None
+    for nb in ca_atom.GetNeighbors():
+        if nb.GetSymbol() == 'N':
+            backbone_n = nb.GetIdx()
+        elif nb.GetSymbol() == 'C':
+            for nn in nb.GetNeighbors():
+                if nn.GetSymbol() == 'O':
+                    bond = mol.GetBondBetweenAtoms(nb.GetIdx(), nn.GetIdx())
+                    if bond and bond.GetBondTypeAsDouble() == 2.0:
+                        backbone_c = nb.GetIdx()
+                        break
 
     blocked = {ca_idx}
     if backbone_n is not None:
@@ -736,20 +609,6 @@ def _rotate_side_chain_toward(conf, side_atoms, ca_xy, target_xy):
     return float(np.degrees(angle))
 
 
-def _rotate_side_chain_by_matrix(conf, side_atoms, ca_pos, R):
-    """Rotate side_atoms around ca_pos using a fixed 3x3 rotation matrix
-    (from the GUI orientation CSV), then flatten back to the surface (z=0).
-    """
-    if not side_atoms:
-        return
-    ca = np.array(ca_pos, dtype=float)
-    for atom_idx in side_atoms:
-        pos = np.array([*conf.GetAtomPosition(atom_idx)], dtype=float)
-        new_pos = R @ (pos - ca) + ca
-        new_pos[2] = 0.0
-        conf.SetAtomPosition(atom_idx, new_pos.tolist())
-
-
 def position_peptide_at_experimental_positions(peptide, residue_info, residue_data):
     """
     Position peptide backbone via global Kabsch alignment on Cα positions,
@@ -786,39 +645,22 @@ def position_peptide_at_experimental_positions(peptide, residue_info, residue_da
 
 
 def _orient_all_side_chains(peptide, conf, residue_info, residue_data):
-    """Orient each residue's side chain.
-
-    ``functional_position`` (Cα -> side-chain-functional-group target, from
-    the GUI) takes priority when present: it is self-consistent with this
-    residue's own re-embedded geometry (same ca_idx, same conformer), unlike
-    ``fixed_rotation`` (a 3x3 matrix from the GUI orientation CSV), which was
-    computed against the GUI's own embed of the amino acid and does not
-    correspond to this independently re-embedded one. fixed_rotation is only
-    used as a fallback, for residues with no functional_position (e.g. no
-    side-chain group, or none set).
-    """
+    """Rotate each residue's side chain in XY toward its functional_position."""
     print(f"Orienting side chains:")
     for res_idx, (res_info, res_data) in enumerate(zip(residue_info, residue_data)):
-        ca_idx = res_info['ca_idx']
-        side_atoms = _get_side_chain_atoms_linear(peptide, ca_idx)
-
         func_pos = res_data.get('functional_position')
-        if func_pos is not None:
-            pos = conf.GetAtomPosition(ca_idx)
-            ca_xy = np.array([pos.x, pos.y])
-            target_xy = np.array(func_pos[:2])
-            deg = _rotate_side_chain_toward(conf, side_atoms, ca_xy, target_xy)
-            print(f"  Residue {res_idx} ({res_info['aa']}): side chain rotated {deg:.1f}° toward functional_position")
+        if func_pos is None:
+            print(f"  Residue {res_idx} ({res_info['aa']}): no functional_position, skipped")
             continue
 
-        fixed_rotation = res_data.get('fixed_rotation')
-        if fixed_rotation is not None:
-            ca_pos = [*conf.GetAtomPosition(ca_idx)]
-            _rotate_side_chain_by_matrix(conf, side_atoms, ca_pos, np.array(fixed_rotation))
-            print(f"  Residue {res_idx} ({res_info['aa']}): fixed orientation applied from GUI CSV (no functional_position)")
-            continue
+        ca_idx = res_info['ca_idx']
+        pos = conf.GetAtomPosition(ca_idx)
+        ca_xy = np.array([pos.x, pos.y])
+        target_xy = np.array(func_pos[:2])
 
-        print(f"  Residue {res_idx} ({res_info['aa']}): no functional_position or fixed orientation, skipped")
+        side_atoms = _get_side_chain_atoms_linear(peptide, ca_idx)
+        deg = _rotate_side_chain_toward(conf, side_atoms, ca_xy, target_xy)
+        print(f"  Residue {res_idx} ({res_info['aa']}): side chain rotated {deg:.1f}°")
 
 
 def position_peptide_per_residue(peptide, residue_info, residue_data):

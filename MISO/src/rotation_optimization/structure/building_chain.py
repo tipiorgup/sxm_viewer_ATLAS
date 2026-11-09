@@ -4,6 +4,9 @@ from rdkit import Chem
 from openbabel import openbabel as ob
 from ..rotation.rotation_optimization import (
     find_rotation_FULL_3D_QUATERNION,
+    find_rotation_with_face,
+    face_sign,
+    flip_molecule_coordinates,
     find_rotation_1D_Z_AXIS,
     find_rotation_QUEST_VARIANTS_TOP_N,
     find_rotation_for_phosphate_linkage,
@@ -34,7 +37,8 @@ VDW_RADII = {
 }
 
 def align_and_position_molecules(molecule_data_dict, linkage_definitions,
-                                orientation_constraints=None, root_mol='GlcN_1', iterations=500):
+                                orientation_constraints=None, root_mol='GlcN_1', iterations=500,
+                                face_state=None, seed=None):
     """
     Align and position all molecules based on linkage definitions.
     
@@ -56,15 +60,46 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
         Name of root molecule
     iterations : int
         Number of optimization iterations
+    face_state : dict or None
+        {mol_name: +1 or -1}: which face of each ring must point up (+z).
+        The root is rotated about its COM to present its face with its
+        linkage carbons aimed at the partner COMs; every other unconstrained
+        monomer is placed with find_rotation_with_face.  All COMs stay at
+        their experimental positions.  None keeps the previous search.
+    seed : int or None
+        Seed for the uniform fallback sampling, so a polymer is reproducible.
     """
     print("="*70)
     print("ALIGNING AND POSITIONING MOLECULES")
     print("="*70)
-    
-    # ========================================================================
-    # NORMALIZE LINKAGE FORMAT
-    # ========================================================================
+    if face_state is not None:
+        print("Face state: " + face_state_label(face_state, list(face_state.keys())))
 
+    linkage_definitions = normalize_linkage_definitions(linkage_definitions)
+
+    # ========================================================================
+    # PARSE ORIENTATION CONSTRAINTS
+    # ========================================================================
+    if orientation_constraints is None:
+        orientation_constraints = {}
+
+    print("\nOrientation constraints (surface = XY plane, Z = up):")
+    if orientation_constraints:
+        for mol, orientation in orientation_constraints.items():
+            if orientation not in ['flat', 'perpendicular']:
+                raise ValueError(f"Invalid orientation '{orientation}' for {mol}. Use 'flat' or 'perpendicular'")
+            print(f"  {mol}: {orientation}")
+    else:
+        print("  None specified (all molecules can orient freely)")
+
+    root_mol = resolve_root_molecule(linkage_definitions, root_mol, molecule_data_dict)
+    sorted_linkages = topological_sort_linkages(linkage_definitions, root_mol)
+    return _position_molecules(molecule_data_dict, sorted_linkages, orientation_constraints,
+                               root_mol, iterations, face_state, seed)
+
+
+def normalize_linkage_definitions(linkage_definitions):
+    """Return linkages in the 6 element form [donor, dc, acceptor, ac, anom, name]."""
     normalized_linkages = []
     for link in linkage_definitions:
         # Check if it's a coordinate-based linkage with coordinate at END
@@ -93,63 +128,41 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
         else:
             raise ValueError(f"Invalid linkage format: {link}. Expected 3 (coordinate), 4, or 6 elements.")
     
-    linkage_definitions = normalized_linkages
-    
-    # ========================================================================
-    # PARSE ORIENTATION CONSTRAINTS
-    # ========================================================================
-    if orientation_constraints is None:
-        orientation_constraints = {}
-    
-    print("\nOrientation constraints (surface = XY plane, Z = up):")
-    if orientation_constraints:
-        for mol, orientation in orientation_constraints.items():
-            if orientation not in ['flat', 'perpendicular']:
-                raise ValueError(f"Invalid orientation '{orientation}' for {mol}. Use 'flat' or 'perpendicular'")
-            print(f"  {mol}: {orientation}")
-    else:
-        print("  None specified (all molecules can orient freely)")
+    return normalized_linkages
 
-    
-    # ========================================================================
-    # SMART ROOT DETECTION
-    # ========================================================================
-    
-    # If user specified a root explicitly, trust them
+
+def resolve_root_molecule(linkage_definitions, root_mol, molecule_data_dict):
+    """User root if it exists, else a coordinate bonded root, else a molecule
+    that never receives a bond.  Expects normalised linkages."""
     if root_mol and root_mol in molecule_data_dict:
         print(f"Using user-specified root: {root_mol}")
+        return root_mol
+
+    # Option A: Molecule that bonds to a coordinate
+    coordinate_roots = set()
+    for link in linkage_definitions:
+        if isinstance(link[2], (list, np.ndarray)):
+            coordinate_roots.add(link[0])
+
+    # Option B: Traditional root (never receives bonds)
+    all_donors = {link[0] for link in linkage_definitions}
+    all_acceptors = {link[2] for link in linkage_definitions if isinstance(link[2], str)}
+    traditional_roots = all_donors - all_acceptors
+
+    # Prefer coordinate roots, fallback to traditional roots
+    if coordinate_roots:
+        root_mol = list(coordinate_roots)[0]
+        print(f"Auto-detected coordinate-bonded root: {root_mol}")
+    elif traditional_roots:
+        root_mol = list(traditional_roots)[0]
+        print(f"Auto-detected traditional root: {root_mol}")
     else:
-        # Auto-detect root
-        
-        # Option A: Molecule that bonds to a coordinate
-        coordinate_roots = set()
-        for link in linkage_definitions:
-            acceptor = link[2]
-            if isinstance(acceptor, (list, np.ndarray)):
-                coordinate_roots.add(link[0])
-        
-        # Option B: Traditional root (never receives bonds)
-        all_donors = {link[0] for link in linkage_definitions}
-        all_acceptors = set()
-        for link in linkage_definitions:
-            acceptor = link[2]
-            if isinstance(acceptor, str):
-                all_acceptors.add(acceptor)
-        traditional_roots = all_donors - all_acceptors
-        
-        # Prefer coordinate roots, fallback to traditional roots
-        if coordinate_roots:
-            root_mol = list(coordinate_roots)[0]
-            print(f"Auto-detected coordinate-bonded root: {root_mol}")
-        elif traditional_roots:
-            root_mol = list(traditional_roots)[0]
-            print(f"Auto-detected traditional root: {root_mol}")
-        else:
-            raise ValueError("No root molecule found")
-    
-    # ========================================================================
-    # TOPOLOGICAL SORT
-    # ========================================================================
+        raise ValueError("No root molecule found")
+    return root_mol
+
+
+def topological_sort_linkages(linkage_definitions, root_mol):
+    """Order linkages so every acceptor is positioned before its donor."""
     sorted_linkages = []
     in_chain = {root_mol}
     remaining = list(linkage_definitions)
@@ -164,11 +177,125 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
                 sorted_linkages.append(link)
                 in_chain.add(donor)
                 remaining.remove(link)
-        
+
         if len(remaining) == initial_len:
             print(f"\nWARNING: Could not position all molecules. Remaining: {[l[0] for l in remaining]}")
             break
-    
+    return sorted_linkages
+
+
+def chain_molecule_order(linkage_definitions, root_mol, molecule_data_dict):
+    """
+    Molecules in the order align_and_position_molecules positions them:
+    the root first, then each donor in topological order.
+    """
+    links = normalize_linkage_definitions(linkage_definitions)
+    root = resolve_root_molecule(links, root_mol, molecule_data_dict)
+    order = [root]
+    for link in topological_sort_linkages(links, root):
+        if link[0] not in order:
+            order.append(link[0])
+    return order
+
+
+# ============================================================================
+# FACE STATES
+# ============================================================================
+# A face state assigns +1 or -1 to every monomer: which face of its ring
+# points up (+z, away from the surface), measured by face_sign.  For a
+# glucose dimer the four states 00, 01, 10, 11 are the four structurally
+# distinct ways to deposit it.  Label convention: '0' = +1, '1' = -1, one
+# character per monomer in chain_molecule_order.
+
+def face_state_label(face_state, mol_order):
+    """'01'-style label for a face state, in *mol_order*."""
+    return ''.join('0' if face_state.get(m, 1) == 1 else '1' for m in mol_order)
+
+
+def generate_face_states(mol_order, n_states, seed=0, faceable=None):
+    """
+    Up to *n_states* distinct face states for the molecules in *mol_order*.
+
+    Molecules not in *faceable* (no ring, so no face) are fixed at +1 and do
+    not multiply the state count.
+
+    If all 2^k states fit in n_states, all of them are returned in binary
+    order (00, 01, 10, 11 for a dimer).  Otherwise the all '0' state comes
+    first and the rest is a seeded random sample without repeats, so a run
+    is reproducible and states are never duplicated.
+
+    Returns
+    -------
+    list[dict]  each {mol_name: +1 or -1}
+    """
+    faceable = [m for m in mol_order if faceable is None or m in faceable]
+    k = len(faceable)
+    total = 2 ** k
+
+    def _state(bits):
+        st = {m: 1 for m in mol_order}
+        for i, m in enumerate(faceable):
+            st[m] = -1 if (bits >> (k - 1 - i)) & 1 else 1
+        return st
+
+    if n_states >= total:
+        return [_state(b) for b in range(total)]
+
+    rng = np.random.default_rng(seed)
+    picks = [0]
+    if total <= 1_000_000:
+        picks += [int(b) for b in rng.choice(np.arange(1, total), size=n_states - 1, replace=False)]
+    else:
+        seen = {0}
+        while len(picks) < n_states:
+            b = int(rng.integers(1, total))
+            if b not in seen:
+                seen.add(b)
+                picks.append(b)
+    return [_state(b) for b in picks]
+
+
+def _orient_root_for_face(root_data, root_mol, sorted_linkages, molecule_data_dict,
+                          face, iterations, seed):
+    """
+    Rotate the root about its fixed COM so that it presents *face* and its
+    linkage carbons point toward the experimental positions (COMs) of the
+    monomers they bond to.
+
+    Without this the root keeps the arbitrary orientation of its conformer,
+    and its linkage carbon can sit on the far side of the ring, where no
+    rotation of the partner can close the bond.
+
+    Returns the rotated root, or None when the root has no partner to aim at.
+    """
+    bonds = []
+    for donor, dc, acceptor, ac, anom, name in sorted_linkages:
+        if acceptor == root_mol and donor in molecule_data_dict and ac:
+            bonds.append({'donor_carbon': ac,
+                          'target': np.asarray(molecule_data_dict[donor]['COM'], dtype=float),
+                          'target_carbon': None})
+        elif donor == root_mol:
+            if isinstance(acceptor, (list, np.ndarray)):
+                bonds.append({'donor_carbon': dc, 'target': np.asarray(acceptor, dtype=float),
+                              'target_carbon': None})
+            elif acceptor in molecule_data_dict:
+                bonds.append({'donor_carbon': dc,
+                              'target': np.asarray(molecule_data_dict[acceptor]['COM'], dtype=float),
+                              'target_carbon': None})
+    bonds = [b for b in bonds if b['donor_carbon'] in root_data.get('carbon_map', {})]
+    if not bonds:
+        return None
+    first, rest = bonds[0], bonds[1:]
+    mol, _, params = find_rotation_with_face(
+        root_data, first['donor_carbon'], first['target'], None,
+        [], np.asarray(root_data['COM'], dtype=float), face=face,
+        n_samples=iterations, additional_bonds=rest or None, seed=seed)
+    return mol
+
+
+def _position_molecules(molecule_data_dict, sorted_linkages, orientation_constraints,
+                        root_mol, iterations, face_state=None, seed=None):
+    """Body of align_and_position_molecules after linkage preparation."""
     # ========================================================================
     # BUILD LINKAGE MAP: Collect all bonds per molecule
     # ========================================================================
@@ -213,7 +340,30 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
             print(f" (target: ±1.0)")
         else:
             print(f" (target: 0.0)")
-    
+
+    # Face state for the root.
+    if face_state is not None and face_state.get(root_mol) in (1, -1):
+        want = face_state[root_mol]
+        oriented = None
+        if not root_orientation:
+            oriented = _orient_root_for_face(chain_dict[root_mol], root_mol, sorted_linkages,
+                                             molecule_data_dict, want, iterations, seed)
+        if oriented is not None:
+            chain_dict[root_mol] = oriented
+            print(f"\nRoot {root_mol}: rotated about its COM to face {want:+d}, "
+                  f"linkage carbons toward their partners")
+        else:
+            # orientation constrained root, or no partner to aim at: just turn it over
+            have = face_sign(chain_dict[root_mol])
+            if have != 0 and have != want:
+                com_root = chain_dict[root_mol]['COM']
+                chain_dict[root_mol] = flip_molecule_coordinates(chain_dict[root_mol], com_root)
+                print(f"\nRoot {root_mol}: turned over to face {want:+d}")
+            else:
+                print(f"\nRoot {root_mol}: already face {have:+d}")
+        chain_list[0] = chain_dict[root_mol]
+        chain_dict[root_mol]['face_sign'] = face_sign(chain_dict[root_mol])
+
     processed_molecules = {root_mol}
     
     for donor_mol, donor_c, acceptor_mol, acceptor_c, anom, name in sorted_linkages:
@@ -301,6 +451,7 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
         # Choose optimization method — always fall back to experimental position if
         # the rotation optimizer raises so the molecule is never absent from chain_dict.
         best_mol = None
+        distance = float('inf')
         try:
             if target_orientation and len(available_linkages) > 1:
                 # Multi-bond with orientation constraint
@@ -332,6 +483,27 @@ def align_and_position_molecules(molecule_data_dict, linkage_definitions,
                     n_samples=iterations,
                     existing_linkages=sorted_linkages, future_bonds_to_this_mol=future_bonds_to_this_mol
                 )
+
+            elif face_state is not None and face_state.get(donor_mol) in (1, -1):
+                # No orientation constraint, face required by the face state
+                want = face_state[donor_mol]
+                print(f"  Using face constrained 3D rotation (face {want:+d})")
+                primary = available_linkages[0]
+                additional_bonds = [{'donor_carbon': a['donor_carbon'],
+                                     'target': a['target'],
+                                     'target_carbon': a['target_carbon']}
+                                    for a in available_linkages[1:]]
+                best_mol, distance, params = find_rotation_with_face(
+                    template, primary['donor_carbon'],
+                    primary['target'], primary['target_carbon'],
+                    chain_list, fixed_com, face=want,
+                    n_samples=iterations,
+                    additional_bonds=additional_bonds or None,
+                    seed=None if seed is None else seed + len(processed_molecules)
+                )
+                if best_mol is not None:
+                    print(f"  Face {face_sign(best_mol):+d} via {params['method']} "
+                          f"({params['variant']}), filters passed: {params['filters_passed']}")
 
             else:
                 # No orientation constraint - use FULL 3D quaternion rotation
