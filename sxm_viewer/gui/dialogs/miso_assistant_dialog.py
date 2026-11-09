@@ -59,6 +59,7 @@ class ConnectionSketch(QtWidgets.QWidget):
         self.root = None
         self.fixed_orientation = None
         self.caption = ""
+        self.compact = False        # gallery thumbnails: short header, no legend
         self.setMinimumSize(420, 260)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
@@ -147,7 +148,7 @@ class ConnectionSketch(QtWidgets.QWidget):
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
         painter.setPen(QtCore.Qt.black)
         header = self.caption or "Connection plan"
-        if self.fixed_orientation is not None:
+        if self.fixed_orientation is not None and not self.compact:
             header += " | " + ("keep positioned rotations" if self.fixed_orientation
                                else "MISO optimizes orientations")
         painter.drawText(QtCore.QRectF(8, 4, self.width() - 16, 20),
@@ -268,6 +269,9 @@ class ConnectionSketch(QtWidgets.QWidget):
         font.setBold(False)
         painter.setFont(font)
         painter.setPen(QtGui.QColor("#606060"))
+        if self.compact:
+            painter.end()
+            return
         legend = ("Drawn as positioned (top view). C1, C2\u2026: carbons that can form a linkage. "
                   "Arrows: donor \u2192 acceptor (\u03b1/\u03b2); green: sugar \u2192 amino acid; "
                   "purple: peptide chain from N term to C term; brown: lipid chain. "
@@ -558,6 +562,114 @@ class ServiceSettingsPanel(QtWidgets.QWidget):
 
     def _error(self, message):
         QtWidgets.QMessageBox.warning(self.window(), "LLM service", message)
+
+
+class VariantGallery(QtWidgets.QWidget):
+    """Small sketches of every proposed variant, with a Keep box for each (paged)."""
+
+    PER_PAGE = 12
+    COLUMNS = 3
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, instances, parent=None):
+        super().__init__(parent)
+        self.instances = instances
+        self.variants = []
+        self.keep = []
+        self.page = 0
+        self._plan = {}
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.title = QtWidgets.QLabel("")
+        self.title.setWordWrap(True)
+        outer.addWidget(self.title)
+        self.grid_host = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout(self.grid_host)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.grid_host)
+        outer.addWidget(scroll, 1)
+        row = QtWidgets.QHBoxLayout()
+        self.prev_btn = QtWidgets.QPushButton("Previous")
+        self.next_btn = QtWidgets.QPushButton("Next")
+        self.keep_all_btn = QtWidgets.QPushButton("Keep all")
+        self.drop_all_btn = QtWidgets.QPushButton("Discard all")
+        self.page_label = QtWidgets.QLabel("")
+        self.prev_btn.clicked.connect(lambda: self._go(-1))
+        self.next_btn.clicked.connect(lambda: self._go(1))
+        self.keep_all_btn.clicked.connect(lambda: self._set_all(True))
+        self.drop_all_btn.clicked.connect(lambda: self._set_all(False))
+        for widget in (self.prev_btn, self.page_label, self.next_btn):
+            row.addWidget(widget)
+        row.addStretch()
+        row.addWidget(self.keep_all_btn)
+        row.addWidget(self.drop_all_btn)
+        outer.addLayout(row)
+
+    def set_variants(self, variants, plan, lipid_rows=(), caption=""):
+        """``plan``: dict with root, fixed_orientation and peptide_bonds for the sketches."""
+        self.variants = [list(v) for v in variants]
+        self.keep = [True] * len(self.variants)
+        self.page = 0
+        self._plan = dict(plan)
+        self._lipids = list(lipid_rows)
+        self._caption = caption
+        self._render()
+
+    def kept(self):
+        return [v for v, flag in zip(self.variants, self.keep) if flag]
+
+    def pages(self):
+        return max(1, -(-len(self.variants) // self.PER_PAGE))
+
+    def _go(self, step):
+        self.page = min(max(self.page + step, 0), self.pages() - 1)
+        self._render()
+
+    def _set_all(self, flag):
+        self.keep = [flag] * len(self.variants)
+        self._render()
+        self.changed.emit()
+
+    def _toggle(self, index, flag):
+        self.keep[index] = bool(flag)
+        self._update_labels()
+        self.changed.emit()
+
+    def _update_labels(self):
+        kept = sum(self.keep)
+        self.title.setText(
+            f"{len(self.variants)} variants proposed and checked locally. Keep the ones you "
+            f"want; each kept variant becomes its own YAML. Kept: {kept}. {self._caption}")
+        self.page_label.setText(f"Page {self.page + 1} of {self.pages()}")
+        self.prev_btn.setEnabled(self.page > 0)
+        self.next_btn.setEnabled(self.page < self.pages() - 1)
+
+    def _render(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        start = self.page * self.PER_PAGE
+        for offset, variant in enumerate(self.variants[start:start + self.PER_PAGE]):
+            index = start + offset
+            box = QtWidgets.QGroupBox(f"Variant {index + 1}")
+            layout = QtWidgets.QVBoxLayout(box)
+            sketch = ConnectionSketch(self.instances)
+            sketch.compact = True
+            sketch.setMinimumSize(230, 150)
+            sketch.set_lipids(self._lipids)
+            sketch.set_plan(variant, self._plan.get("root"), self._plan.get("fixed_orientation"),
+                            f"v{index + 1}", self._plan.get("peptide_bonds", ()))
+            layout.addWidget(sketch, 1)
+            check = QtWidgets.QCheckBox("Keep")
+            check.setChecked(self.keep[index])
+            check.toggled.connect(lambda flag, i=index: self._toggle(i, flag))
+            layout.addWidget(check)
+            self.grid.addWidget(box, offset // self.COLUMNS, offset % self.COLUMNS)
+        self._update_labels()
 
 
 class MISOAssistantDialog(QtWidgets.QDialog):
@@ -1241,12 +1353,23 @@ class MISOAssistantDialog(QtWidgets.QDialog):
                                 else "Let MISO optimize"),
             "\nConnections:",
         ]
-        for link in choices.connections:
+        alternatives = getattr(choices, "alternatives", None) or []
+        if len(alternatives) > 1:
+            lines[-1] = (f"\nVariants: {len(alternatives)} (one YAML each; the program checked "
+                         "every one):")
+            for number, variant in enumerate(alternatives, start=1):
+                bonds = "; ".join(
+                    f"{self.instances[l.donor]['label']} {l.donor_carbon} -> "
+                    f"{self.instances[l.acceptor]['label']} {l.acceptor_carbon} "
+                    + ("(phosphate)" if l.bond == "phosphate" else f"({l.anomer})")
+                    for l in variant)
+                lines.append(f"  v{number}: {bonds}")
+        for link in ([] if len(alternatives) > 1 else choices.connections):
             lines.append(f"{self.instances[link.donor]['label']} {link.donor_carbon} -> "
                          f"{self.instances[link.acceptor]['label']} {link.acceptor_carbon} "
                          + ("(phosphate bridge)" if link.bond == "phosphate"
                             else f"({link.anomer})"))
-        if not choices.connections:
+        if not choices.connections and len(alternatives) < 2:
             lines.append("None (single sugar)." if not self.has_peptide else "None.")
         if self.has_peptide:
             order = (choices.peptide_order if choices.peptide_order is not None
@@ -1370,8 +1493,13 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             chat_layout.addLayout(order_row)
             self._show_peptide()
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.variant_gallery = VariantGallery(self.instances)
+        self.variant_gallery.changed.connect(self._variants_changed)
+        self.online_stack = QtWidgets.QStackedWidget()
+        self.online_stack.addWidget(self.online_sketch)
+        self.online_stack.addWidget(self.variant_gallery)
         split.addWidget(chat)
-        split.addWidget(self.online_sketch)
+        split.addWidget(self.online_stack)
         split.setSizes([550, 550])
         layout.addWidget(split, 1)
         self.online_approve = QtWidgets.QPushButton("Approve and apply reviewed proposal")
@@ -1475,21 +1603,50 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             self.online_sketch.set_plan(choices.connections, choices.root, choices.fixed_orientation,
                                         "Proposal - NOT applied until you approve",
                                         choices.peptide_bonds)
+            if len(choices.alternatives) > 1:
+                self.variant_gallery.set_variants(
+                    choices.alternatives,
+                    {"root": choices.root, "fixed_orientation": choices.fixed_orientation,
+                     "peptide_bonds": choices.peptide_bonds},
+                    self._rows_with(choices), "Nothing is applied until you approve.")
+                self.online_stack.setCurrentWidget(self.variant_gallery)
+            else:
+                self.online_stack.setCurrentWidget(self.online_sketch)
             self.online_approve.setEnabled(True)
             self.online_status.setText("Proposal validated locally. Review every bond; nothing has been applied.")
         else:
             self.online_status.setText("Advice received. No settings changed.")
 
+    def _kept_choices(self):
+        """The proposal with only the variants the user kept (None: all discarded)."""
+        choices = self._online_choices
+        if choices is None or len(choices.alternatives) < 2:
+            return choices
+        kept = self.variant_gallery.kept()
+        if not kept:
+            return None
+        return replace(choices, connections=kept[0], alternatives=kept if len(kept) > 1 else [])
+
+    def _variants_changed(self):
+        choices = self._kept_choices()
+        self.online_approve.setEnabled(choices is not None)
+        if choices is not None:
+            self.online_review.setPlainText(self._summary(choices))
+
     def _approve_online(self):
         if self._online_choices is None:
             self._error("No valid proposal is available to approve.")
             return
-        choices = self._online_choices
+        choices = self._kept_choices()
+        if choices is None:
+            self._error("Keep at least one variant, or ask the assistant for a new proposal.")
+            return
         if self.has_peptide:
             choices = replace(choices, peptide_order=list(self.peptide_order))
         try:
-            validate_choices(self.instances, choices, self.lipid_rows,
-                             self.point_count if self.has_petn else None)
+            for variant in (choices.alternatives or [choices.connections]):
+                validate_choices(self.instances, replace(choices, connections=variant),
+                                 self.lipid_rows, self.point_count if self.has_petn else None)
         except MISOExportError as exc:
             self._error(str(exc))
             return

@@ -1235,7 +1235,8 @@ class PositionMonomerDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDi
         out_path = self.csv_le.text().strip() or "monomers.csv"
         config = None
         try:
-            config = self._make_miso_config(out_path)
+            configs = self._miso_configs(out_path)
+            config = configs[0][1]
         except MISOExportError as exc:
             QtWidgets.QMessageBox.warning(
                 self, "MISO YAML export",
@@ -1251,25 +1252,27 @@ class PositionMonomerDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets.QDi
                     self, "Missing dependency", "PyYAML is required for MISO YAML export.")
                 return
             export_errors += (yaml.YAMLError,)
-        yaml_path = Path(out_path).with_suffix(".yml")
+        yaml_path = configs[0][0]
         try:
             written = self._write_csv_exports(out_path)
-            if config is not None:
-                with open(yaml_path, "w", encoding="utf-8") as handle:
-                    yaml.safe_dump(config, handle, sort_keys=False, allow_unicode=True)
+            for path, cfg in configs:
+                with open(path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(cfg, handle, sort_keys=False, allow_unicode=True)
         except export_errors as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Export failed",
                 f"Could not complete the MISO export:\n{exc}\n\n"
                 "Some companion files may already have been written. Fix the error and export again.")
             return
-        written.append(yaml_path.name)
+        written.extend(path.name for path, _cfg in configs)
         self.viewer.last_monomer_yaml = str(yaml_path.resolve())
         QtWidgets.QMessageBox.information(
             self, "Done",
             f"Saved {len(self._instances)} unit(s):\n  "
             + "\n  ".join(written)
-            + f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
+            + (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}" if len(configs) == 1 else
+               f"\n\n{len(configs)} MISO input YAMLs (variants) in:\n  {yaml_path.resolve().parent}"
+               "\nRun MISO uses the first one.")
             + self._lipid_yaml_note()
             + "\n\nPlease give the YAML a final inspection (units, root, linkages, "
               "\u03b1/\u03b2, orientation mode) before running MISO. "

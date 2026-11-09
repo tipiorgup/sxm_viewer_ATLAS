@@ -7,6 +7,8 @@ The host dialog provides ``self._instances`` (placed sugar units) and
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..._shared import QtCore, QtWidgets
 from ...utils.miso_yaml import (
     GLYCOSYLATION_TYPES, MISOExportError, PEtNGroup, PeptideBond, SugarConnection,
@@ -39,6 +41,10 @@ class MISOConnectionMixin:
         self.assistant_btn = QtWidgets.QPushButton("Guide me / optional LLM assistant")
         self.assistant_btn.clicked.connect(self._open_miso_assistant)
         box.addWidget(self.assistant_btn)
+        self.variants_label = QtWidgets.QLabel("")
+        self.variants_label.setWordWrap(True)
+        self.variants_label.setVisible(False)
+        box.addWidget(self.variants_label)
         form = QtWidgets.QFormLayout()
         self.root_combo = QtWidgets.QComboBox()
         self.root_combo.addItem("Choose root monomer...", None)
@@ -404,7 +410,40 @@ class MISOConnectionMixin:
         """Carbons held by lipids or PEtN groups, which a new sugar bond must avoid."""
         return self._used_lipid_sites() | set(self._petn_sites() if self.SUPPORTS_PETN else ())
 
+    # Alternative connection lists proposed by the assistant (empty: ordinary export).
+    _variants = ()
+    VARIANT_CONFIRM_COUNT = 25
+
+    def _set_variants(self, variants):
+        self._variants = [list(v) for v in variants] if len(variants) > 1 else []
+        count = len(self._variants)
+        self.variants_label.setVisible(bool(count))
+        self.variants_label.setText(
+            f"Assistant variants: {count}. The table shows variant 1; export writes one "
+            "YAML per variant (shared CSV and companion files). Editing the connections "
+            "discards the variants." if count else "")
+
+    def _miso_configs(self, out_path):
+        """[(yaml_path, config)]: one entry, or one per assistant variant."""
+        base = Path(out_path).with_suffix(".yml")
+        if len(self._variants) < 2:
+            return [(base, self._make_miso_config(out_path))]
+        original = self._connections
+        results = []
+        try:
+            for number, variant in enumerate(self._variants, start=1):
+                self._connections = list(variant)
+                try:
+                    config = self._make_miso_config(out_path)
+                except MISOExportError as exc:
+                    raise MISOExportError(f"Variant {number}: {exc}") from exc
+                results.append((base.with_name(f"{base.stem}_v{number}{base.suffix}"), config))
+        finally:
+            self._connections = original
+        return results
+
     def _reset_connections(self):
+        self._set_variants([])
         self._connections.clear()
         self._peptide_bonds = []
         self._peptide_order = None
@@ -463,12 +502,14 @@ class MISOConnectionMixin:
             QtWidgets.QMessageBox.warning(self, "MISO connection", str(exc))
             return
         self._connections.append(connection)
+        self._set_variants([])
         self._fill_connection_table()
 
     def _remove_connection(self):
         row = self.connection_table.currentRow()
         if row >= 0:
             self._connections.pop(row)
+            self._set_variants([])
             self.connection_table.removeRow(row)
 
     def _fill_connection_table(self):
@@ -515,6 +556,7 @@ class MISOConnectionMixin:
             self._apply_assistant_choices(dialog.result_choices)
 
     def _apply_assistant_choices(self, choices):
+        from dataclasses import replace
         from ...utils.miso_assistant import validate_choices
         try:
             validate_choices(self._instances, choices,
@@ -523,7 +565,25 @@ class MISOConnectionMixin:
         except MISOExportError as exc:
             QtWidgets.QMessageBox.warning(self, "MISO assistant", str(exc))
             return
+        variants = list(getattr(choices, "alternatives", None) or [])
+        if len(variants) > 1:
+            try:
+                for variant in variants:
+                    validate_choices(self._instances, replace(choices, connections=variant),
+                                     self._lipid_context() if hasattr(self, "_lipid_context")
+                                     else (), len(self._points) if self.SUPPORTS_PETN else None)
+            except MISOExportError as exc:
+                QtWidgets.QMessageBox.warning(self, "MISO assistant", str(exc))
+                return
+            if len(variants) >= self.VARIANT_CONFIRM_COUNT:
+                answer = QtWidgets.QMessageBox.question(
+                    self, "MISO assistant",
+                    f"The assistant proposes {len(variants)} variants, so export will write "
+                    f"{len(variants)} YAML files. Continue?")
+                if answer != QtWidgets.QMessageBox.Yes:
+                    return
         self._connections = list(choices.connections)
+        self._set_variants(variants)
         if self.SUPPORTS_PETN:
             self._petn = list(choices.petn)
             self._refresh_petn_ui()

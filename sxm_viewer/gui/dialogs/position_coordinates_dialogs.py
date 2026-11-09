@@ -997,7 +997,8 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
                 return
         if with_yaml:
             try:
-                config = self._make_miso_config(out_path)
+                configs = self._miso_configs(out_path)
+                config = configs[0][1]
             except MISOExportError as exc:
                 QtWidgets.QMessageBox.warning(
                     self, "MISO YAML export",
@@ -1011,7 +1012,7 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
                     self, "Missing dependency", "PyYAML is required for MISO YAML export.")
                 return
             export_errors += (yaml.YAMLError,)
-        yaml_path = Path(out_path).with_suffix(".yml")
+        yaml_path = configs[0][0] if config is not None else Path(out_path).with_suffix(".yml")
         extra = []
         try:
             with open(out_path, "w", newline="") as f:
@@ -1031,8 +1032,9 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
                 if pickle_path:
                     extra.append(pickle_path)
             if config is not None:
-                with open(yaml_path, "w", encoding="utf-8") as handle:
-                    yaml.safe_dump(config, handle, sort_keys=False, allow_unicode=True)
+                for path, cfg in configs:
+                    with open(path, "w", encoding="utf-8") as handle:
+                        yaml.safe_dump(cfg, handle, sort_keys=False, allow_unicode=True)
         except export_errors as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Export failed",
@@ -1055,8 +1057,13 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
         if config is not None:
             message += self._lipid_yaml_note() + self._special_groups_note()
             self.viewer.last_monomer_yaml = str(yaml_path.resolve())
-            message += (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
-                        "\n\nPlease give the YAML a final inspection (units, root, "
+            if len(configs) == 1:
+                message += f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
+            else:
+                message += (f"\n\n{len(configs)} MISO input YAMLs (variants):\n  "
+                            + "\n  ".join(path.name for path, _c in configs)
+                            + "\nRun MISO uses the first one.")
+            message += ("\n\nPlease give the YAML a final inspection (units, root, "
                         "linkages, \u03b1/\u03b2, orientation mode) before running MISO. "
                         "Open Run MISO to use this YAML and its companion files.")
         QtWidgets.QMessageBox.information(self, "Done", message)
