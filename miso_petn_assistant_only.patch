@@ -1,0 +1,311 @@
+diff --git a/sxm_viewer/gui/dialogs/_miso_connection_panel.py b/sxm_viewer/gui/dialogs/_miso_connection_panel.py
+index 111d985..49edf4f 100644
+--- a/sxm_viewer/gui/dialogs/_miso_connection_panel.py
++++ b/sxm_viewer/gui/dialogs/_miso_connection_panel.py
+@@ -24,9 +24,6 @@ class MISOConnectionMixin:
+     SUPPORTS_PEPTIDE = False
+     # Hosts that own free image points (Position coordinates) set this to offer PEtN.
+     SUPPORTS_PETN = False
+-    PETN_HINT = (
+-        "Adds a phosphoethanolamine to a sugar carbon. Pick a spare point on the image "
+-        "(not a sugar or amino acid point) and MISO places the terminal N atom there.")
+     PEPTIDE_HINT = (
+         "Join a sugar carbon to an amino acid (Asn, Ser, Thr or Tyr; one sugar per "
+         "residue). The chain runs in the order listed below; any residue can be part "
+@@ -103,8 +100,6 @@ class MISOConnectionMixin:
+         self._petn = []
+         if self.SUPPORTS_PEPTIDE:
+             self._build_peptide_ui(box)
+-        if self.SUPPORTS_PETN:
+-            self._build_petn_ui(box)
+         self._refresh_connection_units()
+         return group
+ 
+@@ -115,39 +110,6 @@ class MISOConnectionMixin:
+             self.link_anomer_combo.setCurrentIndex(0)
+ 
+     # ------------------------------------------------------------------ PEtN
+-    def _build_petn_ui(self, box):
+-        box.addWidget(QtWidgets.QLabel("<b>Phosphoethanolamine (PEtN)</b>"))
+-        hint = QtWidgets.QLabel(self.PETN_HINT)
+-        hint.setWordWrap(True)
+-        box.addWidget(hint)
+-        form = QtWidgets.QFormLayout()
+-        self.petn_sugar_combo = QtWidgets.QComboBox()
+-        self.petn_carbon_combo = QtWidgets.QComboBox()
+-        self.petn_point_combo = QtWidgets.QComboBox()
+-        row = QtWidgets.QHBoxLayout()
+-        row.addWidget(self.petn_sugar_combo, 1)
+-        row.addWidget(self.petn_carbon_combo)
+-        form.addRow("Sugar and carbon:", row)
+-        form.addRow("N atom at point:", self.petn_point_combo)
+-        box.addLayout(form)
+-        self.petn_sugar_combo.currentIndexChanged.connect(self._refresh_petn_carbons)
+-        buttons = QtWidgets.QHBoxLayout()
+-        add = QtWidgets.QPushButton("Add PEtN")
+-        remove = QtWidgets.QPushButton("Remove selected PEtN")
+-        add.clicked.connect(self._add_petn)
+-        remove.clicked.connect(self._remove_petn)
+-        buttons.addWidget(add)
+-        buttons.addWidget(remove)
+-        box.addLayout(buttons)
+-        self.petn_table = QtWidgets.QTableWidget(0, 3)
+-        self.petn_table.setHorizontalHeaderLabels(["Sugar", "Carbon", "N point"])
+-        self.petn_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+-        self.petn_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+-        self.petn_table.horizontalHeader().setSectionResizeMode(
+-            QtWidgets.QHeaderView.ResizeToContents)
+-        self.petn_table.setFixedHeight(80)
+-        box.addWidget(self.petn_table)
+-
+     def _free_point_indices(self):
+         """Picked points that belong to no unit (hosts with free points override this)."""
+         return []
+@@ -166,19 +128,12 @@ class MISOConnectionMixin:
+     def _petn_sites(self):
+         return {(group.sugar, group.sugar_carbon) for group in self._petn}
+ 
+-    def _refresh_petn_carbons(self, _index=None):
+-        selected = self.petn_carbon_combo.currentText()
+-        self.petn_carbon_combo.clear()
+-        index = self.petn_sugar_combo.currentData()
+-        if index is not None and 0 <= index < len(self._instances):
+-            self.petn_carbon_combo.addItems(linkage_carbons(self._instances[index]))
+-        if selected in [self.petn_carbon_combo.itemText(i)
+-                        for i in range(self.petn_carbon_combo.count())]:
+-            self.petn_carbon_combo.setCurrentText(selected)
+-
+-    def _refresh_petn_ui(self):
+-        """Refill the PEtN lists after units or points change; drop groups that no longer fit."""
+-        if not self.SUPPORTS_PETN or not hasattr(self, "petn_table"):
++    def _prune_petn(self):
++        """Drop PEtN groups that no longer fit the units or the free points.
++
++        PEtN has no controls in the main panel: it is set in the assistant only.
++        """
++        if not self.SUPPORTS_PETN:
+             return
+         free = set(self._free_point_indices())
+         self._petn = [g for g in self._petn
+@@ -186,53 +141,6 @@ class MISOConnectionMixin:
+                       and self._instances[g.sugar].get("kind") == "sugar"
+                       and g.sugar_carbon in linkage_carbons(self._instances[g.sugar])
+                       and g.point in free]
+-        blockers = [QtCore.QSignalBlocker(self.petn_sugar_combo),
+-                    QtCore.QSignalBlocker(self.petn_point_combo)]
+-        self.petn_sugar_combo.clear()
+-        self.petn_sugar_combo.addItem("Choose sugar...", None)
+-        for index, inst in enumerate(self._instances):
+-            if inst["kind"] == "sugar":
+-                self.petn_sugar_combo.addItem(inst["label"], index)
+-        self.petn_point_combo.clear()
+-        self.petn_point_combo.addItem("Choose point...", None)
+-        taken = {g.point for g in self._petn}
+-        for point in sorted(free - taken):
+-            self.petn_point_combo.addItem(self._petn_point_label(point), point)
+-        del blockers
+-        self._refresh_petn_carbons()
+-        self._fill_petn_table()
+-
+-    def _fill_petn_table(self):
+-        self.petn_table.setRowCount(len(self._petn))
+-        for row, group in enumerate(self._petn):
+-            values = (self._instances[group.sugar]["label"], group.sugar_carbon,
+-                      str(group.point))
+-            for column, value in enumerate(values):
+-                self.petn_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+-
+-    def _add_petn(self):
+-        sugar, point = self.petn_sugar_combo.currentData(), self.petn_point_combo.currentData()
+-        if sugar is None or point is None:
+-            QtWidgets.QMessageBox.warning(
+-                self, "PEtN", "Choose a sugar, a carbon and the point for the N atom.")
+-            return
+-        group = PEtNGroup(sugar, self.petn_carbon_combo.currentText(), point)
+-        try:
+-            from ...utils.miso_yaml import validate_petn
+-            validate_petn(self._instances, self._petn + [group],
+-                          self._connection_sites() | self._used_lipid_sites(),
+-                          len(self._points), self._connections)
+-        except MISOExportError as exc:
+-            QtWidgets.QMessageBox.warning(self, "PEtN", str(exc))
+-            return
+-        self._petn.append(group)
+-        self._refresh_petn_ui()
+-
+-    def _remove_petn(self):
+-        row = self.petn_table.currentRow()
+-        if row >= 0:
+-            self._petn.pop(row)
+-            self._refresh_petn_ui()
+ 
+     def _connection_sites(self):
+         """Sugar carbons used by sugar bonds and peptide bonds."""
+@@ -467,7 +375,7 @@ class MISOConnectionMixin:
+         self._refresh_linkage_carbons()
+         if self.SUPPORTS_PEPTIDE:
+             self._refresh_peptide_ui()
+-        self._refresh_petn_ui()
++        self._prune_petn()
+         refresh_lipids = getattr(self, "_refresh_lipid_attach_ui", None)
+         if refresh_lipids is not None and hasattr(self, "lipid_attach_sugar"):
+             refresh_lipids()
+@@ -586,7 +494,7 @@ class MISOConnectionMixin:
+         self._set_variants(variants)
+         if self.SUPPORTS_PETN:
+             self._petn = list(choices.petn)
+-            self._refresh_petn_ui()
++            self._prune_petn()
+         if choices.lipid_attachments and hasattr(self, "_apply_lipid_attachments"):
+             self._apply_lipid_attachments(choices.lipid_attachments)
+         self._peptide_bonds = list(choices.peptide_bonds)
+diff --git a/sxm_viewer/gui/dialogs/miso_assistant_dialog.py b/sxm_viewer/gui/dialogs/miso_assistant_dialog.py
+index 3e5eda9..62b6a5b 100644
+--- a/sxm_viewer/gui/dialogs/miso_assistant_dialog.py
++++ b/sxm_viewer/gui/dialogs/miso_assistant_dialog.py
+@@ -1250,12 +1250,21 @@ class MISOAssistantDialog(QtWidgets.QDialog):
+         number = 4 + int(self.has_peptide) + int(self.has_lipids)
+         text = QtWidgets.QLabel(
+             f"{number}. Does a sugar carry a phosphoethanolamine (PEtN)?\n\n"
+-            "Skip this page if not. A PEtN sits on a sugar carbon and MISO steers its terminal "
++            "Optional. A PEtN sits on a sugar carbon and MISO steers its terminal "
+             "N atom to a free point you picked on the image (a point that is not a sugar or "
+             "amino acid). Use the point you meant for the N atom; it is never guessed from "
+             "positions.")
+         text.setWordWrap(True)
+         form.addWidget(text)
++        self.petn_chk = QtWidgets.QCheckBox("Add phosphoethanolamine (PEtN) to this structure")
++        self.petn_chk.setChecked(bool(self.petn))
++        form.addWidget(self.petn_chk)
++        self.petn_fields = QtWidgets.QWidget()
++        form = QtWidgets.QVBoxLayout(self.petn_fields)
++        form.setContentsMargins(0, 0, 0, 0)
++        page.layout().addWidget(self.petn_fields)
++        self.petn_chk.toggled.connect(self.petn_fields.setEnabled)
++        self.petn_fields.setEnabled(self.petn_chk.isChecked())
+         fields = QtWidgets.QFormLayout()
+         self.petn_sugar = self._unit_combo(lambda inst: not is_amino_acid(inst))
+         self.petn_carbon = QtWidgets.QComboBox()
+@@ -1335,6 +1344,12 @@ class MISOAssistantDialog(QtWidgets.QDialog):
+             self.connections.pop(row)
+             self._show_connections()
+ 
++    def _chosen_petn(self):
++        """PEtN groups only when the optional box is ticked."""
++        if self.has_petn and self.petn_chk.isChecked():
++            return list(self.petn)
++        return []
++
+     def _offline_choices(self):
+         root, mode = self.root_combo.currentData(), self.mode_combo.currentData()
+         if root is None or mode is None:
+@@ -1342,7 +1357,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
+         choices = AssistantChoices(
+             root, mode, list(self.connections), list(self.peptide_bonds),
+             list(self.peptide_order) if self.has_peptide else None,
+-            self._lipid_attachments(), list(self.petn))
++            self._lipid_attachments(), self._chosen_petn())
+         validate_choices(self.instances, choices, self.lipid_rows, self.point_count)
+         return choices
+ 
+diff --git a/sxm_viewer/gui/dialogs/position_coordinates_dialogs.py b/sxm_viewer/gui/dialogs/position_coordinates_dialogs.py
+index 1059c3f..76af83d 100644
+--- a/sxm_viewer/gui/dialogs/position_coordinates_dialogs.py
++++ b/sxm_viewer/gui/dialogs/position_coordinates_dialogs.py
+@@ -445,7 +445,7 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
+ 
+     def _refresh_table(self):
+         self.count_lbl.setText(f"Points: {len(self._points)}")
+-        self._refresh_petn_ui()
++        self._prune_petn()
+         self._update_build_status()
+         self._update_rotation_controls()
+         self._draw_markers()
+diff --git a/sxm_viewer/utils/miso_assistant.py b/sxm_viewer/utils/miso_assistant.py
+index b3d5e48..b8234e7 100644
+--- a/sxm_viewer/utils/miso_assistant.py
++++ b/sxm_viewer/utils/miso_assistant.py
+@@ -105,7 +105,9 @@ otherwise use a normal glycosidic bond. In "connections" write "bond": "phosphat
+ "anomer" for it. The donor is the sugar MISO rotates toward the acceptor: it must have no
+ other sugar or peptide bond, it cannot be the root, and the acceptor must belong to the
+ glycosidic chain on the root side. A carbon still takes only ONE bond.
+-2. Phosphoethanolamine (PEtN) on a sugar carbon. When the context has "free_points", they
++2. Phosphoethanolamine (PEtN) on a sugar carbon. It is OPTIONAL and the main window has no
++controls for it: it exists only here, so add one only when the user asks for it, and you may
++mention it as an available option. When the context has "free_points", they
+ are image points the user picked that belong to no unit, each with "point" and
+ "xy_angstrom". A PEtN needs a sugar, a carbon from that sugar's "available_carbons" and the
+ free point where its terminal N atom should end up. Never pick the point from positions
+diff --git a/tests/test_special_groups.py b/tests/test_special_groups.py
+index 3d2a981..be5078a 100644
+--- a/tests/test_special_groups.py
++++ b/tests/test_special_groups.py
+@@ -331,6 +331,10 @@ class AssistantDialogTests(unittest.TestCase):
+     def test_petn_through_the_offline_page(self):
+         d = self.dialog(free_points=FREE, point_count=8)
+         d.connections = list(GLC_GLC)
++        self.assertFalse(d.petn_chk.isChecked())
++        self.assertFalse(d.petn_fields.isEnabled())
++        d.petn_chk.setChecked(True)
++        self.assertTrue(d.petn_fields.isEnabled())
+         d.petn_sugar.setCurrentIndex(d.petn_sugar.findData(1))
+         d.petn_carbon.setCurrentText("C6")
+         d.petn_point.setCurrentIndex(d.petn_point.findData(5))
+@@ -340,6 +344,9 @@ class AssistantDialogTests(unittest.TestCase):
+         d.root_combo.setCurrentIndex(d.root_combo.findData(1))
+         choices = d._offline_choices()
+         self.assertEqual(choices.petn, [PEtNGroup(1, "C6", 5)])
++        d.petn_chk.setChecked(False)                      # unticked: nothing is written
++        self.assertEqual(d._offline_choices().petn, [])
++        d.petn_chk.setChecked(True)
+         self.assertIn("N atom at point 5", d._summary(choices))
+ 
+     def test_petn_on_a_taken_carbon_is_refused_on_the_page(self):
+@@ -400,7 +407,10 @@ class CoordinatesPanelTests(unittest.TestCase):
+ 
+     def test_free_points_exclude_unit_points(self):
+         self.assertEqual(self.d._free_point_indices(), [2, 3, 4, 5, 6, 7])
+-        self.assertEqual(self.d.petn_point_combo.count(), 7)
++
++    def test_main_panel_has_no_petn_controls(self):
++        for name in ("petn_table", "petn_sugar_combo", "petn_carbon_combo", "petn_point_combo"):
++            self.assertFalse(hasattr(self.d, name), name)
+ 
+     def test_phosphate_bridge_from_the_panel_reaches_the_yaml(self):
+         d = self.d
+@@ -417,16 +427,10 @@ class CoordinatesPanelTests(unittest.TestCase):
+         self.assertEqual(config["Phosphate"], [["Glc_0", "C1", "Glc_1", "C4"]])
+         self.assertIn("Phosphate bridges written", d._special_groups_note())
+ 
+-    def test_petn_from_the_panel_reaches_the_yaml(self):
++    def test_petn_from_the_assistant_reaches_the_yaml(self):
+         d = self.d
+         d._connections.append(GLC_GLC[0])
+-        d.petn_sugar_combo.setCurrentIndex(d.petn_sugar_combo.findData(1))
+-        d.petn_carbon_combo.setCurrentText("C6")
+-        d.petn_point_combo.setCurrentIndex(d.petn_point_combo.findData(5))
+-        d._add_petn()
+-        self.assertEqual(self.warning.call_count, 0, self.warning.call_args)
+-        self.assertEqual(d.petn_table.item(0, 2).text(), "5")
+-        self.assertEqual(d.petn_point_combo.findData(5), -1)         # the point is taken now
++        d._petn = [PEtNGroup(1, "C6", 5)]
+         config = d._make_miso_config("out.csv")
+         self.assertEqual(config["PEtN"], [{"connection": ["Glc_1", "C6"], "direction": [5]}])
+         self.assertIn("PEtN groups written", d._special_groups_note())
+@@ -435,7 +439,7 @@ class CoordinatesPanelTests(unittest.TestCase):
+         d = self.d
+         d._petn = [PEtNGroup(1, "C6", 7)]
+         d._points.pop()
+-        d._refresh_petn_ui()
++        d._prune_petn()
+         self.assertEqual(d._petn, [])
+ 
+     def test_a_new_sugar_bond_avoids_a_petn_carbon(self):
+@@ -457,7 +461,6 @@ class CoordinatesPanelTests(unittest.TestCase):
+         self.assertEqual(self.warning.call_count, 0, self.warning.call_args)
+         self.assertEqual(d._connections[0].bond, "phosphate")
+         self.assertEqual(d._petn, [PEtNGroup(1, "C6", 5)])
+-        self.assertEqual(d.petn_table.rowCount(), 1)
+ 
+     def test_rebuilding_clears_the_petn_groups(self):
+         d = self.d

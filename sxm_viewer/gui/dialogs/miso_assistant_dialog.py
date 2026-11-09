@@ -1250,12 +1250,21 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         number = 4 + int(self.has_peptide) + int(self.has_lipids)
         text = QtWidgets.QLabel(
             f"{number}. Does a sugar carry a phosphoethanolamine (PEtN)?\n\n"
-            "Skip this page if not. A PEtN sits on a sugar carbon and MISO steers its terminal "
+            "Optional. A PEtN sits on a sugar carbon and MISO steers its terminal "
             "N atom to a free point you picked on the image (a point that is not a sugar or "
             "amino acid). Use the point you meant for the N atom; it is never guessed from "
             "positions.")
         text.setWordWrap(True)
         form.addWidget(text)
+        self.petn_chk = QtWidgets.QCheckBox("Add phosphoethanolamine (PEtN) to this structure")
+        self.petn_chk.setChecked(bool(self.petn))
+        form.addWidget(self.petn_chk)
+        self.petn_fields = QtWidgets.QWidget()
+        form = QtWidgets.QVBoxLayout(self.petn_fields)
+        form.setContentsMargins(0, 0, 0, 0)
+        page.layout().addWidget(self.petn_fields)
+        self.petn_chk.toggled.connect(self.petn_fields.setEnabled)
+        self.petn_fields.setEnabled(self.petn_chk.isChecked())
         fields = QtWidgets.QFormLayout()
         self.petn_sugar = self._unit_combo(lambda inst: not is_amino_acid(inst))
         self.petn_carbon = QtWidgets.QComboBox()
@@ -1335,6 +1344,12 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             self.connections.pop(row)
             self._show_connections()
 
+    def _chosen_petn(self):
+        """PEtN groups only when the optional box is ticked."""
+        if self.has_petn and self.petn_chk.isChecked():
+            return list(self.petn)
+        return []
+
     def _offline_choices(self):
         root, mode = self.root_combo.currentData(), self.mode_combo.currentData()
         if root is None or mode is None:
@@ -1342,7 +1357,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         choices = AssistantChoices(
             root, mode, list(self.connections), list(self.peptide_bonds),
             list(self.peptide_order) if self.has_peptide else None,
-            self._lipid_attachments(), list(self.petn))
+            self._lipid_attachments(), self._chosen_petn())
         validate_choices(self.instances, choices, self.lipid_rows, self.point_count)
         return choices
 

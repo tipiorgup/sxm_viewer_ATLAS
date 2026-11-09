@@ -105,7 +105,9 @@ otherwise use a normal glycosidic bond. In "connections" write "bond": "phosphat
 "anomer" for it. The donor is the sugar MISO rotates toward the acceptor: it must have no
 other sugar or peptide bond, it cannot be the root, and the acceptor must belong to the
 glycosidic chain on the root side. A carbon still takes only ONE bond.
-2. Phosphoethanolamine (PEtN) on a sugar carbon. When the context has "free_points", they
+2. Phosphoethanolamine (PEtN) on a sugar carbon. It is OPTIONAL and the main window has no
+controls for it: it exists only here, so add one only when the user asks for it, and you may
+mention it as an available option. When the context has "free_points", they
 are image points the user picked that belong to no unit, each with "point" and
 "xy_angstrom". A PEtN needs a sugar, a carbon from that sugar's "available_carbons" and the
 free point where its terminal N atom should end up. Never pick the point from positions

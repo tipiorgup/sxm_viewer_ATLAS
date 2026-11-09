@@ -445,7 +445,7 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
 
     def _refresh_table(self):
         self.count_lbl.setText(f"Points: {len(self._points)}")
-        self._refresh_petn_ui()
+        self._prune_petn()
         self._update_build_status()
         self._update_rotation_controls()
         self._draw_markers()
