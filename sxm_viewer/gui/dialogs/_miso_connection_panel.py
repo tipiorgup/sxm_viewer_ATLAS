@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from ..._shared import QtCore, QtWidgets
 from ...utils.miso_yaml import (
-    GLYCOSYLATION_TYPES, MISOExportError, PeptideBond, SugarConnection,
+    GLYCOSYLATION_TYPES, MISOExportError, PEtNGroup, PeptideBond, SugarConnection,
     default_peptide_order, is_amino_acid, linkage_carbons, validate_connections,
 )
 
@@ -20,6 +20,11 @@ class MISOConnectionMixin:
         "connections and root. YAML export supports sugars only.")
     # Hosts that can export a peptide section set this to True; others stay sugar only.
     SUPPORTS_PEPTIDE = False
+    # Hosts that own free image points (Position coordinates) set this to offer PEtN.
+    SUPPORTS_PETN = False
+    PETN_HINT = (
+        "Adds a phosphoethanolamine to a sugar carbon. Pick a spare point on the image "
+        "(not a sugar or amino acid point) and MISO places the terminal N atom there.")
     PEPTIDE_HINT = (
         "Join a sugar carbon to an amino acid (Asn, Ser, Thr or Tyr; one sugar per "
         "residue). The chain runs in the order listed below; any residue can be part "
@@ -56,6 +61,15 @@ class MISOConnectionMixin:
             row.addWidget(unit, 1)
             row.addWidget(carbon)
             form.addRow(label, row)
+        self.link_bond_combo = QtWidgets.QComboBox()
+        self.link_bond_combo.addItem("Glycosidic bond", "glycosidic")
+        self.link_bond_combo.addItem("Phosphate bridge", "phosphate")
+        self.link_bond_combo.setToolTip(
+            "Phosphate bridge: sugar carbon, O, P, O, sugar carbon. MISO rotates the donor "
+            "toward the acceptor, so the donor can have no other sugar bond and the acceptor "
+            "must be in the glycosidic chain.")
+        self.link_bond_combo.currentIndexChanged.connect(self._bond_type_changed)
+        form.addRow("Bond type:", self.link_bond_combo)
         form.addRow("Linkage anomer:", self.link_anomer_combo)
         box.addLayout(form)
         self.donor_combo.currentIndexChanged.connect(self._refresh_linkage_carbons)
@@ -68,9 +82,9 @@ class MISOConnectionMixin:
         buttons.addWidget(add)
         buttons.addWidget(remove)
         box.addLayout(buttons)
-        self.connection_table = QtWidgets.QTableWidget(0, 5)
+        self.connection_table = QtWidgets.QTableWidget(0, 6)
         self.connection_table.setHorizontalHeaderLabels(
-            ["Donor", "Carbon", "Acceptor", "Carbon", "Anomer"])
+            ["Donor", "Carbon", "Acceptor", "Carbon", "Anomer", "Bond"])
         self.connection_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.connection_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.connection_table.horizontalHeader().setSectionResizeMode(
@@ -80,10 +94,146 @@ class MISOConnectionMixin:
         layout.addWidget(group)
         self._peptide_bonds = []
         self._peptide_order = None
+        self._petn = []
         if self.SUPPORTS_PEPTIDE:
             self._build_peptide_ui(box)
+        if self.SUPPORTS_PETN:
+            self._build_petn_ui(box)
         self._refresh_connection_units()
         return group
+
+    def _bond_type_changed(self, _index=None):
+        phosphate = self.link_bond_combo.currentData() == "phosphate"
+        self.link_anomer_combo.setEnabled(not phosphate)
+        if phosphate:
+            self.link_anomer_combo.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------ PEtN
+    def _build_petn_ui(self, box):
+        box.addWidget(QtWidgets.QLabel("<b>Phosphoethanolamine (PEtN)</b>"))
+        hint = QtWidgets.QLabel(self.PETN_HINT)
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+        form = QtWidgets.QFormLayout()
+        self.petn_sugar_combo = QtWidgets.QComboBox()
+        self.petn_carbon_combo = QtWidgets.QComboBox()
+        self.petn_point_combo = QtWidgets.QComboBox()
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.petn_sugar_combo, 1)
+        row.addWidget(self.petn_carbon_combo)
+        form.addRow("Sugar and carbon:", row)
+        form.addRow("N atom at point:", self.petn_point_combo)
+        box.addLayout(form)
+        self.petn_sugar_combo.currentIndexChanged.connect(self._refresh_petn_carbons)
+        buttons = QtWidgets.QHBoxLayout()
+        add = QtWidgets.QPushButton("Add PEtN")
+        remove = QtWidgets.QPushButton("Remove selected PEtN")
+        add.clicked.connect(self._add_petn)
+        remove.clicked.connect(self._remove_petn)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        box.addLayout(buttons)
+        self.petn_table = QtWidgets.QTableWidget(0, 3)
+        self.petn_table.setHorizontalHeaderLabels(["Sugar", "Carbon", "N point"])
+        self.petn_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.petn_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.petn_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents)
+        self.petn_table.setFixedHeight(80)
+        box.addWidget(self.petn_table)
+
+    def _free_point_indices(self):
+        """Picked points that belong to no unit (hosts with free points override this)."""
+        return []
+
+    def _petn_point_label(self, index):
+        return f"Point {index}"
+
+    def _petn_free_points(self):
+        """Allowlisted rows for the assistant: spare points with their coordinates."""
+        rows = []
+        for index in self._free_point_indices():
+            _ox, _oy, x, y, *_rest = self._points[index]
+            rows.append({"point": index, "xy_angstrom": [round(float(x), 4), round(float(y), 4)]})
+        return rows
+
+    def _petn_sites(self):
+        return {(group.sugar, group.sugar_carbon) for group in self._petn}
+
+    def _refresh_petn_carbons(self, _index=None):
+        selected = self.petn_carbon_combo.currentText()
+        self.petn_carbon_combo.clear()
+        index = self.petn_sugar_combo.currentData()
+        if index is not None and 0 <= index < len(self._instances):
+            self.petn_carbon_combo.addItems(linkage_carbons(self._instances[index]))
+        if selected in [self.petn_carbon_combo.itemText(i)
+                        for i in range(self.petn_carbon_combo.count())]:
+            self.petn_carbon_combo.setCurrentText(selected)
+
+    def _refresh_petn_ui(self):
+        """Refill the PEtN lists after units or points change; drop groups that no longer fit."""
+        if not self.SUPPORTS_PETN or not hasattr(self, "petn_table"):
+            return
+        free = set(self._free_point_indices())
+        self._petn = [g for g in self._petn
+                      if 0 <= g.sugar < len(self._instances)
+                      and self._instances[g.sugar].get("kind") == "sugar"
+                      and g.sugar_carbon in linkage_carbons(self._instances[g.sugar])
+                      and g.point in free]
+        blockers = [QtCore.QSignalBlocker(self.petn_sugar_combo),
+                    QtCore.QSignalBlocker(self.petn_point_combo)]
+        self.petn_sugar_combo.clear()
+        self.petn_sugar_combo.addItem("Choose sugar...", None)
+        for index, inst in enumerate(self._instances):
+            if inst["kind"] == "sugar":
+                self.petn_sugar_combo.addItem(inst["label"], index)
+        self.petn_point_combo.clear()
+        self.petn_point_combo.addItem("Choose point...", None)
+        taken = {g.point for g in self._petn}
+        for point in sorted(free - taken):
+            self.petn_point_combo.addItem(self._petn_point_label(point), point)
+        del blockers
+        self._refresh_petn_carbons()
+        self._fill_petn_table()
+
+    def _fill_petn_table(self):
+        self.petn_table.setRowCount(len(self._petn))
+        for row, group in enumerate(self._petn):
+            values = (self._instances[group.sugar]["label"], group.sugar_carbon,
+                      str(group.point))
+            for column, value in enumerate(values):
+                self.petn_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+
+    def _add_petn(self):
+        sugar, point = self.petn_sugar_combo.currentData(), self.petn_point_combo.currentData()
+        if sugar is None or point is None:
+            QtWidgets.QMessageBox.warning(
+                self, "PEtN", "Choose a sugar, a carbon and the point for the N atom.")
+            return
+        group = PEtNGroup(sugar, self.petn_carbon_combo.currentText(), point)
+        try:
+            from ...utils.miso_yaml import validate_petn
+            validate_petn(self._instances, self._petn + [group],
+                          self._connection_sites() | self._used_lipid_sites(),
+                          len(self._points), self._connections)
+        except MISOExportError as exc:
+            QtWidgets.QMessageBox.warning(self, "PEtN", str(exc))
+            return
+        self._petn.append(group)
+        self._refresh_petn_ui()
+
+    def _remove_petn(self):
+        row = self.petn_table.currentRow()
+        if row >= 0:
+            self._petn.pop(row)
+            self._refresh_petn_ui()
+
+    def _connection_sites(self):
+        """Sugar carbons used by sugar bonds and peptide bonds."""
+        sites = {(link.donor, link.donor_carbon) for link in self._connections}
+        sites |= {(link.acceptor, link.acceptor_carbon) for link in self._connections}
+        sites |= {(bond.sugar, bond.sugar_carbon) for bond in self._peptide_bonds}
+        return sites
 
     def _build_peptide_ui(self, box):
         title = QtWidgets.QLabel("<b>Sugar to amino acid bonds</b>")
@@ -250,10 +400,15 @@ class MISOConnectionMixin:
         sites = getattr(self, "_lipid_sites", None)
         return sites() if sites is not None else set()
 
+    def _used_group_sites(self):
+        """Carbons held by lipids or PEtN groups, which a new sugar bond must avoid."""
+        return self._used_lipid_sites() | set(self._petn_sites() if self.SUPPORTS_PETN else ())
+
     def _reset_connections(self):
         self._connections.clear()
         self._peptide_bonds = []
         self._peptide_order = None
+        self._petn = []
         self.connection_table.setRowCount(0)
         self._refresh_connection_units()
 
@@ -273,6 +428,7 @@ class MISOConnectionMixin:
         self._refresh_linkage_carbons()
         if self.SUPPORTS_PEPTIDE:
             self._refresh_peptide_ui()
+        self._refresh_petn_ui()
         refresh_lipids = getattr(self, "_refresh_lipid_attach_ui", None)
         if refresh_lipids is not None and hasattr(self, "lipid_attach_sugar"):
             refresh_lipids()
@@ -295,12 +451,14 @@ class MISOConnectionMixin:
             QtWidgets.QMessageBox.warning(
                 self, "MISO connection", "Choose both a donor and an acceptor.")
             return
+        bond = self.link_bond_combo.currentData()
         connection = SugarConnection(
             donor, self.donor_carbon_combo.currentText(), acceptor,
-            self.acceptor_carbon_combo.currentText(), self.link_anomer_combo.currentText())
+            self.acceptor_carbon_combo.currentText(),
+            "none" if bond == "phosphate" else self.link_anomer_combo.currentText(), bond)
         try:
             validate_connections(self._instances, self._connections + [connection],
-                                 self._peptide_bonds, self._used_lipid_sites())
+                                 self._peptide_bonds, self._used_group_sites())
         except MISOExportError as exc:
             QtWidgets.QMessageBox.warning(self, "MISO connection", str(exc))
             return
@@ -317,7 +475,9 @@ class MISOConnectionMixin:
         self.connection_table.setRowCount(len(self._connections))
         for row, link in enumerate(self._connections):
             values = (self._instances[link.donor]["label"], link.donor_carbon,
-                      self._instances[link.acceptor]["label"], link.acceptor_carbon, link.anomer)
+                      self._instances[link.acceptor]["label"], link.acceptor_carbon,
+                      link.anomer if link.bond == "glycosidic" else "n/a",
+                      "phosphate" if link.bond == "phosphate" else "glycosidic")
             for column, value in enumerate(values):
                 self.connection_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
         self._refresh_chain_sketch()
@@ -347,7 +507,10 @@ class MISOConnectionMixin:
             self.orientation_combo.currentData(), parent=self,
             peptide_bonds=self._peptide_bonds,
             peptide_order=self._current_peptide_order() if self._residue_indices() else None,
-            lipid_rows=self._lipid_context() if hasattr(self, "_lipid_context") else ())
+            lipid_rows=self._lipid_context() if hasattr(self, "_lipid_context") else (),
+            free_points=self._petn_free_points() if self.SUPPORTS_PETN else None,
+            point_count=len(self._points) if self.SUPPORTS_PETN else None,
+            petn=self._petn if self.SUPPORTS_PETN else ())
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.result_choices is not None:
             self._apply_assistant_choices(dialog.result_choices)
 
@@ -355,11 +518,15 @@ class MISOConnectionMixin:
         from ...utils.miso_assistant import validate_choices
         try:
             validate_choices(self._instances, choices,
-                             self._lipid_context() if hasattr(self, "_lipid_context") else ())
+                             self._lipid_context() if hasattr(self, "_lipid_context") else (),
+                             len(self._points) if self.SUPPORTS_PETN else None)
         except MISOExportError as exc:
             QtWidgets.QMessageBox.warning(self, "MISO assistant", str(exc))
             return
         self._connections = list(choices.connections)
+        if self.SUPPORTS_PETN:
+            self._petn = list(choices.petn)
+            self._refresh_petn_ui()
         if choices.lipid_attachments and hasattr(self, "_apply_lipid_attachments"):
             self._apply_lipid_attachments(choices.lipid_attachments)
         self._peptide_bonds = list(choices.peptide_bonds)

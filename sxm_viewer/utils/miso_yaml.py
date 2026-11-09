@@ -10,6 +10,12 @@ class MISOExportError(ValueError):
     """Placed units or connection choices cannot form a valid MISO input."""
 
 
+# "glycosidic" joins two sugars directly. "phosphate" joins them through a phosphate
+# bridge: MISO rotates the donor sugar toward the acceptor (the target, which must sit
+# in the glycosidic chain) and builds sugar carbon, O, P, O, sugar carbon.
+BOND_TYPES = ("glycosidic", "phosphate")
+
+
 @dataclass(frozen=True)
 class SugarConnection:
     donor: int
@@ -17,6 +23,16 @@ class SugarConnection:
     acceptor: int
     acceptor_carbon: str
     anomer: str
+    bond: str = "glycosidic"
+
+
+@dataclass(frozen=True)
+class PEtNGroup:
+    """A phosphoethanolamine on a sugar carbon; ``point`` is the picked image point
+    (its index in the positions CSV) where the terminal N atom should end up."""
+    sugar: int
+    sugar_carbon: str
+    point: int
 
 
 @dataclass(frozen=True)
@@ -171,6 +187,10 @@ def validate_lipids(instances: list[dict], lipids, used_sites=()) -> None:
             used.add(site)
             anchored_sugars.add(index)
         elif lipid.anchor == "lipid":
+            if lipid.linkage != "amide":
+                raise MISOExportError(
+                    f"{name}: a branch off a lipid chain must use amide. MISO builds ester "
+                    "and ether branches without any chain, so they would silently be missing.")
             branched.append(lipid)
         else:
             raise MISOExportError(f"{name}: the anchor must be 'sugar' or 'lipid'.")
@@ -185,6 +205,116 @@ def validate_lipids(instances: list[dict], lipids, used_sites=()) -> None:
                 "sugar (MISO branches from the first sugar that carries lipids).")
 
 
+def _distance_to_polyline(point, polyline) -> float:
+    import math
+    best = float("inf")
+    for a, b in zip(polyline, polyline[1:]):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length2 = dx * dx + dy * dy
+        t = 0.0 if length2 == 0 else max(0.0, min(1.0, (
+            (point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / length2))
+        best = min(best, math.hypot(point[0] - a[0] - t * dx, point[1] - a[1] - t * dy))
+    return best
+
+
+def lipid_branch_parent(lipids):
+    """Index (in ``lipids``) of the sugar attached lipid the branches grow from, or None.
+
+    MISO bonds every branch to carbon 2 of the FIRST sugar attached lipid it built, so
+    all branches must sit on one lipid. The parent is the sugar attached lipid whose
+    drawn line is closest to the branch's End (bond point).
+    """
+    lipids = list(lipids)
+    sugar_rows = [i for i, lip in enumerate(lipids) if lip.anchor == "sugar"]
+    parents = set()
+    for lip in lipids:
+        if lip.anchor != "lipid" or lip.end is None:
+            continue
+        def line_of(i):
+            points = [p for p in (lipids[i].start, lipids[i].mid, lipids[i].end) if p is not None]
+            return points * 2 if len(points) == 1 else points
+
+        best = min(sugar_rows, key=lambda i: _distance_to_polyline(lip.end, line_of(i)),
+                   default=None)
+        if best is not None:
+            parents.add(best)
+    if len(parents) > 1:
+        names = ", ".join(lipids[i].label for i in sorted(parents))
+        raise MISOExportError(
+            f"The branches sit on different lipids ({names}). MISO can only branch from one "
+            "lipid (the first one it builds): put every branch End point on the same lipid.")
+    return next(iter(parents)) if parents else None
+
+
+def _validate_phosphate_bridges(instances, connections, peptide_bonds=()):
+    """MISO rotates the donor of a phosphate bridge as a separate unit, so it must be a leaf."""
+    bridges = [link for link in connections if link.bond == "phosphate"]
+    if not bridges:
+        return
+    glycosidic_units = {unit for link in connections if link.bond == "glycosidic"
+                        for unit in (link.donor, link.acceptor)}
+    peptide_units = {bond.sugar for bond in peptide_bonds}
+    donors = set()
+    for link in bridges:
+        donor, target = instances[link.donor]["label"], instances[link.acceptor]["label"]
+        if link.donor in donors:
+            raise MISOExportError(
+                f"{donor} is the rotated sugar of two phosphate bridges. MISO allows one per sugar.")
+        donors.add(link.donor)
+        if link.donor in glycosidic_units or link.donor in peptide_units:
+            raise MISOExportError(
+                f"{donor} has a phosphate bridge to {target} and another bond. MISO rotates the "
+                "donor of a phosphate bridge as a separate sugar, so it can have no glycosidic "
+                "or peptide bond. Swap donor and acceptor, or use a glycosidic bond.")
+    for link in bridges:
+        if link.acceptor in donors:
+            raise MISOExportError(
+                f"{instances[link.acceptor]['label']} is the rotated sugar of another phosphate "
+                "bridge, so it cannot be the target of this one. The target must sit in the "
+                "glycosidic chain.")
+
+
+def validate_petn(instances: list[dict], petn, used_sites=(), point_count=None,
+                  connections=(), reserved_points=()) -> None:
+    """Check phosphoethanolamine groups against MISO's rules (pipeline.add_petn_modifications)."""
+    used = set(used_sites)
+    reserved = {inst.get("position", i) for i, inst in enumerate(instances)} | set(reserved_points)
+    rotated = {link.donor for link in connections if link.bond == "phosphate"}
+    seen_points = set()
+    for number, group in enumerate(petn, 1):
+        if not (type(group.sugar) is int and 0 <= group.sugar < len(instances)):
+            raise MISOExportError(f"PEtN {number} refers to a unit that no longer exists.")
+        unit = instances[group.sugar]
+        if not is_sugar(unit):
+            raise MISOExportError(f"PEtN {number}: {unit['label']} is not a sugar.")
+        if group.sugar in rotated:
+            raise MISOExportError(
+                f"{unit['label']} is rotated into place by a phosphate bridge. MISO adds PEtN "
+                "only to sugars of the glycosidic chain: use another sugar or carbon.")
+        if group.sugar_carbon not in linkage_carbons(unit):
+            raise MISOExportError(
+                f"{unit['label']}: {group.sugar_carbon} is not a mapped hydroxyl-bearing carbon.")
+        site = (group.sugar, group.sugar_carbon)
+        if site in used:
+            raise MISOExportError(
+                f"{unit['label']} {group.sugar_carbon} is already used by another bond, lipid "
+                "or PEtN. A carbon takes only one.")
+        used.add(site)
+        if type(group.point) is not int or group.point < 0:
+            raise MISOExportError(f"PEtN {number}: choose the point where the N atom goes.")
+        if point_count is not None and group.point >= point_count:
+            raise MISOExportError(
+                f"PEtN {number}: point {group.point} does not exist (the image has "
+                f"{point_count} points).")
+        if group.point in reserved:
+            raise MISOExportError(
+                f"PEtN {number}: point {group.point} is already used by a sugar or amino acid. "
+                "Pick a separate point for the N atom.")
+        if group.point in seen_points:
+            raise MISOExportError(f"Point {group.point} is used by two PEtN groups.")
+        seen_points.add(group.point)
+
+
 def validate_connections(instances: list[dict],
                          connections: list[SugarConnection],
                          peptide_bonds=(), lipid_sites=()) -> None:
@@ -195,7 +325,10 @@ def validate_connections(instances: list[dict],
             raise MISOExportError(f"Connection {number} refers to a unit that no longer exists.")
         if link.donor == link.acceptor:
             raise MISOExportError(f"Connection {number} links a unit to itself.")
-        if link.anomer not in ("alpha", "beta"):
+        if link.bond not in BOND_TYPES:
+            raise MISOExportError(
+                f"Connection {number}: choose a glycosidic bond or a phosphate bridge.")
+        if link.bond == "glycosidic" and link.anomer not in ("alpha", "beta"):
             raise MISOExportError(f"Choose alpha or beta for connection {number}.")
         for index, carbon in ((link.donor, link.donor_carbon),
                               (link.acceptor, link.acceptor_carbon)):
@@ -211,6 +344,7 @@ def validate_connections(instances: list[dict],
                 raise MISOExportError(
                     f"{instance['label']}: {carbon} is already used by another connection.")
             used_sites.add(site)
+    _validate_phosphate_bridges(instances, connections, peptide_bonds)
     used_residues = set()
     for number, bond in enumerate(peptide_bonds, 1):
         if not (type(bond.sugar) is int and type(bond.residue) is int
@@ -251,7 +385,7 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
                       has_lipids: bool = False,
                       positions_csv: str | None = None,
                       peptide_bonds=(), peptide_order=None,
-                      functional_points=None, lipids=()) -> dict:
+                      functional_points=None, lipids=(), petn=(), point_count=None) -> dict:
     """MISO input for the sugar and amino acid ``instances``.
 
     Amino acid units become the ``peptide`` section (chain order ``peptide_order``,
@@ -259,11 +393,16 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
     ``functional_points`` optionally maps an amino acid unit index to the circle
     index of its side-chain point (``functional_position``); default None.
 
+    ``petn`` are phosphoethanolamine groups (``PEtNGroup``); ``point_count`` is the number
+    of picked points, so a PEtN point can be checked against the positions CSV.
+    Connections with ``bond == "phosphate"`` become the ``Phosphate`` section.
+
     Each instance occupies point ``inst["position"]`` of the positions CSV
     (default: its list index). ``positions_csv`` overrides the default
     ``<stem>_positions.csv`` circle input.
     """
     lipids = list(lipids)
+    petn = list(petn)
     if (has_lipids and not lipids) or any(
             not (is_sugar(inst) or is_amino_acid(inst)) for inst in instances):
         raise MISOExportError(
@@ -315,11 +454,16 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
         positions.setdefault(name, []).append(point)
         molecule_ids[index] = f"{name}_{point}"
 
-    validate_connections(instances, connections, peptide_bonds)
-    validate_lipids(instances, lipids, {
+    petn_sites = {(group.sugar, group.sugar_carbon) for group in petn}
+    validate_connections(instances, connections, peptide_bonds, petn_sites)
+    connection_sites = {
         (link.donor, link.donor_carbon) for link in connections} | {
         (link.acceptor, link.acceptor_carbon) for link in connections} | {
-        (bond.sugar, bond.sugar_carbon) for bond in peptide_bonds})
+        (bond.sugar, bond.sugar_carbon) for bond in peptide_bonds}
+    validate_lipids(instances, lipids, connection_sites | petn_sites)
+    validate_petn(instances, petn, connection_sites | {
+        (lip.sugar, lip.sugar_carbon) for lip in lipids if lip.anchor == "sugar"},
+        point_count, connections, set((functional_points or {}).values()))
     if aa_ids and not peptide_bonds:
         raise MISOExportError(
             "Amino acids are placed but no sugar is bonded to them. Add a sugar to "
@@ -335,8 +479,14 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
     if unknown:
         raise MISOExportError(f"Unknown amino acid '{unknown[0]}' in the peptide.")
 
+    glycosidic = [link for link in connections if link.bond == "glycosidic"]
+    bridges = [link for link in connections if link.bond == "phosphate"]
+    if root in {link.donor for link in bridges}:
+        raise MISOExportError(
+            f"{instances[root]['label']} is the root, but it is the sugar rotated by a phosphate "
+            "bridge. Choose another root, or swap donor and acceptor of the bridge.")
     adjacent = {i: set() for i in sugar_ids}
-    for link in connections:
+    for link in glycosidic:
         adjacent[link.donor].add(link.acceptor)
         adjacent[link.acceptor].add(link.donor)
     reachable = {i: set(n) for i, n in adjacent.items()}
@@ -351,6 +501,13 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
         for neighbor in reachable[pending.pop()] - reached:
             reached.add(neighbor)
             pending.append(neighbor)
+    for link in bridges:
+        if link.acceptor not in reached:
+            raise MISOExportError(
+                f"Phosphate bridge to {instances[link.acceptor]['label']}: the target sugar must "
+                "be connected to the root by glycosidic bonds, because MISO builds the bridge "
+                "from it.")
+    reached.update(link.donor for link in bridges)
     if len(reached) != len(sugar_ids):
         missing = ", ".join(instances[i]["label"] for i in sugar_ids if i not in reached)
         hint = (" With optimized orientations all sugars must form one glycan joined by "
@@ -359,9 +516,9 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
                 if peptide_bonds and not fixed_orientation else "")
         raise MISOExportError(f"All sugars must connect to the root. Unconnected: {missing}.{hint}")
     if not fixed_orientation:
-        reached = {root}
+        reached = {root} | {link.donor for link in bridges}
         while True:
-            donors = {link.donor for link in connections if link.acceptor in reached}
+            donors = {link.donor for link in glycosidic if link.acceptor in reached}
             if donors <= reached:
                 break
             reached.update(donors)
@@ -373,7 +530,7 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
 
     stem = Path(out_path).resolve().with_suffix("")
     bonds = []
-    for link in connections:
+    for link in glycosidic:
         donor = molecule_ids[link.donor]
         acceptor = molecule_ids[link.acceptor]
         description = (f"{instances[link.donor]['label']} {link.donor_carbon} -> "
@@ -395,6 +552,13 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
         "direction": [bond[:] for bond in bonds],
         "glycosidic_bonds": bonds,
     }
+    if bridges:
+        config["Phosphate"] = [
+            [molecule_ids[link.donor], link.donor_carbon,
+             molecule_ids[link.acceptor], link.acceptor_carbon] for link in bridges]
+    if petn:
+        config["PEtN"] = [{"connection": [molecule_ids[group.sugar], group.sugar_carbon],
+                           "direction": [group.point]} for group in petn]
     if aa_ids:
         config["peptide"] = {
             "sequence": "-".join(AA_ONE_LETTER[n] for n in residue_names),
@@ -412,6 +576,15 @@ def build_miso_config(instances: list[dict], connections: list[SugarConnection],
             "use_spacer": False,
         } for bond in peptide_bonds]
     if lipids:
+        # MISO branches from the first sugar attached lipid it builds: put the parent first.
+        parent = lipid_branch_parent(lipids)
+        sugar_first = [lip for lip in lipids if lip.anchor == "sugar"]
+        if parent is not None:
+            parent_lipid = lipids[parent]
+            sugar_first.remove(parent_lipid)
+            sugar_first.insert(0, parent_lipid)
+        lipids = sugar_first + [lip for lip in lipids if lip.anchor == "lipid"]
+
         def xyz(point):
             return [round(float(point[0]), 6), round(float(point[1]), 6), 0.0]
 

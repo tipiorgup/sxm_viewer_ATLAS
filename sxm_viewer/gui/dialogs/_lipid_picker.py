@@ -24,7 +24,8 @@ from pathlib import Path
 import numpy as np
 
 from sxm_viewer._shared import QtCore, QtWidgets
-from sxm_viewer.utils.miso_yaml import LipidBond, is_sugar, lipid_carbons
+from sxm_viewer.utils.miso_yaml import (
+    LipidBond, MISOExportError, is_sugar, lipid_branch_parent, lipid_carbons)
 
 # Colors used for built atoms (kept local so the module has no host dependency).
 LIPID_ATOM_COLORS = {"C": "#9e9e9e", "O": "#e53935", "N": "#1e88e5", "H": "#eeeeee"}
@@ -90,8 +91,12 @@ class LipidPickerMixin:
         "4. Under MISO attachment choose a sugar and its carbon (put the End next to that "
         "sugar), or Branch off a lipid chain (put the End on that lipid's chain).\n"
         "5. Choose ester, amide or ether. Carbons 0 means automatic.\n"
-        "A sugar carbon holds only one thing: a sugar bond, a peptide bond or a lipid. "
-        "Branches need at least one lipid attached to a sugar, all on one sugar.")
+        "A sugar carbon holds only one thing: a sugar bond, a peptide bond or a lipid.\n"
+        "Branches: MISO only builds a branch with the amide linkage (ester and ether "
+        "branches get no chain), so branches are set to amide. A branch needs at least one "
+        "lipid attached to a sugar, all on one sugar, and all branches on the same lipid. "
+        "MISO bonds a branch to carbon 2 of that lipid, so put the branch End point near "
+        "the beginning of that lipid's chain, next to its sugar.")
 
     def _build_lipid_group(self, parent_layout):
         self.lipid_group = QtWidgets.QGroupBox("Lipids")
@@ -334,6 +339,12 @@ class LipidPickerMixin:
                              if lip["sugar"] is not None else None)
         else:
             lip["sugar"] = lip["carbon"] = None
+            lip["linkage"] = "amide"             # MISO only builds amide branches
+            combo = self.lipid_table.cellWidget(row, 4)
+            if combo is not None:
+                blocker = QtCore.QSignalBlocker(combo)
+                combo.setCurrentText("amide")
+                del blocker
         on_sugar = lip["anchor"] == "sugar"
         self.lipid_attach_sugar.setEnabled(on_sugar)
         self.lipid_attach_carbon.setEnabled(on_sugar)
@@ -378,6 +389,13 @@ class LipidPickerMixin:
         if not self._lipids:
             return ""
         note = f"\n\nLipids written to the YAML: {len(self._lipids)}."
+        try:
+            parent = lipid_branch_parent(self._lipid_bonds())
+        except MISOExportError:
+            parent = None
+        if parent is not None:
+            note += (f"\nBranches bond to carbon 2 of {self._lipids[parent]['label']} "
+                     "(MISO uses carbon 2 of the first lipid it builds).")
         if any(lip.get("mid") is not None for lip in self._lipids):
             note += ("\nA bend (midpoint) is written, but MISO's chain builder may pull the "
                      "chain off the bend; check the result.")

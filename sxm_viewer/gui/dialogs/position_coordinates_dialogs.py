@@ -42,6 +42,7 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
     # valid; it is moved next to the coordinates visually.
     COL_TYPE = 8
     SUPPORTS_PEPTIDE = True
+    SUPPORTS_PETN = True            # free picked points can hold a PEtN nitrogen
     CONNECTION_HINT = (
         "Connect named sugars explicitly; branches are allowed. Rebuilding clears "
         "connections, peptide bonds and root.")
@@ -433,8 +434,18 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
             lambda _text, combo=type_combo: self._on_type_changed(combo))
         self.table.setCellWidget(index, self.COL_TYPE, type_combo)
 
+    def _free_point_indices(self):
+        """Picked points that are not the position of a sugar or amino acid unit."""
+        used = {inst["position"] for inst in self._instances}
+        return [i for i in range(len(self._points)) if i not in used]
+
+    def _petn_point_label(self, index):
+        _ox, _oy, x, y, *_rest = self._points[index]
+        return f"Point {index}  ({x:.1f}, {y:.1f} A)"
+
     def _refresh_table(self):
         self.count_lbl.setText(f"Points: {len(self._points)}")
+        self._refresh_petn_ui()
         self._update_build_status()
         self._update_rotation_controls()
         self._draw_markers()
@@ -923,7 +934,21 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
             mode, out_path, self._sxm_path, positions_csv=out_path,
             has_lipids=bool(self._lipids), lipids=self._lipid_bonds(),
             peptide_bonds=self._peptide_bonds,
-            peptide_order=self._current_peptide_order() if self._residue_indices() else None)
+            peptide_order=self._current_peptide_order() if self._residue_indices() else None,
+            petn=self._petn, point_count=len(self._points))
+
+    def _special_groups_note(self):
+        """Text for the export dialog about phosphate bridges and PEtN groups."""
+        note = ""
+        bridges = [link for link in self._connections if link.bond == "phosphate"]
+        if bridges:
+            note += (f"\n\nPhosphate bridges written to the YAML: {len(bridges)}. MISO rotates "
+                     "the donor sugar of each bridge toward its target, even when you chose to "
+                     "keep the positioned rotations.")
+        if self._petn:
+            note += (f"\n\nPEtN groups written to the YAML: {len(self._petn)}. The N atom is "
+                     "steered to the picked point, so check the result.")
+        return note
 
     # ------------------------------------------------------------------ export
     def _browse_csv(self):
@@ -1028,7 +1053,7 @@ class PositionCoordinatesDialog(LipidPickerMixin, MISOConnectionMixin, QtWidgets
         if lipid_files:
             message += "\n\nLipids:\n  " + "\n  ".join(Path(p).name for p in lipid_files)
         if config is not None:
-            message += self._lipid_yaml_note()
+            message += self._lipid_yaml_note() + self._special_groups_note()
             self.viewer.last_monomer_yaml = str(yaml_path.resolve())
             message += (f"\n\nMISO input YAML:\n  {yaml_path.resolve()}"
                         "\n\nPlease give the YAML a final inspection (units, root, "

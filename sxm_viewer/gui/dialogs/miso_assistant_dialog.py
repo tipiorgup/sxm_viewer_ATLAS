@@ -15,8 +15,8 @@ from ...utils.miso_assistant import (
 from ...utils.miso_models import profile_for
 from ...utils.miso_yaml import (
     GLYCOSYLATION_TYPES, AA_ONE_LETTER, LIPID_LINKAGES, LipidAttachment, MISOExportError,
-    PeptideBond, SugarConnection, default_peptide_order, is_amino_acid, is_sugar,
-    lipid_carbons, linkage_carbons, validate_connections, validate_lipids,
+    PEtNGroup, PeptideBond, SugarConnection, default_peptide_order, is_amino_acid, is_sugar,
+    lipid_carbons, linkage_carbons, validate_connections, validate_lipids, validate_petn,
 )
 
 
@@ -207,11 +207,14 @@ class ConnectionSketch(QtWidgets.QWidget):
             start = self._site_point(geometries, centres, to_widget, link.donor, link.donor_carbon)
             end = self._site_point(geometries, centres, to_widget, link.acceptor, link.acceptor_carbon)
             radius = 11.0 if geometries[link.donor] is None else 5.0
-            anomer = {"alpha": "\u03b1", "beta": "\u03b2"}.get(link.anomer, link.anomer)
+            phosphate = link.bond == "phosphate"
+            anomer = "P" if phosphate else {"alpha": "\u03b1", "beta": "\u03b2"}.get(
+                link.anomer, link.anomer)
             # Carbon names are already shown on drawn structures.
             label = (anomer if geometries[link.donor] and geometries[link.acceptor]
                      else f"{link.donor_carbon}\u2192{link.acceptor_carbon} {anomer}")
-            self._draw_bond(painter, start, end, radius, label)
+            self._draw_bond(painter, start, end, radius, label,
+                            "#7b1fa2" if phosphate else "#d97706")
         for bond in valid_peptide:
             start = self._site_point(geometries, centres, to_widget, bond.sugar, bond.sugar_carbon)
             end = centres[bond.residue]
@@ -433,6 +436,15 @@ class ServiceSettingsPanel(QtWidgets.QWidget):
         self.remember_key = QtWidgets.QCheckBox("Remember API key in Windows Credential Manager")
         self.remember_key.setChecked(True)
         settings_layout.addWidget(self.remember_key)
+        self.web_search_chk = QtWidgets.QCheckBox(
+            "Allow the provider's web search (off by default)")
+        self.web_search_chk.setToolTip(
+            "Lets the model look up chemical names on the web through your provider. Search "
+            "queries leave this computer and may cost extra. Available with Anthropic and with "
+            "OpenAI search models (the model name contains 'search'), not with institutional "
+            "endpoints. Search results never change what MISO can build.")
+        self.web_search_chk.toggled.connect(lambda _on: self.changed.emit())
+        settings_layout.addWidget(self.web_search_chk)
         buttons = QtWidgets.QHBoxLayout()
         save = QtWidgets.QPushButton("Save configuration")
         load = QtWidgets.QPushButton("Load saved key")
@@ -466,7 +478,8 @@ class ServiceSettingsPanel(QtWidgets.QWidget):
 
     def service_config(self):
         return ServiceConfig(self.provider_combo.currentText(), self.endpoint_edit.text().strip(),
-                             self.model_edit.text().strip(), self.auth_combo.currentData())
+                             self.model_edit.text().strip(), self.auth_combo.currentData(),
+                             self.web_search_chk.isChecked())
 
     def api_key(self):
         return self.key_edit.text()
@@ -493,6 +506,8 @@ class ServiceSettingsPanel(QtWidgets.QWidget):
         self.model_edit.setText(self.settings.value("model", ""))
         self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(
             self.settings.value("auth_header", "Authorization"))))
+        self.web_search_chk.setChecked(
+            str(self.settings.value("web_search", "false")).lower() == "true")
         self.settings_toggle.setChecked(not self.model_edit.text().strip())
         self.changed.emit()
 
@@ -506,7 +521,8 @@ class ServiceSettingsPanel(QtWidgets.QWidget):
             self._error(str(exc))
             return
         for key, value in (("provider", config.provider), ("endpoint", config.endpoint),
-                           ("model", config.model), ("auth_header", config.auth_header)):
+                           ("model", config.model), ("auth_header", config.auth_header),
+                           ("web_search", "true" if config.web_search else "false")):
             self.settings.setValue(key, value)
         self.settings.sync()
         if self.settings.status() != QtCore.QSettings.NoError:
@@ -548,7 +564,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
     """An offline question-by-question guide, with opt-in hosted proposals."""
 
     def __init__(self, instances, connections, root, mode, parent=None,
-                 peptide_bonds=(), peptide_order=None, lipid_rows=()):
+                 peptide_bonds=(), peptide_order=None, lipid_rows=(),
+                 free_points=None, point_count=None, petn=()):
         super().__init__(parent)
         self.setWindowTitle("MISO YAML assistant")
         self.resize(1100, 760)
@@ -560,9 +577,15 @@ class MISOAssistantDialog(QtWidgets.QDialog):
                               else default_peptide_order(self.instances))
         self.lipid_rows = [dict(row) for row in lipid_rows]
         self.has_lipids = bool(self.lipid_rows)
+        # Free image points only exist in Position coordinates; None turns PEtN off.
+        self.free_points = ([dict(row) for row in free_points]
+                            if free_points is not None else None)
+        self.point_count = point_count
+        self.petn = list(petn)
+        self.has_petn = self.free_points is not None
         self.context = molecular_context(self.instances, connections, root, mode,
                                          self.peptide_bonds, self.peptide_order,
-                                         self.lipid_rows)
+                                         self.lipid_rows, self.free_points, self.petn)
         self.result_choices = None
         self._online_choices = None
         self._history = []
@@ -736,7 +759,9 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             "bond toward the free tip. Attach it to a sugar carbon (the sugar lying next "
             "to the End point), or as a branch off another lipid chain (the End point lies "
             "on that chain). Choose the linkage too: ester, amide or ether. A carbon can "
-            "carry only one bond or lipid. Do not choose by distance alone.")
+            "carry only one bond or lipid. A branch must use amide (MISO builds no chain "
+            "for ester or ether branches) and bonds to carbon 2 of the lipid it sits on. "
+            "Do not choose by distance alone.")
         text.setWordWrap(True)
         form.addWidget(text)
         fields = QtWidgets.QFormLayout()
@@ -785,6 +810,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         on_sugar = self.lipid_anchor_choice.currentData() == "sugar"
         self.lipid_sugar_choice.setEnabled(on_sugar)
         self.lipid_carbon_choice.setEnabled(on_sugar)
+        if not on_sugar:
+            self.lipid_linkage_choice.setCurrentText("amide")   # MISO builds only amide branches
 
     def _load_lipid_choice(self, _index=None):
         """Show the chosen lipid's current attachment in the form."""
@@ -814,6 +841,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
     def _attachment_sites_without_lipids(self):
         used = {(link.donor, link.donor_carbon) for link in self.connections}
         used |= {(link.acceptor, link.acceptor_carbon) for link in self.connections}
+        used |= {(group.sugar, group.sugar_carbon) for group in self.petn}
         return used | {(bond.sugar, bond.sugar_carbon) for bond in self.peptide_bonds}
 
     def _attachment_sites(self, skip=None):
@@ -821,6 +849,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         used = {(link.donor, link.donor_carbon) for link in self.connections}
         used |= {(link.acceptor, link.acceptor_carbon) for link in self.connections}
         used |= {(bond.sugar, bond.sugar_carbon) for bond in self.peptide_bonds}
+        used |= {(group.sugar, group.sugar_carbon) for group in self.petn}
         return used | self._lipid_sites(skip)
 
     def _set_lipid_attachment(self):
@@ -966,7 +995,10 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             "For each bond, choose the donor (provides the anomeric carbon), "
             "the acceptor, both carbon positions, and alpha/beta. "
             "Only hydroxyl-bearing carbons recognized by MISO are listed. "
-            "Do not infer a bond just because two sugars are close together.")
+            "Do not infer a bond just because two sugars are close together.\n\n"
+            "Choose a phosphate bridge only when you know the two sugars are joined through "
+            "a phosphate. MISO then rotates the donor toward the acceptor, so the donor can "
+            "have no other sugar bond and the acceptor must be in the glycosidic chain.")
         text.setWordWrap(True)
         form.addWidget(text)
         fields = QtWidgets.QFormLayout()
@@ -981,6 +1013,11 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             row.addWidget(carbon)
             fields.addRow(label, row)
             unit.currentIndexChanged.connect(self._refresh_carbons)
+        self.bond_combo = QtWidgets.QComboBox()
+        self.bond_combo.addItem("Glycosidic bond", "glycosidic")
+        self.bond_combo.addItem("Phosphate bridge", "phosphate")
+        self.bond_combo.currentIndexChanged.connect(self._bond_choice_changed)
+        fields.addRow("Bond type:", self.bond_combo)
         self.anomer_combo = QtWidgets.QComboBox()
         self.anomer_combo.addItems(["Choose...", "alpha", "beta"])
         fields.addRow("Anomer:", self.anomer_combo)
@@ -993,8 +1030,9 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         buttons.addWidget(add)
         buttons.addWidget(remove)
         form.addLayout(buttons)
-        self.link_table = QtWidgets.QTableWidget(0, 5)
-        self.link_table.setHorizontalHeaderLabels(["Donor", "Carbon", "Acceptor", "Carbon", "Anomer"])
+        self.link_table = QtWidgets.QTableWidget(0, 6)
+        self.link_table.setHorizontalHeaderLabels(
+            ["Donor", "Carbon", "Acceptor", "Carbon", "Anomer", "Bond"])
         self.link_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.link_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.link_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
@@ -1004,12 +1042,14 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             self.pages.addWidget(self._build_peptide_page())
         if self.has_lipids:
             self.pages.addWidget(self._build_lipid_page())
+        if self.has_petn:
+            self.pages.addWidget(self._build_petn_page())
         self._show_connections()
 
         fourth = QtWidgets.QWidget()
         form = QtWidgets.QVBoxLayout(fourth)
         form.addWidget(QtWidgets.QLabel(
-            f"{4 + int(self.has_peptide) + int(self.has_lipids)}. Review every chemical choice before applying. 'Export CSV + MISO input YAML' "
+            f"{4 + int(self.has_peptide) + int(self.has_lipids) + int(self.has_petn)}. Review every chemical choice before applying. 'Export CSV + MISO input YAML' "
             "then writes the YAML; give it a final inspection before running MISO."))
         self.offline_review = QtWidgets.QPlainTextEdit()
         self.offline_review.setReadOnly(True)
@@ -1052,7 +1092,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         self.link_table.setRowCount(len(self.connections))
         for row, link in enumerate(self.connections):
             values = (self.instances[link.donor]["label"], link.donor_carbon,
-                      self.instances[link.acceptor]["label"], link.acceptor_carbon, link.anomer)
+                      self.instances[link.acceptor]["label"], link.acceptor_carbon,
+                      link.anomer if link.bond == "glycosidic" else "n/a", link.bond)
             for column, value in enumerate(values):
                 self.link_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
         self._refresh_offline_sketch()
@@ -1068,16 +1109,113 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         if donor is None or acceptor is None:
             self._error("Choose both named units first.")
             return
+        bond = self.bond_combo.currentData()
         link = SugarConnection(donor, self.donor_carbon.currentText(), acceptor,
-                               self.acceptor_carbon.currentText(), self.anomer_combo.currentText())
+                               self.acceptor_carbon.currentText(),
+                               "none" if bond == "phosphate" else self.anomer_combo.currentText(),
+                               bond)
         try:
             validate_connections(self.instances, self.connections + [link],
-                                 self.peptide_bonds, self._lipid_sites())
+                                 self.peptide_bonds,
+                                 self._lipid_sites() | {(g.sugar, g.sugar_carbon)
+                                                        for g in self.petn})
         except MISOExportError as exc:
             self._error(str(exc))
             return
         self.connections.append(link)
         self._show_connections()
+
+    def _bond_choice_changed(self, _index=None):
+        phosphate = self.bond_combo.currentData() == "phosphate"
+        self.anomer_combo.setEnabled(not phosphate)
+        if phosphate:
+            self.anomer_combo.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------ PEtN page
+    def _build_petn_page(self):
+        page = QtWidgets.QWidget()
+        form = QtWidgets.QVBoxLayout(page)
+        number = 4 + int(self.has_peptide) + int(self.has_lipids)
+        text = QtWidgets.QLabel(
+            f"{number}. Does a sugar carry a phosphoethanolamine (PEtN)?\n\n"
+            "Skip this page if not. A PEtN sits on a sugar carbon and MISO steers its terminal "
+            "N atom to a free point you picked on the image (a point that is not a sugar or "
+            "amino acid). Use the point you meant for the N atom; it is never guessed from "
+            "positions.")
+        text.setWordWrap(True)
+        form.addWidget(text)
+        fields = QtWidgets.QFormLayout()
+        self.petn_sugar = self._unit_combo(lambda inst: not is_amino_acid(inst))
+        self.petn_carbon = QtWidgets.QComboBox()
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.petn_sugar, 1)
+        row.addWidget(self.petn_carbon)
+        fields.addRow("Sugar and carbon:", row)
+        self.petn_point = QtWidgets.QComboBox()
+        self.petn_point.addItem("Choose point...", None)
+        for entry in self.free_points:
+            x, y = entry.get("xy_angstrom", (0.0, 0.0))
+            self.petn_point.addItem(f"Point {entry['point']}  ({x:.1f}, {y:.1f} A)", entry["point"])
+        fields.addRow("N atom at point:", self.petn_point)
+        form.addLayout(fields)
+        self.petn_sugar.currentIndexChanged.connect(self._refresh_petn_choice_carbons)
+        buttons = QtWidgets.QHBoxLayout()
+        add = QtWidgets.QPushButton("Add PEtN")
+        remove = QtWidgets.QPushButton("Remove selected PEtN")
+        add.clicked.connect(self._add_petn_group)
+        remove.clicked.connect(self._remove_petn_group)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        form.addLayout(buttons)
+        self.petn_list = QtWidgets.QTableWidget(0, 3)
+        self.petn_list.setHorizontalHeaderLabels(["Sugar", "Carbon", "N point"])
+        self.petn_list.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.petn_list.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.petn_list.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents)
+        form.addWidget(self.petn_list)
+        self._show_petn_groups()
+        return page
+
+    def _refresh_petn_choice_carbons(self, _index=None):
+        self.petn_carbon.clear()
+        index = self.petn_sugar.currentData()
+        if index is not None:
+            self.petn_carbon.addItems(linkage_carbons(self.instances[index]))
+
+    def _show_petn_groups(self):
+        self.petn_list.setRowCount(len(self.petn))
+        for row, group in enumerate(self.petn):
+            values = (self.instances[group.sugar]["label"], group.sugar_carbon, str(group.point))
+            for column, value in enumerate(values):
+                self.petn_list.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+
+    def _add_petn_group(self):
+        sugar, point = self.petn_sugar.currentData(), self.petn_point.currentData()
+        if sugar is None or point is None:
+            self._error("Choose a sugar, a carbon and the point for the N atom.")
+            return
+        group = PEtNGroup(sugar, self.petn_carbon.currentText(), point)
+        try:
+            validate_petn(self.instances, self.petn + [group],
+                          self._attachment_sites_without_lipids_or_petn() | self._lipid_sites(),
+                          self.point_count, self.connections)
+        except MISOExportError as exc:
+            self._error(str(exc))
+            return
+        self.petn.append(group)
+        self._show_petn_groups()
+
+    def _remove_petn_group(self):
+        row = self.petn_list.currentRow()
+        if row >= 0:
+            self.petn.pop(row)
+            self._show_petn_groups()
+
+    def _attachment_sites_without_lipids_or_petn(self):
+        used = {(link.donor, link.donor_carbon) for link in self.connections}
+        used |= {(link.acceptor, link.acceptor_carbon) for link in self.connections}
+        return used | {(bond.sugar, bond.sugar_carbon) for bond in self.peptide_bonds}
 
     def _remove_connection(self):
         row = self.link_table.currentRow()
@@ -1092,8 +1230,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         choices = AssistantChoices(
             root, mode, list(self.connections), list(self.peptide_bonds),
             list(self.peptide_order) if self.has_peptide else None,
-            self._lipid_attachments())
-        validate_choices(self.instances, choices, self.lipid_rows)
+            self._lipid_attachments(), list(self.petn))
+        validate_choices(self.instances, choices, self.lipid_rows, self.point_count)
         return choices
 
     def _summary(self, choices):
@@ -1106,7 +1244,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         for link in choices.connections:
             lines.append(f"{self.instances[link.donor]['label']} {link.donor_carbon} -> "
                          f"{self.instances[link.acceptor]['label']} {link.acceptor_carbon} "
-                         f"({link.anomer})")
+                         + ("(phosphate bridge)" if link.bond == "phosphate"
+                            else f"({link.anomer})"))
         if not choices.connections:
             lines.append("None (single sugar)." if not self.has_peptide else "None.")
         if self.has_peptide:
@@ -1123,6 +1262,11 @@ class MISOAssistantDialog(QtWidgets.QDialog):
                              f"{GLYCOSYLATION_TYPES.get(residue['name'], '?')})")
         if self.has_lipids:
             lines.extend(self._lipid_summary_lines(choices))
+        if choices.petn:
+            lines.append("\nPhosphoethanolamine (PEtN):")
+            for group in choices.petn:
+                lines.append(f"{self.instances[group.sugar]['label']} {group.sugar_carbon}, "
+                             f"N atom at point {group.point}")
         return "\n".join(lines)
 
     def _next(self):
@@ -1167,7 +1311,7 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         layout.addWidget(note)
         self.service = ServiceSettingsPanel(self)
         for name in ("settings_toggle", "settings_box", "provider_combo", "endpoint_edit",
-                     "model_edit", "key_edit", "auth_combo", "remember_key"):
+                     "model_edit", "key_edit", "auth_combo", "remember_key", "web_search_chk"):
             setattr(self, name, getattr(self.service, name))
         layout.addWidget(self.service)
         self.online_status = QtWidgets.QLabel("No molecular data is sent until you consent and press Send.")
@@ -1269,7 +1413,9 @@ class MISOAssistantDialog(QtWidgets.QDialog):
                 "available carbons, connection/root/mode settings, and this conversation.\n\n"
                 "No images, local file paths, SMILES, or repository code are included automatically. "
                 "Do not type confidential information or credentials into chat. "
-                "Provider retention policies and charges apply.",
+                + ("Web search is ON: the provider may send search queries based on this "
+                   "conversation to the web. " if config.web_search else "")
+                + "Provider retention policies and charges apply.",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
             if answer != QtWidgets.QMessageBox.Yes:
                 self.online_status.setText("Nothing sent. You can use the offline guide.")
@@ -1307,7 +1453,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
             self._error(error)
             return
         try:
-            message, choices = parse_reply(text, self.instances, self.lipid_rows)
+            message, choices = parse_reply(text, self.instances, self.lipid_rows,
+                                           self.point_count if self.has_petn else None)
         except AssistantError as exc:
             self.online_status.setText(str(exc))
             self.transcript.appendPlainText("Local validation: " + str(exc))
@@ -1341,7 +1488,8 @@ class MISOAssistantDialog(QtWidgets.QDialog):
         if self.has_peptide:
             choices = replace(choices, peptide_order=list(self.peptide_order))
         try:
-            validate_choices(self.instances, choices, self.lipid_rows)
+            validate_choices(self.instances, choices, self.lipid_rows,
+                             self.point_count if self.has_petn else None)
         except MISOExportError as exc:
             self._error(str(exc))
             return
