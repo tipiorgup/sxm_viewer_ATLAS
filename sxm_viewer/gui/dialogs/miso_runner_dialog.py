@@ -1,5 +1,5 @@
 from __future__ import annotations
-import re
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -11,24 +11,16 @@ class MISORunnerDialog(QtWidgets.QDialog):
     """Run the MISO pipeline (module_B.py) with a YAML config + CSV + NPZ."""
 
     _MISO_DIR = Path(__file__).resolve().parents[3] / "MISO"
-    # Options this GUI may pass, used when module_B.py cannot be read.
-    _LEGACY_FLAGS = frozenset({"--input_file", "--iterations", "--n_polymers",
-                               "--phase1_kicks", "--debug_checkpoints"})
+    @classmethod
+    def _engine_info(cls, use_help_fallback=False):
+        """What the installed MISO engine accepts (see utils/miso_engine.py)."""
+        from ...utils.miso_engine import inspect_engine
+        return inspect_engine(cls._MISO_DIR, use_help_fallback=use_help_fallback)
 
     @classmethod
     def _supported_flags(cls):
-        """Command line options module_B.py declares, so a newer or older MISO engine that
-        dropped or renamed an option is not sent an argument it rejects (exit code 2)."""
-        script = cls._MISO_DIR / "module_B.py"
-        try:
-            text = script.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return set(cls._LEGACY_FLAGS)
-        flags = set(re.findall(r"""add_argument\(\s*(?:["']-[\w-]+["']\s*,\s*)*["'](--[\w-]+)["']""",
-                               text))
-        flags |= set(re.findall(r"""["'](--[\w-]+)["']""",
-                                " ".join(re.findall(r"add_argument\([^)]*\)", text, re.S))))
-        return flags or set(cls._LEGACY_FLAGS)
+        """Command line options module_B.py declares."""
+        return set(cls._engine_info().options)
 
     def __init__(self, viewer, parent=None):
         super().__init__(parent or viewer)
@@ -324,6 +316,23 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self._append(f"[MISO] monomer_data_path:  {cfg.get('monomer_data_path')}")
         self._append("-" * 60)
 
+        from ...utils.miso_engine import EngineError, build_arguments, compatibility_notes
+        info = self._engine_info(use_help_fallback=True)
+        try:
+            engine_args, notes = build_arguments(
+                info, self._tmp_yaml.name, self.iter_spin.value(), self.poly_spin.value(),
+                phase1_kicks=True, debug_checkpoints=self.debug_chk.isChecked())
+        except EngineError as exc:
+            self._append(f"[MISO] {exc}")
+            QtWidgets.QMessageBox.warning(self, "MISO engine", str(exc))
+            self._cleanup_tmp()
+            return
+        notes += compatibility_notes(info, cfg)
+        for note in notes:
+            self._append(f"[MISO] Note: {note}")
+        supported = set(info.options)
+        args = ["-X", "utf8", str(self._MISO_DIR / "module_B.py"), *engine_args]
+
         self._process = QtCore.QProcess(self)
         self._process.setWorkingDirectory(str(results_dir))
         self._process.readyReadStandardOutput.connect(self._on_stdout)
@@ -334,27 +343,11 @@ class MISORunnerDialog(QtWidgets.QDialog):
         env.insert("PYTHONUTF8", "1")
         existing_pp = env.value("PYTHONPATH", "")
         miso_str = str(self._MISO_DIR)
-        env.insert("PYTHONPATH", f"{miso_str};{existing_pp}" if existing_pp else miso_str)
+        env.insert("PYTHONPATH", f"{miso_str}{os.pathsep}{existing_pp}" if existing_pp else miso_str)
         env.insert("DEFAULT_COMPRESSION_STEPS", str(self.comp_spin.value()))
         env.insert("DEFAULT_GRAVITY", str(self.gravity_spin.value()))
         self._process.setProcessEnvironment(env)
 
-        args = [
-            "-X", "utf8",
-            str(self._MISO_DIR / "module_B.py"),
-            "--input_file", self._tmp_yaml.name,
-            "--iterations", str(self.iter_spin.value()),
-            "--n_polymers", str(self.poly_spin.value()),
-        ]
-        supported = self._supported_flags()
-        for flag, wanted in (("--phase1_kicks", True),
-                             ("--debug_checkpoints", self.debug_chk.isChecked())):
-            if not wanted:
-                continue
-            if flag in supported:
-                args.append(flag)
-            else:
-                self._append(f"[MISO] This MISO version has no {flag} option; skipped.")
         self._last_cfg = dict(cfg)
         self._last_settings = {
             "iterations": self.iter_spin.value(),
