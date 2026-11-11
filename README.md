@@ -51,6 +51,37 @@ python -m sxm_viewer
 
 See the full installation guide in the MkDocs site for the Windows installer helper and troubleshooting notes.
 
+### Start with a click (desktop icon)
+
+After installing, you can start the program from an icon, with no terminal and no manual
+environment activation. Windows and Linux are supported, with a venv or a conda environment.
+
+* **Installer:** `scripts/install_sxm_viewer.bat` (or `python scripts/install.py`) offers to
+  create the icon at the end. Answer Y, or press Enter. To skip the question, add
+  `--no-launcher`.
+* **Any other environment (for example conda), or later:** activate the environment you
+  use, then run once:
+
+  ```powershell
+  python scripts\create_launcher.py
+  ```
+
+  Add `--dry-run` to see what would be created without writing anything. The environment
+  that runs the script is the one the icon starts, so run it again on each computer, and
+  again if you move the folder or recreate the environment.
+
+What you get:
+
+| System | Icon |
+|---|---|
+| Windows | "MISO GUI" shortcut on the Desktop, no console window (conda uses a hidden launcher that activates the environment first) |
+| Linux | "MISO GUI" entry in the application menu and a copy on the Desktop |
+
+The generated files go to a `launchers/` folder that git ignores, because they contain
+paths of your computer. If the icon opens nothing, start the program once from a terminal
+(`python -m sxm_viewer`, or `scripts\run_sxm_viewer.bat`) to read the error message.
+macOS is not supported by the icon script.
+
 
 ---
 ## MISO Tools
@@ -107,6 +138,14 @@ script or terminal required.
 
 > The runner uses only the YAML + CSV (uniform surface gravity). It does not require
 > the STM grid NPZ.
+
+**Updating the MISO engine.** Replace the contents of the `MISO/` folder with the new
+version and press **Run MISO**. Before each run the viewer reads `MISO/module_B.py`,
+sends only the command line options that version accepts, and writes lines starting with
+`[MISO] Note:` at the top of the log. These say which options were skipped, whether the
+compression steps or gravity values may be ignored, and whether a YAML section such as
+`Phosphate` or `PEtN` is no longer mentioned by the engine. If the viewer cannot drive the
+new version at all, it stops with a message before anything runs.
 
 ### Workflow
 

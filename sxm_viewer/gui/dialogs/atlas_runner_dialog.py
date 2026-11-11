@@ -223,7 +223,8 @@ class ATLASRunnerDialog(QtWidgets.QDialog):
             "--n_polymers", str(self.poly_spin.value()),
             "--phase1_kicks",
         ]
-        self._process.start(sys.executable, args)
+        from ...utils.miso_engine import console_python
+        self._process.start(console_python(), args)
 
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)

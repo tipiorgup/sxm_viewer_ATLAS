@@ -41,6 +41,11 @@ def parse_args():
         "--python",
         help="Path to the Python interpreter to use (overrides PYTHON env).",
     )
+    parser.add_argument(
+        "--no-launcher",
+        action="store_true",
+        help="Do not offer to create the click to start icon (Desktop and menu).",
+    )
     return parser.parse_args()
 
 
@@ -435,6 +440,38 @@ def install_requirements():
         raise RuntimeError("Installation failed")
 
 
+def maybe_create_launcher(py: Path, no_launcher: bool = False, interactive: bool | None = None,
+                          ask=input, run=subprocess.run) -> str:
+    """Offer the click to start icon; never lets a problem here fail the installation.
+
+    The icon is made by create_launcher.py with the new environment's own Python, so it
+    starts exactly this environment. Returns "created", "declined", "skipped" or "failed".
+    """
+    script = PROJECT_ROOT / "create_launcher.py"
+    if no_launcher or not script.is_file():
+        return "skipped"
+    if interactive is None:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    if interactive:
+        try:
+            answer = ask("\nCreate a click to start icon for the MISO GUI "
+                         "(Desktop and application menu)? [Y/n]: ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer in ("n", "no"):
+            print("[install] No icon created. Run create_launcher.py later to make one.")
+            return "declined"
+    try:
+        result = run([str(py), str(script)], check=False)
+    except Exception as exc:
+        print(f"[install] Could not create the icon: {exc}")
+        return "failed"
+    if getattr(result, "returncode", 1) != 0:
+        print("[install] The icon could not be created. Run create_launcher.py to see why.")
+        return "failed"
+    return "created"
+
+
 def main():
     args = parse_args()
     assert_supported_runtime()
@@ -500,6 +537,7 @@ def main():
     install_requirements()
     
     py = python_executable()
+    launcher_status = maybe_create_launcher(py, args.no_launcher) if py.exists() else "skipped"
     if py.exists():
         if os.name == "nt":
             activate = VENV_DIR / "Scripts" / "activate"
@@ -515,7 +553,10 @@ def main():
         print(f"    {activate_cmd}")
         print(f"\nThen run:")
         print(f"    python -m sxm_viewer")
-        print("\nOr use the run_sxm_viewer.bat shortcut")
+        if launcher_status == "created":
+            print("\nOr double click the MISO GUI icon that was just created.")
+        else:
+            print("\nOr use the run_sxm_viewer.bat shortcut")
         print("="*70 + "\n")
 
 

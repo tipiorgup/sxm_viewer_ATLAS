@@ -71,6 +71,17 @@ class EngineInfo:
                       if opt.required and name not in GUI_OPTIONS)
 
 
+def console_python() -> str:
+    """Interpreter for child processes. A shortcut that starts the GUI with pythonw.exe has
+    no console, and a pythonw child would swallow all output, so use python.exe beside it."""
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":
+        sibling = exe.with_name("python.exe")
+        if sibling.is_file():
+            return str(sibling)
+    return sys.executable
+
+
 # --------------------------------------------------------------------------- reading
 def _options_from_source(text: str) -> dict[str, EngineOption]:
     """Options declared by ``add_argument`` calls, read from the syntax tree."""
@@ -107,7 +118,7 @@ def _options_from_help(script: Path, miso_dir: Path, timeout: float) -> dict[str
     env["PYTHONPATH"] = os.pathsep.join(
         [str(miso_dir)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     try:
-        done = subprocess.run([sys.executable, "-X", "utf8", str(script), "--help"],
+        done = subprocess.run([console_python(), "-X", "utf8", str(script), "--help"],
                               cwd=str(miso_dir), env=env, capture_output=True, text=True,
                               timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError):

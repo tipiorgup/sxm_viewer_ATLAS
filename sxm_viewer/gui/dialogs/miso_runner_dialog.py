@@ -360,7 +360,8 @@ class MISORunnerDialog(QtWidgets.QDialog):
         }
         self._stopped_by_user = False
         self.why_btn.setEnabled(False)
-        self._process.start(sys.executable, args)
+        from ...utils.miso_engine import console_python
+        self._process.start(console_python(), args)
 
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
