@@ -210,6 +210,9 @@ class OptimizationConfig:
     image_interval: int = DEFAULT_IMAGE_INTERVAL
     output_name: str = "optimization"
 
+    # Debugging: save an SDF after phase 1 and after phase 2 as well as the final structure
+    save_debug_checkpoints: bool = False
+
 
 @dataclass
 class RingConstraintConfig:

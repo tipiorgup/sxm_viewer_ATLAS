@@ -122,6 +122,13 @@ def parse_arguments():
         help="Enable stochastic kicks during phase 1 minimization to escape torsional local minima"
     )
     parser.add_argument(
+        "--debug_checkpoints",
+        action="store_true",
+        default=False,
+        help="Save intermediate SDF structures (pre-opt, post-phase1, post-phase2 for atom "
+             "runs; pre-refine for sugar only rigid runs) next to the final structure"
+    )
+    parser.add_argument(
         "--faces",
         choices=["enumerate", "legacy"],
         default="enumerate",
@@ -495,6 +502,12 @@ def main():
                     if refine_mode == "rigid":
                         # No check_and_fix_geometry here: fix_overlapping_atoms moves
                         # atoms, and the rigid path must start from the templates.
+                        if args.debug_checkpoints:
+                            from src.rotation_optimization.md.utils import save_molecule
+                            save_molecule(final_with_h,
+                                          f"{name}_{conformers_selection}_pre_refine",
+                                          file_format='sdf')
+                            print(f"  Saved: {name}_{conformers_selection}_pre_refine.sdf")
                         with timer.section(f"{tag}   Rigid body REFINE", level=3):
                             from src.rotation_optimization.rigid_refine import (
                                 refine_structure, RigidRefineConfig)
@@ -527,13 +540,15 @@ def main():
                                 initial_ring_coms=initial_ring_coms,
                                 stm_npy_path=stm_npz_path,
                                 enable_phase1_kicks=args.phase1_kicks,
-                                torsion_constraints=torsion_constraints
+                                torsion_constraints=torsion_constraints,
+                                save_debug_checkpoints=args.debug_checkpoints
                             )
 
                     with timer.section(f"{tag}   Save results", level=3):
                         lpf.save_optimization_results(
                             final_with_h, optimized_mol, success,
-                            name, conformers_selection, residue_index
+                            name, conformers_selection, residue_index,
+                            save_debug_checkpoints=args.debug_checkpoints
                         )
 
             # Store results

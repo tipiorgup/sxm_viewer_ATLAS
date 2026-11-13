@@ -1076,8 +1076,9 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     )
     t_phase1 = time.perf_counter() - t0
 
-    # save_molecule(mol_copy, f"{config.output_name}_phase1_minimized", file_format='sdf')
-    # print(f"  💾 Saved: {config.output_name}_phase1_minimized.sdf")
+    if config.save_debug_checkpoints:
+        save_molecule(mol_copy, f"{config.output_name}_phase1_minimized", file_format='sdf')
+        print(f"  Saved: {config.output_name}_phase1_minimized.sdf")
 
     # PHASE 2: COMPRESSION
 
@@ -1095,8 +1096,9 @@ def optimize_with_slab_and_rings(mol, config=None, molecule_data_dict=None,
     t_phase2 = time.perf_counter() - t0
 
 
-    # save_molecule(mol_copy, f"{config.output_name}_phase2_compressed", file_format='sdf')
-    # print(f"  💾 Saved: {config.output_name}_phase2_compressed.sdf")
+    if config.save_debug_checkpoints:
+        save_molecule(mol_copy, f"{config.output_name}_phase2_compressed", file_format='sdf')
+        print(f"  Saved: {config.output_name}_phase2_compressed.sdf")
 
     # PHASE 3: FINAL MINIMIZATION WITH LINKER STILL FROZEN
 
