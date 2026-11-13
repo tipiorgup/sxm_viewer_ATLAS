@@ -10,6 +10,7 @@ from ..._shared import QtCore, QtWidgets, QtGui
 class MISORunnerDialog(QtWidgets.QDialog):
     """Run the MISO pipeline (module_B.py) with a YAML config + CSV + NPZ."""
 
+    DEFAULT_POLYMERS = 5
     _MISO_DIR = Path(__file__).resolve().parents[3] / "MISO"
     @classmethod
     def _engine_info(cls, use_help_fallback=False):
@@ -35,7 +36,6 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self._job_summary = []
         self._failure = None
         self._job_log_start = 0
-        self._default_polymers = 5
         self._stopped_by_user = False
         self._build_ui()
 
@@ -115,16 +115,6 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self.iter_spin.setValue(100)
         self.iter_spin.setFixedWidth(90)
         param_row.addWidget(self.iter_spin)
-        param_row.addSpacing(20)
-        param_row.addWidget(QtWidgets.QLabel("Polymers per YAML:"))
-        self.poly_spin = QtWidgets.QSpinBox()
-        self.poly_spin.setRange(1, 100)
-        self.poly_spin.setValue(5)
-        self.poly_spin.setFixedWidth(70)
-        self.poly_spin.setToolTip(
-            "Default for every queued YAML. Rows you changed by hand keep their own value.")
-        self.poly_spin.valueChanged.connect(self._on_default_polymers_changed)
-        param_row.addWidget(self.poly_spin)
         param_row.addSpacing(20)
         param_row.addWidget(QtWidgets.QLabel("Compression steps:"))
         self.comp_spin = QtWidgets.QSpinBox()
@@ -252,7 +242,7 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self.queue_table.setItem(row, 0, yaml_item)
         spin = QtWidgets.QSpinBox()
         spin.setRange(1, 100)
-        spin.setValue(self.poly_spin.value())
+        spin.setValue(self.DEFAULT_POLYMERS)
         self.queue_table.setCellWidget(row, 1, spin)
         if self.queue_table.rowCount() == 1:
             # The first YAML seeds the shared fields; later ones only fill gaps.
@@ -271,15 +261,6 @@ class MISORunnerDialog(QtWidgets.QDialog):
 
     def _clear_queue(self):
         self.queue_table.setRowCount(0)
-
-    def _on_default_polymers_changed(self, value):
-        """Move rows still at the previous default to the new one."""
-        previous = self._default_polymers
-        for row in range(self.queue_table.rowCount()):
-            spin = self.queue_table.cellWidget(row, 1)
-            if spin.value() == previous:
-                spin.setValue(value)
-        self._default_polymers = value
 
     def _prefill_from_viewer(self):
         """Queue the last exported YAML, or guess CSV/orientation/monomer files."""
