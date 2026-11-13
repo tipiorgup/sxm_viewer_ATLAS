@@ -55,6 +55,34 @@ def _linkage_carbon_sites(mol_data, carbon_name, coords, c_pos):
     return leaving, c_pos - 1.09 * s_ / np.linalg.norm(s_)
 
 
+def _stereo_frame(mol_data, carbon_name, coords, c_pos):
+    """
+    (carbon position, unit normal) describing the configuration of a ring
+    carbon that loses its hydroxyl: the normal of the plane through the
+    carbon's two other heavy neighbours, oriented toward the old hydroxyl O.
+    A new substituent X keeps the configuration when normal . (X - C) > 0;
+    the hydrogen added later takes the opposite side.  None when the carbon
+    is not a CH stereocentre with exactly two other heavy neighbours.
+    """
+    old_o = _leaving_oxygen_position(mol_data, carbon_name, coords, c_pos)
+    types = mol_data.get('atom_types')
+    if old_o is None or types is None or len(types) != len(coords):
+        return None
+    xyz = np.asarray(coords, dtype=float)
+    d = np.linalg.norm(xyz - c_pos, axis=1)
+    others = [i for i, t in enumerate(types) if t != 'H' and 0.5 < d[i] < 1.65
+              and np.linalg.norm(xyz[i] - old_o) > 0.1]
+    if len(others) != 2:
+        return None
+    n = np.cross(xyz[others[0]] - c_pos, xyz[others[1]] - c_pos)
+    if np.linalg.norm(n) < 1e-6:
+        return None
+    n /= np.linalg.norm(n)
+    if n @ (old_o - c_pos) < 0:
+        n = -n
+    return c_pos, n
+
+
 def _leaving_oxygen_position(mol_data, carbon_name, coords, c_pos):
     """Position of the hydroxyl oxygen on ``carbon_name`` that the bridge
     replaces, or None.  Quiet version of _resolve_oh_to_remove."""
@@ -243,9 +271,16 @@ def create_glycosidic_bond(mol1_data, carbon1_name, mol2_data, carbon2_name, ano
         angles = np.radians(np.arange(0.0, 360.0, 5.0))
         circle = base + height * (np.cos(angles)[:, None] * u + np.sin(angles)[:, None] * v)
 
+        frames = [f for f in (_stereo_frame(mol1_data, carbon1_name, coords1, c1_pos),
+                              _stereo_frame(mol2_data, carbon2_name, coords2, c2_pos)) if f is not None]
+
         def _cost(p_):
             c = max(np.linalg.norm(p_ - q) for q in leaving)
             c += 10.0 * sum(max(0.0, 1.6 - np.linalg.norm(p_ - h)) for h in h_sites)
+            # keep each ring carbon clearly on the side of its old hydroxyl
+            for c_at, n_hat in frames:
+                u = (p_ - c_at) / np.linalg.norm(p_ - c_at)
+                c += 10.0 * max(0.0, 0.5 - float(n_hat @ u)) ** 2
             return c
 
         cost = np.array([_cost(c) for c in circle])

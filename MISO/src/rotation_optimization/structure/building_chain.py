@@ -212,41 +212,54 @@ def face_state_label(face_state, mol_order):
     return ''.join('0' if face_state.get(m, 1) == 1 else '1' for m in mol_order)
 
 
-def generate_face_states(mol_order, n_states, seed=0, faceable=None):
+def generate_face_states(mol_order, n_states, seed=0, faceable=None, allowed=None):
     """
     Up to *n_states* distinct face states for the molecules in *mol_order*.
 
-    Molecules not in *faceable* (no ring, so no face) are fixed at +1 and do
-    not multiply the state count.
+    faceable : molecules that have a face (a ring).  Others are fixed at +1.
+    allowed  : {mol: [faces]} from face_screening.screen_faces.  Faces not
+               listed are never used, so only geometrically possible states
+               are produced.  None allows both faces everywhere.
 
-    If all 2^k states fit in n_states, all of them are returned in binary
-    order (00, 01, 10, 11 for a dimer).  Otherwise the all '0' state comes
-    first and the rest is a seeded random sample without repeats, so a run
-    is reproducible and states are never duplicated.
+    If every allowed state fits in n_states they are all returned, in
+    product order (00, 01, 10, 11 for a free dimer).  Otherwise the state
+    made of each molecule's first allowed face comes first, then a seeded
+    random sample of distinct allowed states.
 
     Returns
     -------
     list[dict]  each {mol_name: +1 or -1}
     """
-    faceable = [m for m in mol_order if faceable is None or m in faceable]
-    k = len(faceable)
-    total = 2 ** k
+    import itertools
+    choices = []
+    for m in mol_order:
+        if faceable is not None and m not in faceable:
+            choices.append([1])
+        elif allowed is not None and m in allowed and allowed[m]:
+            choices.append(list(allowed[m]))
+        else:
+            choices.append([1, -1])
+    sizes = [len(c) for c in choices]
+    total = 1
+    for k in sizes:
+        total *= k
 
-    def _state(bits):
-        st = {m: 1 for m in mol_order}
-        for i, m in enumerate(faceable):
-            st[m] = -1 if (bits >> (k - 1 - i)) & 1 else 1
-        return st
+    def _state(index):
+        st, rest = {}, index
+        for m, opts, k in zip(reversed(mol_order), reversed(choices), reversed(sizes)):
+            st[m] = opts[rest % k]
+            rest //= k
+        return {m: st[m] for m in mol_order}
 
     if n_states >= total:
-        return [_state(b) for b in range(total)]
+        return [dict(zip(mol_order, combo)) for combo in itertools.product(*choices)]
 
     rng = np.random.default_rng(seed)
-    picks = [0]
+    picks, seen = [0], {0}
     if total <= 1_000_000:
-        picks += [int(b) for b in rng.choice(np.arange(1, total), size=n_states - 1, replace=False)]
+        for b in rng.choice(np.arange(1, total), size=n_states - 1, replace=False):
+            picks.append(int(b))
     else:
-        seen = {0}
         while len(picks) < n_states:
             b = int(rng.integers(1, total))
             if b not in seen:

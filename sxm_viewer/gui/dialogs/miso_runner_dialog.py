@@ -29,9 +29,13 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self.setMinimumWidth(620)
         self._process = None
         self._tmp_yaml = None
-        self._last_cfg = None
-        self._last_settings = {}
-        self._last_exit_code = None
+        self._queue = []
+        self._current_job = None
+        self._job_total = 0
+        self._job_summary = []
+        self._failure = None
+        self._job_log_start = 0
+        self._default_polymers = 5
         self._stopped_by_user = False
         self._build_ui()
 
@@ -44,18 +48,40 @@ class MISORunnerDialog(QtWidgets.QDialog):
         root.setSpacing(8)
         root.setContentsMargins(12, 12, 12, 12)
 
+        # Queue of configurations: one row per YAML, each with its own positions
+        # CSV and its own number of polymers. Rows run one after the other.
+        self.queue_table = QtWidgets.QTableWidget(0, 2)
+        self.queue_table.setHorizontalHeaderLabels(["Config YAML", "Polymers"])
+        header = self.queue_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        self.queue_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.queue_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.queue_table.setMinimumHeight(110)
+        root.addWidget(self.queue_table)
+
+        queue_btns = QtWidgets.QHBoxLayout()
+        self.add_yaml_btn = QtWidgets.QPushButton("Add YAML(s)...")
+        self.add_yaml_btn.setToolTip("Select one or several YAML files. They run one after the other.")
+        self.add_yaml_btn.clicked.connect(self._browse_yamls)
+        self.remove_btn = QtWidgets.QPushButton("Remove")
+        self.remove_btn.clicked.connect(self._remove_selected)
+        self.clear_btn = QtWidgets.QPushButton("Clear")
+        self.clear_btn.clicked.connect(self._clear_queue)
+        for btn in (self.add_yaml_btn, self.remove_btn, self.clear_btn):
+            queue_btns.addWidget(btn)
+        queue_btns.addStretch()
+        root.addLayout(queue_btns)
+
+        # Coordinates are shared by every queued YAML.
         form = QtWidgets.QFormLayout()
         form.setLabelAlignment(QtCore.Qt.AlignRight)
-
-        self.yaml_le, yaml_row = self._file_row("Browse…", "YAML files (*.yml *.yaml);;All files (*)")
-        self.csv_le,  csv_row  = self._file_row("Browse…", "CSV files (*.csv);;All files (*)")
-
-        form.addRow("Config YAML:", yaml_row)
-        form.addRow("Positions CSV:", csv_row)
+        self.csv_le, csv_row = self._file_row("Browse...", "CSV files (*.csv);;All files (*)")
+        form.addRow("Positions CSV (all YAMLs):", csv_row)
         root.addLayout(form)
 
         self.fixed_ori_chk = QtWidgets.QCheckBox(
-            "Use fixed orientation (skip QUEST alignment for placed monomers)")
+            "Use fixed orientation (skip QUEST alignment for placed monomers), applies to all YAMLs")
         self.fixed_ori_chk.toggled.connect(self._on_fixed_ori_toggled)
         root.addWidget(self.fixed_ori_chk)
 
@@ -90,11 +116,14 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self.iter_spin.setFixedWidth(90)
         param_row.addWidget(self.iter_spin)
         param_row.addSpacing(20)
-        param_row.addWidget(QtWidgets.QLabel("Polymers:"))
+        param_row.addWidget(QtWidgets.QLabel("Polymers per YAML:"))
         self.poly_spin = QtWidgets.QSpinBox()
         self.poly_spin.setRange(1, 100)
         self.poly_spin.setValue(5)
         self.poly_spin.setFixedWidth(70)
+        self.poly_spin.setToolTip(
+            "Default for every queued YAML. Rows you changed by hand keep their own value.")
+        self.poly_spin.valueChanged.connect(self._on_default_polymers_changed)
         param_row.addWidget(self.poly_spin)
         param_row.addSpacing(20)
         param_row.addWidget(QtWidgets.QLabel("Compression steps:"))
@@ -161,16 +190,31 @@ class MISORunnerDialog(QtWidgets.QDialog):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open file", "", filt)
         if path:
             line_edit.setText(path)
-            if line_edit is self.yaml_le:
-                self._load_yaml_fields(path)
 
-    def _load_yaml_fields(self, path):
+    # ------------------------------------------------------------------
+    # YAML queue
+    # ------------------------------------------------------------------
+
+    def _browse_yamls(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Open YAML files", "", "YAML files (*.yml *.yaml);;All files (*)")
+        for path in paths:
+            self._add_yaml(path)
+
+    def _row_yaml(self, row):
+        return self.queue_table.item(row, 0).text()
+
+    def _row_polymers(self, row):
+        return self.queue_table.cellWidget(row, 1).value()
+
+    def _read_yaml_fields(self, path):
+        """(fixed flag, path values) from a YAML, or None after showing a warning."""
         try:
             import yaml
         except ImportError:
             QtWidgets.QMessageBox.critical(
                 self, "Missing dependency", "PyYAML is required to load MISO configuration.")
-            return False
+            return None
         try:
             with open(path, encoding="utf-8") as handle:
                 config = yaml.safe_load(handle)
@@ -187,20 +231,61 @@ class MISORunnerDialog(QtWidgets.QDialog):
                 values[key] = (str((Path(path).resolve().parent / value).resolve())
                                if value else "")
         except (OSError, ValueError, yaml.YAMLError) as exc:
-            QtWidgets.QMessageBox.warning(self, "YAML error", f"Could not load configuration:\n{exc}")
+            QtWidgets.QMessageBox.warning(
+                self, "YAML error", f"Could not load configuration:\n{path}\n{exc}")
+            return None
+        return fixed, values
+
+    def _add_yaml(self, path):
+        path = str(Path(path).resolve())
+        for row in range(self.queue_table.rowCount()):
+            if self._row_yaml(row) == path:
+                return False
+        fields = self._read_yaml_fields(path)
+        if fields is None:
             return False
-        self.csv_le.setText(values["circle_input_path"])
-        self.ori_le.setText(values["orientation_csv_path"])
-        self.monomer_le.setText(values["monomer_data_path"])
-        self.fixed_ori_chk.setChecked(fixed)
+        fixed, values = fields
+        row = self.queue_table.rowCount()
+        self.queue_table.insertRow(row)
+        yaml_item = QtWidgets.QTableWidgetItem(path)
+        yaml_item.setToolTip(path)
+        self.queue_table.setItem(row, 0, yaml_item)
+        spin = QtWidgets.QSpinBox()
+        spin.setRange(1, 100)
+        spin.setValue(self.poly_spin.value())
+        self.queue_table.setCellWidget(row, 1, spin)
+        if self.queue_table.rowCount() == 1:
+            # The first YAML seeds the shared fields; later ones only fill gaps.
+            self.fixed_ori_chk.setChecked(fixed)
+        for edit, key in ((self.csv_le, "circle_input_path"),
+                          (self.ori_le, "orientation_csv_path"),
+                          (self.monomer_le, "monomer_data_path")):
+            if not edit.text().strip() and values[key]:
+                edit.setText(values[key])
         return True
 
+    def _remove_selected(self):
+        rows = sorted({idx.row() for idx in self.queue_table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.queue_table.removeRow(row)
+
+    def _clear_queue(self):
+        self.queue_table.setRowCount(0)
+
+    def _on_default_polymers_changed(self, value):
+        """Move rows still at the previous default to the new one."""
+        previous = self._default_polymers
+        for row in range(self.queue_table.rowCount()):
+            spin = self.queue_table.cellWidget(row, 1)
+            if spin.value() == previous:
+                spin.setValue(value)
+        self._default_polymers = value
+
     def _prefill_from_viewer(self):
-        """Fill CSV/NPZ from the last export of PositionCoordinatesDialog."""
+        """Queue the last exported YAML, or guess CSV/orientation/monomer files."""
         last_yaml = getattr(self.viewer, "last_monomer_yaml", None)
         if last_yaml:
-            self.yaml_le.setText(last_yaml)
-            self._load_yaml_fields(last_yaml)
+            self._add_yaml(last_yaml)
             return
         try:
             canvas = getattr(self.viewer, "preview_canvas", None)
@@ -226,15 +311,15 @@ class MISORunnerDialog(QtWidgets.QDialog):
     # ------------------------------------------------------------------
 
     def _run(self):
-        yaml_path = self.yaml_le.text().strip()
-        csv_path  = self.csv_le.text().strip()
-
+        rows = self.queue_table.rowCount()
+        csv_path = self.csv_le.text().strip()
         missing = []
-        if not yaml_path:
-            missing.append("Config YAML not selected.")
-        elif not Path(yaml_path).is_file():
-            missing.append(f"Config YAML not found:\n  {yaml_path}")
-
+        if rows == 0:
+            missing.append("No config YAML selected.")
+        for row in range(rows):
+            yaml_path = self._row_yaml(row)
+            if not Path(yaml_path).is_file():
+                missing.append(f"Config YAML not found:\n  {yaml_path}")
         if not csv_path:
             missing.append("Positions CSV not selected.")
         elif not Path(csv_path).is_file():
@@ -243,7 +328,7 @@ class MISORunnerDialog(QtWidgets.QDialog):
         if missing:
             QtWidgets.QMessageBox.warning(
                 self, "Missing files",
-                "Cannot run MISO — please fix the following:\n\n" + "\n\n".join(missing)
+                "Cannot run MISO \u2014 please fix the following:\n\n" + "\n\n".join(missing)
             )
             return
 
@@ -256,27 +341,68 @@ class MISORunnerDialog(QtWidgets.QDialog):
             )
             return
 
-        try:
-            with open(yaml_path, "r") as f:
-                cfg = yaml.safe_load(f)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "YAML error", f"Could not read config file:\n{e}")
-            return
+        jobs = []
+        used_names = set()
+        for row in range(rows):
+            yaml_path = self._row_yaml(row)
+            try:
+                with open(yaml_path, "r") as f:
+                    cfg = yaml.safe_load(f)
+                if not isinstance(cfg, dict):
+                    raise ValueError("The YAML must contain a configuration mapping.")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(
+                    self, "YAML error", f"Could not read config file:\n{yaml_path}\n{e}")
+                return
+            self._prepare_config(cfg, yaml_path, csv_path)
 
+            results_dir = Path(csv_path).parent / "results"
+            if rows > 1:
+                # Output names come from the YAML's sxm_file, so two YAMLs of the
+                # same acquisition would overwrite each other in one folder.
+                name = Path(yaml_path).stem
+                unique, k = name, 2
+                while unique in used_names:
+                    unique, k = f"{name}_{k}", k + 1
+                used_names.add(unique)
+                results_dir = results_dir / unique
+            results_dir.mkdir(parents=True, exist_ok=True)
+            jobs.append({
+                "yaml": yaml_path, "csv": csv_path, "cfg": cfg,
+                "n_polymers": self._row_polymers(row), "results_dir": results_dir,
+            })
+
+        self.log.clear()
+        self._queue = jobs
+        self._job_total = len(jobs)
+        self._job_summary = []
+        self._failure = None
+        self._stopped_by_user = False
+        self.why_btn.setEnabled(False)
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self._start_next_job()
+
+    def _prepare_config(self, cfg, yaml_path, csv_path):
+        """Apply the dialog values to one loaded YAML mapping, in place."""
         cfg["circle_input_path"] = csv_path
         cfg.pop("stm_grid_path", None)
 
-        # Orientations CSV / fixed-orientation flag: when the checkbox is on,
-        # take these from the dialog fields (only overriding a field that's
-        # actually filled, so a yaml value isn't wiped by an empty one).
-        # When off, actively clear orientation_csv_path/use_fixed_orientation
+        # Orientations CSV / fixed-orientation flag. When the
+        # checkbox is on take these from the dialog fields (only overriding a
+        # field that's actually filled, so a yaml value isn't wiped by an empty
+        # one). When off, actively clear orientation_csv_path/use_fixed_orientation
         # instead of leaving a stale value from the yaml, module_B.py loads
         # orientation_csv_path whenever it's present regardless of the
         # use_fixed_orientation flag, so an unchecked box has to mean "not
         # used at all", not just "not overridden here". monomer_data_path is
         # independent (reuse exact placed geometry vs regenerate) and is
         # never touched by this checkbox either way.
-        if self.fixed_ori_chk.isChecked():
+        # These dialog values are shared by every queued YAML.
+        yaml_dir = Path(yaml_path).resolve().parent
+        use_fixed = self.fixed_ori_chk.isChecked()
+
+        if use_fixed:
             cfg["use_fixed_orientation"] = True
             ori_path = self.ori_le.text().strip()
             if ori_path:
@@ -284,21 +410,30 @@ class MISORunnerDialog(QtWidgets.QDialog):
             monomer_le_path = self.monomer_le.text().strip()
             if monomer_le_path:
                 cfg["monomer_data_path"] = monomer_le_path
+            ori_cfg = cfg.get("orientation_csv_path")
+            if ori_cfg and not Path(ori_cfg).is_absolute():
+                cfg["orientation_csv_path"] = str((yaml_dir / ori_cfg).resolve())
         else:
             cfg["use_fixed_orientation"] = False
             cfg.pop("orientation_csv_path", None)
 
         # A relative monomer_data_path in the yaml is written by the user
         # relative to the yaml's own folder, but module_B.py runs with its
-        # working directory set to results_dir below, so resolve it here
+        # working directory set to results_dir, so resolve it here
         # instead of letting it fail to open once the process starts.
         monomer_data_path = cfg.get("monomer_data_path")
         if monomer_data_path and not Path(monomer_data_path).is_absolute():
-            cfg["monomer_data_path"] = str((Path(yaml_path).resolve().parent / monomer_data_path).resolve())
+            cfg["monomer_data_path"] = str((yaml_dir / monomer_data_path).resolve())
 
-        results_dir = Path(csv_path).parent / "results"
-        results_dir.mkdir(exist_ok=True)
+    def _start_next_job(self):
+        import yaml
+
+        job = self._queue.pop(0)
+        self._current_job = job
+        cfg = job["cfg"]
+        results_dir = job["results_dir"]
         self._results_dir = results_dir
+        index = self._job_total - len(self._queue)
 
         self._tmp_yaml = tempfile.NamedTemporaryFile(
             mode="w", suffix=".yml", delete=False, dir=str(results_dir)
@@ -307,9 +442,15 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self._tmp_yaml.flush()
         self._tmp_yaml.close()
 
-        self.log.clear()
+        if index > 1:
+            self._append("")
+        self._job_log_start = len(self.log.toPlainText())
+        if self._job_total > 1:
+            self._append("=" * 60)
+            self._append(f"[MISO] Job {index}/{self._job_total}: {Path(job['yaml']).name}")
         self._append(f"[MISO] Results dir:        {results_dir}")
-        self._append(f"[MISO] Config:             {yaml_path}")
+        self._append(f"[MISO] Config:             {job['yaml']}")
+        self._append(f"[MISO] Polymers:           {job['n_polymers']}")
         self._append(f"[MISO] circle_input_path:  {cfg.get('circle_input_path')}")
         self._append(f"[MISO] orientation_csv_path: {cfg.get('orientation_csv_path')}")
         self._append(f"[MISO] use_fixed_orientation: {cfg.get('use_fixed_orientation', False)}")
@@ -320,12 +461,15 @@ class MISORunnerDialog(QtWidgets.QDialog):
         info = self._engine_info(use_help_fallback=True)
         try:
             engine_args, notes = build_arguments(
-                info, self._tmp_yaml.name, self.iter_spin.value(), self.poly_spin.value(),
+                info, self._tmp_yaml.name, self.iter_spin.value(), job["n_polymers"],
                 phase1_kicks=True, debug_checkpoints=self.debug_chk.isChecked())
         except EngineError as exc:
+            # The engine itself is unusable, so no later job could work either.
             self._append(f"[MISO] {exc}")
             QtWidgets.QMessageBox.warning(self, "MISO engine", str(exc))
             self._cleanup_tmp()
+            self._queue = []
+            self._finish_queue()
             return
         notes += compatibility_notes(info, cfg)
         for note in notes:
@@ -348,27 +492,22 @@ class MISORunnerDialog(QtWidgets.QDialog):
         env.insert("DEFAULT_GRAVITY", str(self.gravity_spin.value()))
         self._process.setProcessEnvironment(env)
 
-        self._last_cfg = dict(cfg)
-        self._last_settings = {
+        job["settings"] = {
             "iterations": self.iter_spin.value(),
-            "n_polymers": self.poly_spin.value(),
+            "n_polymers": job["n_polymers"],
             "compression_steps": self.comp_spin.value(),
             "gravity": self.gravity_spin.value(),
             "use_fixed_orientation": bool(cfg.get("use_fixed_orientation")),
             "debug_checkpoints": ("--debug_checkpoints" in supported
                                   and self.debug_chk.isChecked()),
         }
-        self._stopped_by_user = False
-        self.why_btn.setEnabled(False)
         from ...utils.miso_engine import console_python
         self._process.start(console_python(), args)
-
-        self.run_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
 
     def _stop(self):
         if self._process and self._process.state() != QtCore.QProcess.NotRunning:
             self._stopped_by_user = True
+            self._queue = []
             self._process.kill()
             self._append("[MISO] Stopped by user.")
 
@@ -381,25 +520,52 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self._append(data.rstrip())
 
     def _on_finished(self, exit_code, exit_status):
+        job = self._current_job
         self._append("-" * 60)
         self._append(f"[MISO] Finished (exit code {exit_code})")
-        self.run_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
         self._cleanup_tmp()
-        self._last_exit_code = exit_code
         failed = exit_code != 0 or exit_status == QtCore.QProcess.CrashExit
-        self.why_btn.setEnabled(failed and not self._stopped_by_user)
+        status = "stopped" if self._stopped_by_user else ("FAILED" if failed else "ok")
+        self._job_summary.append((Path(job["yaml"]).name, job["n_polymers"], status))
         if failed and not self._stopped_by_user:
+            if self._failure is None:
+                # The troubleshooter explains the first failure of the batch,
+                # using only the log lines of that job.
+                self._failure = {
+                    "log": self.log.toPlainText()[self._job_log_start:],
+                    "cfg": dict(job["cfg"]),
+                    "settings": job.get("settings", {}),
+                    "exit_code": exit_code or 1,
+                }
             self._append("[MISO] Click 'Why did MISO fail?' for checks and an explanation.")
         if exit_code == 0:
             self._convert_sdf_outputs()
+
+        if self._queue and not self._stopped_by_user:
+            self._start_next_job()
+            return
+        self._finish_queue()
+
+    def _finish_queue(self):
+        if self._job_total > 1 and self._job_summary:
+            self._append("=" * 60)
+            self._append("[MISO] Batch summary:")
+            for name, n_poly, status in self._job_summary:
+                self._append(f"[MISO]   {name}  ({n_poly} polymers)  {status}")
+        self._current_job = None
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.why_btn.setEnabled(self._failure is not None and not self._stopped_by_user)
 
     def _explain_failure(self):
         from ...utils.miso_troubleshoot import build_failure_report
         from .miso_troubleshoot_dialog import MISOTroubleshootDialog
 
-        report = build_failure_report(self.log.toPlainText(), self._last_cfg or {},
-                                      self._last_settings, self._last_exit_code or 1)
+        failure = self._failure
+        if not failure:
+            return
+        report = build_failure_report(failure["log"], failure["cfg"],
+                                      failure["settings"], failure["exit_code"])
         MISOTroubleshootDialog(report, self).exec_()
 
     def _convert_sdf_outputs(self):

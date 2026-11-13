@@ -114,6 +114,56 @@ python module_B.py \
 | `--input_file` / `-i` | required | Path to the YAML configuration file |
 | `--iterations` / `-n` | 100 | Rotation search samples per monomer during alignment |
 | `--n_polymers` / `-p` | 5 | Number of independent polymer structures to generate |
+| `--faces` | `enumerate` | `enumerate`: every polymer is built in a different face state (see below). `legacy`: previous behaviour |
+| `--seed` | 0 | Seed for face state sampling and fallback rotations; same seed, same polymers |
+| `--duplicate_rmsd` | 0.25 | Assembled polymers closer than this (A) to an earlier one are reported as near duplicates |
+| `--no_screen` | off | Skip the per sugar face pre screen and try every face state |
+| `--no_joint_rotation` | off | Skip the joint rotation of all sugars after assembly |
+| `--max_gap` | 3.0 | Reject a face state if a linkage C...C stays above this after the joint rotation (A) |
+| `--pool_factor` | 4 | Face states held in reserve per requested polymer, to replace rejected ones |
+
+### Structural diversity: face states
+
+A sugar ring deposited on a surface can lie with either face up.  A face
+state assigns one face to every ring: `0` = oriented ring normal (O5, C1 to C5
+order) pointing up, `1` = pointing down, one character per monomer in
+positioning order (root first).  A glucose dimer has four states: 00, 01,
+10, 11.
+
+With `--faces enumerate` polymer *i* is built in state *i*: every monomer,
+the root included, is rotated about its fixed experimental COM so that it
+presents its face, with its linkage carbons aimed at their partners.  If
+`--n_polymers` is at least 2^k (k rings) all states are built, in binary
+order, and the run is capped at 2^k polymers; otherwise the all `0` state
+plus a seeded random sample of distinct states.  The chosen states are
+written to `<prefix>_face_states.csv`, and the log reports the requested and
+assembled state of each polymer.
+
+States that differ by turning the whole molecule over (00 and 11 for a
+dimer) share the same internal conformation but present opposite faces to
+the surface, so they are distinct adsorption structures.
+
+#### Branched glycans: valid states only
+
+In a branched glycan most face states cannot be built: a sugar with several
+linkages must point C1 at its parent and C3/C4/C6 at its children with one
+rigid orientation, and the order of those carbons around the ring, seen from
+above, reverses with the face.  Three steps deal with this:
+
+1. **Face pre screen** (`face_screening.screen_faces`, milliseconds): for
+   every sugar and face, is there an orientation where all its linkage
+   carbons are within reach of their partners?  Faces that fail are never
+   used.  The log lists sugars whose face is fixed by the layout.  On a
+   15 glucose test tree it fixed 4 faces, leaving 2048 of 32768 states.
+2. **Joint rotation** (`joint_rotation.joint_rigid_rotation`): after the
+   sequential assembly, all sugars rotate together about their fixed COMs
+   (rings rigid) to close every linkage, keep the requested faces, bring the
+   two replaced hydroxyl oxygens together and avoid clashes.  About 0.1 to
+   1.5 s for 15 sugars.
+3. **Rejection**: a state whose linkages stay open (`--max_gap`) or whose
+   faces cannot be kept is skipped and the next state from the pool is
+   tried.  `<prefix>_face_states.csv` lists every state tried, accepted or
+   rejected, with the worst linkage distance and the reason.
 
 ### Running on a cluster (LoadLeveler)
 

@@ -290,27 +290,48 @@ def extract_initial_ring_coms_from_monomers(molecule_data_dict, final_no_h, pyra
 # CHAIN BUILDING
 # ============================================================================
 
-def plan_face_states(molecule_data_dict, config, n_polymers, seed=0):
+def _glycosidic_linkages(config):
+    """Normalised glycosidic linkages (falls back to 'direction')."""
+    links = config.get('glycosidic_bonds') or config['direction']
+    return building_chain.normalize_linkage_definitions([tuple(l) for l in links])
+
+
+def plan_face_states(molecule_data_dict, config, n_polymers, seed=0, pool_factor=4,
+                     screen=True):
     """
-    Decide which face state each polymer is built in.
+    Decide which face states to try, in order.
+
+    1. Every sugar is screened (face_screening.screen_faces): faces that
+       cannot reach all of the sugar's linkage partners at once are removed.
+    2. States are drawn only from the remaining faces: all of them if they
+       fit in the pool, otherwise the first allowed state plus a seeded
+       random sample.  The pool holds up to pool_factor * n_polymers states
+       so that states rejected later by the joint rotation can be replaced.
 
     Returns
     -------
-    (mol_order, states)
-        mol_order : monomers in positioning order (root first); this is also
-                    the character order of the face labels ('0' = +1 face up).
-        states    : list of {mol_name: +1 or -1}, at most n_polymers long and
-                    never longer than the number of distinct states, 2^k for
-                    k monomers with a ring.
+    (mol_order, states, screening)
+        mol_order : monomers in positioning order (root first); the
+                    character order of the face labels ('0' = +1 face up).
+        states    : list of {mol_name: +1 or -1}, the pool, in try order.
+        screening : screen_faces output (None when screen=False).
     """
     from src.rotation_optimization.rotation.rotation_optimization import ring_atom_order
+    from src.rotation_optimization.rotation.face_screening import screen_faces
     rotation_definitions = [tuple(link) for link in config['direction']]
     mol_order = building_chain.chain_molecule_order(
         rotation_definitions, config['root_mol'], molecule_data_dict)
     faceable = [m for m in mol_order
                 if m in molecule_data_dict and ring_atom_order(molecule_data_dict[m]) is not None]
-    states = building_chain.generate_face_states(mol_order, n_polymers, seed=seed, faceable=faceable)
-    return mol_order, states
+    screening = None
+    allowed = None
+    if screen:
+        screening = screen_faces(molecule_data_dict, _glycosidic_linkages(config), seed=seed)
+        allowed = {m: screening[m]['valid'] for m in mol_order if m in screening}
+    n_pool = max(n_polymers, pool_factor * n_polymers)
+    states = building_chain.generate_face_states(
+        mol_order, n_pool, seed=seed, faceable=faceable, allowed=allowed)
+    return mol_order, states, screening
 
 
 def chain_coordinates(chain_dict, mol_order):
@@ -319,7 +340,8 @@ def chain_coordinates(chain_dict, mol_order):
                       for m in mol_order if m in chain_dict])
 
 
-def build_glycan_chain(molecule_data_dict, config, iterations, face_state=None, seed=None):
+def build_glycan_chain(molecule_data_dict, config, iterations, face_state=None, seed=None,
+                       joint_rotation=True, max_gap=3.0, return_report=False):
     """
     Align molecules and create glycosidic bonds.
 
@@ -328,6 +350,14 @@ def build_glycan_chain(molecule_data_dict, config, iterations, face_state=None, 
         (see plan_face_states).  None keeps the previous behaviour.
     seed : int or None
         Seed for the fallback rotation sampling.
+    joint_rotation : bool
+        With a face_state, rotate all sugars together about their fixed
+        COMs to close every linkage (joint_rotation.joint_rigid_rotation)
+        before the bonds are created.
+    max_gap : float
+        Linkage C...C above which the joint step rejects the state.
+    return_report : bool
+        Also return the joint rotation report (None when it did not run).
     
     Returns:
         tuple: (chain_dict, bonds_glyco, sorted_linkages)
@@ -366,6 +396,12 @@ def build_glycan_chain(molecule_data_dict, config, iterations, face_state=None, 
         seed=seed
     )
     
+    report = None
+    if face_state is not None and joint_rotation:
+        from src.rotation_optimization.rotation.joint_rotation import joint_rigid_rotation
+        chain_dict, report = joint_rigid_rotation(
+            chain_dict, _glycosidic_linkages(config), face_state, max_gap=max_gap)
+
     print("\nCreating glycosidic bonds...")
     bonds_glyco = building_chain.create_glycosidic_bonds_in_chain(
         chain_dict, linkage_definitions
@@ -374,6 +410,8 @@ def build_glycan_chain(molecule_data_dict, config, iterations, face_state=None, 
     print(f"\n✓ Built chain with {len(chain_dict)} molecules")
     print(f"✓ Created {len(bonds_glyco)} glycosidic bonds")
     
+    if return_report:
+        return chain_dict, bonds_glyco, sorted_linkages, report
     return chain_dict, bonds_glyco, sorted_linkages
 
 def build_glycan_chain_TOP_N(molecule_data_dict, config, iterations, n_polymers=5, n_quest_variants=6):
