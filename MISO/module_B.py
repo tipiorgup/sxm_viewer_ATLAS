@@ -162,7 +162,7 @@ def parse_arguments():
     parser.add_argument(
         "--max_gap",
         type=float,
-        default=3.0,
+        default=7.0,
         help="Reject a face state if any linkage C...C stays above this after the joint "
              "rotation (Angstrom, default: 3.0)"
     )
