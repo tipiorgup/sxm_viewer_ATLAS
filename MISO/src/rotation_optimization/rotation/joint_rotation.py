@@ -66,10 +66,11 @@ def _leaving_oxygen_index(mol_data, carbon_name):
 
 
 def joint_rigid_rotation(chain_dict, linkages, face_state=None,
-                         d0=IDEAL_BRIDGE_CC, k_link=10.0, k_bridge=0.5, k_face=20.0, k_clash=1.0,
+                         d0=IDEAL_BRIDGE_CC, k_link=10.0, link_width=1.0, k_bridge=0.5,
+                         k_face=200.0, k_clash=1.0,
                          face_margin=0.3, clash_limit=2.9, bonded_clash_limit=2.5,
                          max_iter=4000, tol=1e-7, max_step=0.1,
-                         max_gap=3.0, min_gap=2.1, verbose=True):
+                         max_gap=6.0, min_gap=2.1, verbose=True):
     """
     Rotate every sugar in chain_dict about its COM to close the linkages.
 
@@ -80,9 +81,21 @@ def joint_rigid_rotation(chain_dict, linkages, face_state=None,
                  Molecule to molecule linkages are closed; coordinate linkages
                  are only prevented from opening further than they are now.
     face_state : {name: +1 or -1} or None.  None disables the face term.
+    link_width : the linkage term is quadratic within link_width of d0 and
+                 linear beyond (Huber), so a linkage the layout cannot close
+                 pulls with a bounded force (2 k_link link_width) instead of
+                 one that grows with the gap.  Otherwise one impossible
+                 linkage flips faces and drags every other linkage open.
+    k_face     : the face is the hypothesis under test, so it is held
+                 stiffly; with the Huber linkage term the face always wins
+                 against an unclosable linkage.
     max_gap    : linkage C...C above which the result is rejected (A).  2.86
-                 is the strict limit for a 1.43 A bridge; REFINE closes a
-                 little more.
+                 is the strict limit for a 1.43 A bridge.  Between 2.86 and
+                 max_gap the state is accepted and the linkage is listed in
+                 report['open']: it is built with a long bond and REFINE
+                 shares the error between the bond and the xy positions.
+                 Above max_gap the layout is wrong (a circle assigned to the
+                 wrong sugar, or sugars that do not bond), hence rejected.
     min_gap    : linkage C...C below which the result is rejected (A); the
                  bridge angle would be far too acute.
 
