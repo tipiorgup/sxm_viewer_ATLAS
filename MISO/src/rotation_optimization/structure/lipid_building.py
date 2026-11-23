@@ -408,16 +408,233 @@ def refine_chain_with_fabrik(chain_carbons, target_pos, anchor_pos, C_C_BOND=1.5
 
     return refined_carbons
 
+
+# ============================================================================
+# Chain on the drawn path (MISO builder)
+# ============================================================================
+
+ZIGZAG_ANGLE_DEG = 112.0          # natural C-C-C angle of an all trans chain
+ANGLE_MIN, ANGLE_MAX = 100.0, 124.0   # zig zag angles a defined count may use
+
+
+def _flat(v):
+    v = np.array(v, dtype=float)
+    v[2] = 0.0
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+
+
+def _zigzag_step(d, n, C_C_BOND):
+    """Advance per carbon of an ideal zig zag (bonds C_C_BOND, equal angles)
+    whose n-th carbon is at distance d from the start atom; None if impossible.
+    Even n end on the zig zag axis (d = n a); odd n end one zig off it
+    (d^2 = (n a)^2 + h^2 with h^2 = b^2 - a^2)."""
+    b = C_C_BOND
+    if n % 2 == 0:
+        a = d / n
+    else:
+        if d <= b:
+            return None
+        a = np.sqrt((d * d - b * b) / (n * n - 1)) if n > 1 else None
+    return a if a is not None and 0 < a < b else None
+
+
+def _zigzag_angle(a, C_C_BOND):
+    return float(np.degrees(2 * np.arcsin(a / C_C_BOND)))
+
+
+def _segment_count(d, wanted, C_C_BOND):
+    """Carbons on one segment.  Auto (wanted None): the count whose zig zag
+    angle is closest to ZIGZAG_ANGLE_DEG.  Defined: the count closest to
+    *wanted* whose angle lies in [ANGLE_MIN, ANGLE_MAX] (carbons are added or
+    removed); auto when none does."""
+    a_nat = C_C_BOND * np.sin(np.radians(ZIGZAG_ANGLE_DEG / 2))
+    centre = max(2, int(round(d / a_nat)))
+    cand = []
+    for n in range(max(2, centre - 3), centre + 4):
+        a = _zigzag_step(d, n, C_C_BOND)
+        if a is not None:
+            cand.append((n, _zigzag_angle(a, C_C_BOND)))
+    if not cand:
+        return centre
+    auto = min(cand, key=lambda t: abs(t[1] - ZIGZAG_ANGLE_DEG))[0]
+    if wanted is None:
+        return auto
+    ok = [n for n, ang in cand if ANGLE_MIN <= ang <= ANGLE_MAX]
+    if not ok:
+        return auto
+    return min(ok, key=lambda n: (abs(n - wanted), abs(dict(cand)[n] - ZIGZAG_ANGLE_DEG)))
+
+
+def build_chain_on_path(start_pos, points, n_requested=None, C_C_BOND=1.54, z_surface=None):
+    """
+    Carbon chain lying flat along the drawn path.
+
+    start_pos : the atom the chain grows from (carbonyl C, ether O or branch C).
+    points    : [tip] or [midpoint, tip]; only x and y are used.
+    n_requested : carbons asked for (None: auto).
+    z_surface : height the chain lies at (None: the height of start_pos).
+
+    The path is a straight segment from start_pos to each point in turn.  The
+    points sit at z_surface, so the first segment descends from the linkage
+    to the surface and the rest lies flat.  On each segment the
+    carbons form a natural zig zag in the surface plane: bonds C_C_BOND, angle
+    close to ZIGZAG_ANGLE_DEG.  The advance per carbon is the segment length
+    divided by its carbon count, and a small tilt of the zig zag across the
+    segment puts the last carbon exactly on the point.
+
+    Returns the backbone dict used by the exporter (chain_carbons, n_carbons)
+    plus n_requested, mid_carbon_index, end_carbon_index, mid_target and
+    end_target (the index and point of the carbons REFINE pins).
+    """
+    start_pos = np.asarray(start_pos, dtype=float)
+    z0 = float(start_pos[2]) if z_surface is None else float(z_surface)
+    pts = [np.array([p[0], p[1], z0], dtype=float) for p in points]
+    lengths, prev = [], start_pos
+    for p in pts:
+        lengths.append(float(np.linalg.norm(p - prev)))
+        prev = p
+    total = sum(lengths)
+    wanted = ([max(2, int(round(n_requested * d / total))) for d in lengths]
+              if n_requested else [None] * len(lengths))
+    counts = [_segment_count(d, w, C_C_BOND) for d, w in zip(lengths, wanted)]
+
+    zhat = np.array([0.0, 0.0, 1.0])
+
+    def _segment(prev, p, d, n, side):
+        """Ideal zig zag from prev to p (n carbons), on the given side of the
+        line, turned in its plane so its last carbon lies on p.  The plane holds
+        the segment and the horizontal normal to it, so a descending segment
+        keeps the zig zag across the surface."""
+        u = (p - prev) / np.linalg.norm(p - prev)
+        w = np.cross(zhat, _flat(p - prev)) * side
+        a = _zigzag_step(d, n, C_C_BOND) or (d / n)
+        h = np.sqrt(max(C_C_BOND ** 2 - a ** 2, 0.0))
+        local = [(k * a, h * (k % 2)) for k in range(1, n + 1)]
+        ex, ey = local[-1]
+        t = -np.arctan2(ey, ex)
+        ct, st_ = np.cos(t), np.sin(t)
+        out = []
+        for x, y in local:
+            xr, yr = ct * x - st_ * y, st_ * x + ct * y
+            out.append(prev + u * xr + w * yr)
+        out[-1] = p.copy()
+        return out
+
+    def _angle(a_, m_, b_):
+        v1, v2 = a_ - m_, b_ - m_
+        return float(np.degrees(np.arccos(np.clip(
+            v1 @ v2 / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1, 1))))
+
+    chain, ends, prev = [], [], start_pos
+    for k_seg, (p, d, n) in enumerate(zip(pts, lengths, counts)):
+        if k_seg == 0:
+            seg = _segment(prev, p, d, n, +1)
+        else:
+            # zig zag side of the next segment: the one whose first bond makes
+            # the angle at the bend carbon closest to the natural angle
+            before = chain[-2] if len(chain) >= 2 else start_pos
+            options = [_segment(prev, p, d, n, sd) for sd in (+1, -1)]
+            seg = min(options, key=lambda o: abs(_angle(before, prev, o[0]) - ZIGZAG_ANGLE_DEG))
+        chain.extend(seg)
+        ends.append(len(chain) - 1)
+        prev = p
+
+    if len(pts) == 2:
+        # interior angle of the drawn path at the midpoint (180 = straight)
+        interior = _angle(start_pos, pts[0], pts[1])
+        if interior < 70.0:
+            print(f"  ! lipid: the drawn path folds back at the midpoint (interior angle "
+                  f"{interior:.0f} deg); a chain cannot turn that sharply, so the carbons "
+                  f"around the midpoint will be strained")
+
+    used = sum(counts)
+    note = ''
+    if n_requested and used != int(n_requested):
+        note = (f" ({'added' if used > n_requested else 'removed'} "
+                f"{abs(used - int(n_requested))} to fit the path)")
+    print(f"  Lipid chain: requested {n_requested if n_requested else 'auto'}, used {used}"
+          f"{note}; path " + " + ".join(f"{d:.2f}" for d in lengths) + " A, carbons "
+          + "/".join(str(n) for n in counts))
+
+    data = {
+        "chain_carbons": [c.tolist() for c in chain],
+        "n_carbons": used,
+        "n_requested": int(n_requested) if n_requested else None,
+        "distance_from_target": 0.0,
+        "mid_carbon_index": ends[0] if len(pts) == 2 else None,
+        "end_carbon_index": ends[-1],
+        "mid_target": pts[0].tolist() if len(pts) == 2 else None,
+        "end_target": pts[-1].tolist(),
+    }
+    for i, c_pos in enumerate(chain):
+        data[f"c{i+1}_position"] = c_pos.tolist()
+    return data
+
+
+def replaced_atom_position(mol_data, carbon_name, prefer):
+    """Position of the sugar's own exocyclic N or O on *carbon_name* (the group
+    the lipid linkage replaces), in the sugar's current orientation.  *prefer*
+    is 'N' or 'O'; the other element is the fallback.  None if neither."""
+    cmap = mol_data['carbon_map']
+    coords = np.asarray(mol_data['absolute_coordinates'], dtype=float)
+    types = mol_data.get('atom_types') or []
+    c = coords[cmap[carbon_name]]
+    ring_o = cmap.get('ring_oxygen')
+    best = {}
+    for i, t in enumerate(types):
+        if t not in ('N', 'O') or i == ring_o:
+            continue
+        d = float(np.linalg.norm(coords[i] - c))
+        if 1.2 < d < 1.65 and (t not in best or d < best[t][0]):
+            best[t] = (d, coords[i])
+    for t in (prefer, 'O' if prefer == 'N' else 'N'):
+        if t in best:
+            return best[t][1].copy()
+    return None
+
+
+def build_headgroup_at_sugar(carbon_pos, link_pos, first_point, linkage_type,
+                             C_N_BOND=1.47, C_O_BOND=1.43, AMIDE_CN=1.33, ESTER_CO=1.34,
+                             C_O_DOUBLE=1.23):
+    """Linkage atoms of a sugar attached lipid, lying flat.
+
+    The linkage atom (amide N, ester or ether O) sits where the sugar's own N or
+    O was (link_pos), so the bond to the sugar and the stereo at that carbon are
+    the template's.  The carbonyl carbon follows towards the first path point,
+    level with the linkage atom, and its O lies in the surface plane.
+    Returns (headgroup_data, position the chain grows from)."""
+    carbon_pos = np.asarray(carbon_pos, dtype=float)
+    if link_pos is None:
+        bond = C_N_BOND if linkage_type == 'amide' else C_O_BOND
+        link_pos = carbon_pos + _flat(np.asarray(first_point) - carbon_pos) * bond
+    link_pos = np.asarray(link_pos, dtype=float)
+    d1 = _flat(np.asarray(first_point) - link_pos)
+    w = np.cross(np.array([0.0, 0.0, 1.0]), d1)
+    if linkage_type == 'amide':
+        c = link_pos + d1 * AMIDE_CN
+        return ({"n_link_position": link_pos.tolist(), "c_carbonyl_position": c.tolist(),
+                 "o_carbonyl_position": (c + w * C_O_DOUBLE).tolist()}, c)
+    if linkage_type == 'ester':
+        c = link_pos + d1 * ESTER_CO
+        return ({"o_ester_position": link_pos.tolist(), "c_carbonyl_position": c.tolist(),
+                 "o_carbonyl_position": (c + w * C_O_DOUBLE).tolist()}, c)
+    if linkage_type == 'ether':
+        return {"o_ether_position": link_pos.tolist()}, link_pos
+    raise ValueError(f"Unsupported linkage type: {linkage_type}")
+
+
 def create_lipid_chain(connection_anchor, target_n_position, mol_data=None,
                        carbon_name=None, connection_blob=None, midpoint=None,
                        linkage_type="amide", use_fabrik=False, n_carbons=None):
     """
-    Build a lipid chain from a sugar carbon towards a target position.
-
-    Parameters:
-    - n_carbons: if given, use exactly this many carbons in the backbone
-                 instead of estimating from distance. FABRIK still runs
-                 to reconcile geometry.
+    Build a lipid chain lying flat along the drawn path: from the sugar carbon
+    (or, for a branch, the nearest carbon of the parent chain) through the
+    midpoint, if given, to the tip (target_n_position).  See
+    build_chain_on_path; the chain passes exactly through the midpoint and
+    ends exactly on the tip.  n_carbons: carbons asked for (None: auto); it is
+    adjusted, with a log line, when it cannot fit the path.  use_fabrik is
+    accepted for compatibility and not used.
     """
 
     C_C_BOND = 1.54
@@ -430,38 +647,51 @@ def create_lipid_chain(connection_anchor, target_n_position, mol_data=None,
 
     offset_target = waypoint if waypoint is not None else target_n
 
-    anchor_pos, carbon_idx, ring_center = get_anchor_position(
-        connection_anchor, mol_data, carbon_name, connection_blob,
-        target_position=offset_target
-    )
+    first_point = waypoint if waypoint is not None else target_n
+    path = [waypoint, target_n] if waypoint is not None else [target_n]
     is_branched = (connection_anchor == "lipid")
 
-    if waypoint is not None:
-        initial_direction = (waypoint - anchor_pos)
-    else:
-        initial_direction = (target_n - anchor_pos)
-
-    initial_direction = initial_direction / np.linalg.norm(initial_direction)
-
     print(f"\n{'='*60}")
-    print(f"Creating {'BRANCHED' if is_branched else linkage_type} lipid chain")
-    print(f"Anchor position (offset): {anchor_pos}")
-    if ring_center is not None:
-        print(f"Ring center (COM): {ring_center}")
-    print(f"Initial direction (towards target): {initial_direction}")
-    if n_carbons is not None:
-        print(f"Fixed carbon count: {n_carbons}")
+    if not is_branched:
+        # Sugar attached: the linkage atom takes the place of the sugar's own N or O.
+        if carbon_name is None:
+            raise ValueError("Sugar attachment requires a carbon name")
+        carbon_idx = mol_data['carbon_map'][carbon_name]
+        anchor_pos = np.asarray(mol_data['absolute_coordinates'][carbon_idx], dtype=float)
+        ring_center = np.asarray(mol_data['COM'], dtype=float)
+        link_pos = replaced_atom_position(mol_data, carbon_name,
+                                          'N' if linkage_type == 'amide' else 'O')
+        print(f"Creating {linkage_type} lipid chain on {carbon_name}")
+        print(f"  Sugar carbon: {anchor_pos}, linkage atom "
+              + ("at the sugar's own N/O" if link_pos is not None else "placed towards the path"))
+        headgroup_data, current_pos = build_headgroup_at_sugar(
+            anchor_pos, link_pos, first_point, linkage_type)
+    else:
+        anchor_pos, carbon_idx, ring_center = get_anchor_position(
+            connection_anchor, mol_data, carbon_name, connection_blob,
+            target_position=first_point)
+        print(f"Creating BRANCHED lipid chain from {anchor_pos}")
+        # Same flat linkage as on a sugar, from the parent chain carbon: ester O
+        # (or amide N) towards the path, then C(=O) with its O in the surface
+        # plane.  build_linkage_headgroup's branched form had no ester O, which
+        # the exporter needs, so branched ester lipids were dropped.
+        headgroup_data, current_pos = build_headgroup_at_sugar(
+            anchor_pos, None, first_point, linkage_type)
+        headgroup_data["branched"] = True
 
-    headgroup_data, current_pos = build_linkage_headgroup(
-        anchor_pos, initial_direction, linkage_type,
-        is_branched=is_branched,
-        C_N_BOND=C_N_BOND,
-        C_C_BOND=C_C_BOND,
-        C_O_BOND=C_O_BOND,
-        C_O_DOUBLE=C_O_DOUBLE
-    )
-
-    backbone_data = build_lipid_backbone(current_pos, target_n, waypoint, C_C_BOND, use_fabrik, n_carbons)
+    # Surface height: a sugar attached lipid lies at the height of the sugar's
+    # lowest heavy atom (where the sugar touches the surface); a branch stays
+    # level with its parent chain.
+    z_surface = None
+    if not is_branched:
+        coords = np.asarray(mol_data['absolute_coordinates'], dtype=float)
+        types = mol_data.get('atom_types') or []
+        heavy = [i for i, t in enumerate(types) if t != 'H'] or list(range(len(coords)))
+        z_surface = float(coords[heavy, 2].min())
+        print(f"  Chain lies at z {z_surface:.2f} (sugar contact height), "
+              f"linkage at z {float(current_pos[2]):.2f}")
+    backbone_data = build_chain_on_path(current_pos, path, n_requested=n_carbons,
+                                        C_C_BOND=C_C_BOND, z_surface=z_surface)
 
     print("=" * 60)
 

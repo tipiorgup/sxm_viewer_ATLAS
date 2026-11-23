@@ -97,6 +97,10 @@ class RigidRefineConfig:
     # (cellobiose 00 and 11 collapse onto 10).
     k_face: float = 5000.0
     face_margin: float = 0.5
+    # Lipid pins (midpoint and tip carbons): free inside pin_radius of their
+    # point in x and y, stiff beyond; z free so the lipid can lie down.
+    pin_radius: float = 0.15
+    k_pin: float = 1000.0
     k_phi: float = 0.02                    # kcal/mol/deg^2 outside the window; 0 disables
     phi_window: float = 25.0
     # Bridging O to hydroxyl site springs (kcal/mol/A^2 per site); 0 disables.
@@ -209,7 +213,7 @@ class _State:
 # ---------------------------------------------------------------------------
 
 class RigidRefine:
-    def __init__(self, mol, beadset: BeadSet, linkages, cfg: RigidRefineConfig):
+    def __init__(self, mol, beadset: BeadSet, linkages, cfg: RigidRefineConfig, pins=None):
         self.mol = mol
         self.bs = beadset
         self.links = linkages
@@ -238,6 +242,16 @@ class RigidRefine:
         self.ff_plain.Initialize()
 
         self.target_xy = np.array([b.pivot[:2] for b in beadset.beads], dtype=float)
+        # Lipid pins: only free atoms can be pinned (a lipid carbon always is).
+        free_set = set(beadset.free_atoms)
+        self.pins = []
+        for p_ in (pins or []):
+            if p_['atom'] in free_set:
+                self.pins.append({'atom': int(p_['atom']), 'xy': np.asarray(p_['xy'], dtype=float),
+                                  'label': p_.get('label', str(p_['atom']))})
+            else:
+                print(f"  ! pin {p_.get('label', p_['atom'])}: atom {p_['atom']} is not free; "
+                      f"not pinned")
         self.faces = np.array([b.face for b in beadset.beads], dtype=float)
 
         self.bead_mass = np.array([b.masses.sum() for b in beadset.beads])
@@ -312,8 +326,14 @@ class RigidRefine:
             for li, bk, body, _ in self.sites:
                 d = pos[self.links[li]['o']] - self._site_world(st, bk, body)
                 e_site += self.cfg.k_site * float(d @ d)
-        return (e_ff + e_ext + e_xy + e_face + e_site,
-                {'ff': e_ff, 'ext': e_ext, 'xy': e_xy, 'face': e_face, 'site': e_site})
+        e_pin = 0.0
+        for p_ in self.pins:
+            r = float(np.linalg.norm(pos[p_['atom'], :2] - p_['xy']))
+            if r > self.cfg.pin_radius:
+                e_pin += self.cfg.k_pin * (r - self.cfg.pin_radius) ** 2
+        return (e_ff + e_ext + e_xy + e_face + e_site + e_pin,
+                {'ff': e_ff, 'ext': e_ext, 'xy': e_xy, 'face': e_face, 'site': e_site,
+                 'pin': e_pin})
 
     # -- generalized forces -------------------------------------------------
 
@@ -325,6 +345,11 @@ class RigidRefine:
         _, fz = external_energy_forces(pos[:, 2], self.masses, self.weights,
                                        slab_z, ceiling_z, self.cfg)
         f[:, 2] += fz
+        for p_ in self.pins:
+            d = pos[p_['atom'], :2] - p_['xy']
+            r = float(np.linalg.norm(d))
+            if r > self.cfg.pin_radius:
+                f[p_['atom'], :2] -= 2.0 * self.cfg.k_pin * (r - self.cfg.pin_radius) * d / r
 
         nb = len(self.bs.beads)
         F = np.zeros((nb, 3))
@@ -571,7 +596,7 @@ def linkage_report(pos, links, beadset: BeadSet, co_ideal=1.43):
 
 def refine_structure(mol_h, mol_no_h=None, chain_dict=None, linkage_definitions=None,
                      fixed_atoms=(), config: Optional[RigidRefineConfig] = None,
-                     residue_index=None):
+                     residue_index=None, pins=None):
     """
     Rigid body REFINE of an exported structure.
 
@@ -582,6 +607,8 @@ def refine_structure(mol_h, mol_no_h=None, chain_dict=None, linkage_definitions=
     chain_dict : builder unit dicts (experimental COM, brightness, template coords).
     linkage_definitions : config['glycosidic_bonds'] entries, for the anomer per linkage.
     fixed_atoms : atom indices held fixed (linker rings and the like).
+    pins : [{'atom': index, 'xy': (x, y), 'label': str}], lipid carbons held at
+        their point in x and y (free inside cfg.pin_radius, stiff beyond); z free.
 
     Returns (mol_out, report).  mol_out is a copy of mol_h with new coordinates.
     """
@@ -610,7 +637,7 @@ def refine_structure(mol_h, mol_no_h=None, chain_dict=None, linkage_definitions=
         conf.SetAtomPosition(i, pos0[i].tolist())
     pre = template_deviation(mol, bs, chain_dict, verbose=cfg.verbose) if chain_dict else []
 
-    engine = RigidRefine(mol, bs, links, cfg)
+    engine = RigidRefine(mol, bs, links, cfg, pins=pins)
     st0 = _State(pos0, bs)
     st, run = engine.run(st0)
 
@@ -673,9 +700,14 @@ def refine_structure(mol_h, mol_no_h=None, chain_dict=None, linkage_definitions=
     for r in link_rows:
         r.setdefault('site_angle_donor', 0.0)      # rigid in the donor bead
         r['stereo_ok'] = max(r['site_angle_donor'], r.get('site_angle_acceptor', 0.0)) < 90.0
+    pin_rows = [{'label': p_['label'], 'atom': p_['atom'], 'xy_target': p_['xy'].tolist(),
+                 'xy_off_start': float(np.linalg.norm(pos0[p_['atom'], :2] - p_['xy'])),
+                 'xy_off': float(np.linalg.norm(st.pos[p_['atom'], :2] - p_['xy'])),
+                 'z': float(st.pos[p_['atom'], 2])} for p_ in engine.pins]
     e_mmff = float(engine.ff_plain.CalcEnergy(st.pos.ravel().tolist()))
     e_mmff0 = float(engine.ff_plain.CalcEnergy(pos0.ravel().tolist()))
     report = {'run': run, 'beads': beads_rows, 'linkages': link_rows, 'state': state_rows,
+              'pins': pin_rows,
               'energy_mmff': e_mmff, 'energy_mmff_before': e_mmff0,
               'template_deviation_before': pre,
               'max_rigid_rmsd': max((r['rmsd'] for r in rig), default=0.0),
@@ -691,6 +723,12 @@ def refine_structure(mol_h, mol_no_h=None, chain_dict=None, linkage_definitions=
                   f"{'' if r['face_kept'] else ' LOST'}  xy drift={r['xy_drift']:.2f} A  "
                   f"z {r['z_start']:.2f}->{r['z']:.2f} A"
                   + (f"  Q={r['Q']:.2f} theta={r['theta']:.0f}" if r['Q'] is not None else ''))
+        if pin_rows:
+            print("  Lipid points after REFINE (held within "
+                  f"{cfg.pin_radius:.2f} A in xy):")
+            for r in pin_rows:
+                print(f"    {r['label']:<42} off its point {r['xy_off_start']:.3f} -> "
+                      f"{r['xy_off']:.3f} A, z {r['z']:.2f} A")
         print("  Linkages after REFINE:")
         for r in link_rows:
             print(f"    {r['name']:<28} C-O {r['r_donor']:.3f}/{r['r_acceptor']:.3f} A "
