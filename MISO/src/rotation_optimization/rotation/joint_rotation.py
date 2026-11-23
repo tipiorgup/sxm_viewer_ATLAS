@@ -187,8 +187,13 @@ def joint_rigid_rotation(chain_dict, linkages, face_state=None,
             d = max(np.linalg.norm(v), 1e-9)
             # two sided: too short is as wrong as too long (the clash term
             # skips this carbon pair, so nothing else would stop it)
-            e += k_link * (d - d0) ** 2
-            g = 2 * k_link * (d - d0) * v / d
+            x = d - d0
+            if abs(x) <= link_width:
+                e += k_link * x ** 2
+                g = 2 * k_link * x * v / d
+            else:                        # Huber: linear beyond link_width
+                e += k_link * (2 * link_width * abs(x) - link_width ** 2)
+                g = 2 * k_link * link_width * np.sign(x) * v / d
             grad[kd][id_] += g
             grad[ka][ia] -= g
             if k_bridge and lo_d is not None and lo_a is not None:
@@ -281,6 +286,7 @@ def joint_rigid_rotation(chain_dict, linkages, face_state=None,
         d = np.linalg.norm(pos[a][heavy[a]][:, None] - pos[b][heavy[b]][None], axis=2)
         min_nb = min(min_nb, float(d.min()))
 
+    open_links = {ln: g for ln, g in gaps.items() if g > CLOSABLE_CC}
     reasons = []
     if worst > max_gap:
         reasons.append(f"linkage open ({worst:.2f} A > {max_gap:.2f} A)")
@@ -290,7 +296,7 @@ def joint_rigid_rotation(chain_dict, linkages, face_state=None,
         reasons.append("face state could not be kept")
     report = {'valid': not reasons, 'reason': '; '.join(reasons) or 'ok',
               'gaps': gaps, 'worst_gap': worst, 'shortest_gap': shortest,
-              'faces_kept': faces_kept,
+              'faces_kept': faces_kept, 'open': open_links,
               'min_nonbonded': min_nb, 'energy': e, 'energy_start': e_start,
               'n_iter': it}
     if verbose:
@@ -300,5 +306,9 @@ def joint_rigid_rotation(chain_dict, linkages, face_state=None,
         nb = f"{min_nb:.2f} A" if np.isfinite(min_nb) else "n/a"
         print(f"  linkage C...C {shortest:.2f} to {worst:.2f} A, faces kept: {faces_kept}, "
               f"closest non bonded heavy atoms {nb}")
+        if open_links and report['valid']:
+            print("  open linkages accepted (layout cannot close them; built with a long bond, "
+                  "REFINE shares the error between bond and xy): "
+                  + ", ".join(f"{ln} {g:.2f} A" for ln, g in sorted(open_links.items())))
         print(f"  state {'ACCEPTED' if report['valid'] else 'REJECTED: ' + report['reason']}")
     return new_chain, report

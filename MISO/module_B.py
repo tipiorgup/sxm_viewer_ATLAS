@@ -162,9 +162,12 @@ def parse_arguments():
     parser.add_argument(
         "--max_gap",
         type=float,
-        default=7.0,
+        default=6.0,
         help="Reject a face state if any linkage C...C stays above this after the joint "
-             "rotation (Angstrom, default: 3.0)"
+             "rotation (Angstrom, default: 6.0). A linkage the layout cannot close "
+             "(2.86 A is the strict limit) is accepted below this, built with a long "
+             "bond and reported as stretch; REFINE then shares the error between the "
+             "bond and the xy positions (see --k_xy)."
     )
     parser.add_argument(
         "--pool_factor",
@@ -176,11 +179,13 @@ def parse_arguments():
     parser.add_argument(
         "--refine",
         choices=["rigid", "atom", "auto"],
-        default="auto",
-        help="rigid: REFINE with rigid sugar beads (templates kept exactly, xy at the "
-             "experimental position, z free, bridging oxygens free). atom: the previous "
-             "atom level MMFF minimisation and Langevin MD. auto (default): rigid for "
-             "sugar only systems, atom when a peptide or lipids are present."
+        default="rigid",
+        help="rigid (default): REFINE with rigid sugar beads (templates kept exactly, "
+             "glycosidic O rigid in its donor, xy at the experimental position, z free; "
+             "lipids, PEtN, phosphates and peptides free). atom: the previous atom level "
+             "MMFF minimisation and Langevin MD. auto: rigid whenever there are sugars, "
+             "atom when a peptide is present. A system without sugars has nothing to "
+             "keep rigid and always uses atom."
     )
     parser.add_argument(
         "--r0_xy",
@@ -190,12 +195,72 @@ def parse_arguments():
              "experimental xy before the restraint acts (default: 0.5)"
     )
     parser.add_argument(
+        "--k_xy",
+        type=float,
+        default=50.0,
+        help="Rigid REFINE: stiffness (kcal/mol/A^2) of the xy restraint outside r0_xy "
+             "(default: 50). Decides where a too long linkage puts its error: low values "
+             "move the sugars off their circles and keep the bond short, high values keep "
+             "the circles and stretch the bond."
+    )
+    parser.add_argument(
         "--ceiling_margin",
         type=float,
         default=1.0,
         help="Rigid REFINE: ceiling height above the thickest rigid sugar (Angstrom, default: 1.0)"
     )
     args = parser.parse_args()
+    return args
+
+
+BUILD_OPTION_DEFAULTS = {
+    'faces': 'enumerate', 'seed': 0, 'duplicate_rmsd': 0.25, 'no_screen': False,
+    'no_joint_rotation': False, 'max_gap': 6.0, 'pool_factor': 4, 'refine': 'rigid',
+    'r0_xy': 0.5, 'k_xy': 50.0, 'ceiling_margin': 1.0,
+}
+
+
+def apply_build_options(args, config, argv=None):
+    """Let the yaml's ``build_options`` section override the parser defaults.
+
+    The parser carries the real defaults, so ``parse_arguments()`` alone gives
+    a complete, valid configuration (faces=enumerate, refine=rigid, ...).  A
+    value from the yaml replaces the default only for options that were not
+    typed on the command line; a typed flag always wins.  This lets a front
+    end that only writes the yaml set every build option, and keeps the
+    behaviour of any caller that never reads the yaml section.
+    """
+    import sys as _sys
+    argv = list(_sys.argv[1:] if argv is None else argv)
+    typed = {a.split('=', 1)[0].lstrip('-') for a in argv if a.startswith('--')}
+    opts = config.get('build_options') or {}
+    unknown = sorted(set(opts) - set(BUILD_OPTION_DEFAULTS))
+    if unknown:
+        print(f"  ! build_options: unknown keys ignored: {', '.join(unknown)}")
+    src = {}
+    for key, dflt in BUILD_OPTION_DEFAULTS.items():
+        if key in typed:
+            src[key] = 'cli'
+            continue
+        if key in opts:
+            val = opts[key]
+            if isinstance(dflt, bool):
+                val = bool(val)
+            elif isinstance(dflt, float):
+                val = float(val)
+            elif isinstance(dflt, int):
+                val = int(val)
+            setattr(args, key, val)
+            src[key] = 'yaml'
+        else:
+            src[key] = 'default'
+    if args.faces not in ('enumerate', 'legacy'):
+        raise ValueError(f"build_options.faces must be enumerate or legacy, got {args.faces!r}")
+    if args.refine not in ('rigid', 'atom', 'auto'):
+        raise ValueError(f"build_options.refine must be rigid, atom or auto, got {args.refine!r}")
+    print("\nBuild options: " + ", ".join(
+        f"{k}={getattr(args, k)}" + (f" ({src[k]})" if src[k] != 'default' else '')
+        for k in BUILD_OPTION_DEFAULTS))
     return args
 
 
@@ -214,6 +279,7 @@ def main():
     # ========================================================================
     args = parse_arguments()
     config = lpf.load_config(args.input_file)
+    args = apply_build_options(args, config)
 
     # Extract configuration parameters
     sugars = config.get('sugars', {})
@@ -313,6 +379,14 @@ def main():
                     face = ''.join('0' if f == 1 else '1' for f in sc['valid'])
                     print(f"    {m}: {sc['note']} (allowed {face}; slack face0 "
                           f"{sc['slack'][1]:+.2f} A, face1 {sc['slack'][-1]:+.2f} A)")
+            far = [m for m in face_mol_order
+                   if screening.get(m, {}).get('note') == 'neither face fits']
+            if far:
+                print(f"  ! Layout check: {', '.join(far)} cannot close a linkage in either face "
+                      f"(the circles are further apart than the rigid templates reach by the "
+                      f"slack above). Such linkages are built with a long bond, accepted up to "
+                      f"max_gap = {args.max_gap:.1f} A C...C, and reported as stretch; REFINE then "
+                      f"shares the error between the bond and the xy positions (k_xy).")
         if len(face_states) < args.n_polymers:
             print(f"  Only {len(face_states)} possible face states; "
                   f"generating at most {len(face_states)} polymers instead of {args.n_polymers}")
@@ -495,8 +569,20 @@ def main():
 
                     refine_mode = args.refine
                     if refine_mode == "auto":
-                        refine_mode = "rigid" if (sugars and peptide_data is None
-                                                  and not all_lipids) else "atom"
+                        # Rigid whenever there are sugars; a peptide goes to the atom
+                        # level path (linker rings frozen, trans amide restraints).
+                        refine_mode = "rigid" if (sugars and peptide_data is None) else "atom"
+                        if sugars and peptide_data is not None:
+                            print("  (auto: peptide present, atom level REFINE)")
+                    if refine_mode == "rigid" and not sugars:
+                        # Nothing to keep rigid (pure peptide): the rigid engine would
+                        # find no bead.
+                        print("  (no sugars in this system: atom level REFINE)")
+                        refine_mode = "atom"
+                    elif refine_mode == "rigid" and peptide_data is not None:
+                        print("  (rigid REFINE with a peptide: peptide atoms are free "
+                              "particles, linker ring atoms stay fixed; not yet validated "
+                              "on a glycopeptide)")
                     print(f"\n  REFINE mode: {refine_mode}")
 
                     if refine_mode == "rigid":
@@ -512,7 +598,8 @@ def main():
                             from src.rotation_optimization.rigid_refine import (
                                 refine_structure, RigidRefineConfig)
                             rigid_cfg = RigidRefineConfig(
-                                r0_xy=args.r0_xy, ceiling_margin=args.ceiling_margin)
+                                r0_xy=args.r0_xy, k_xy=args.k_xy,
+                                ceiling_margin=args.ceiling_margin)
                             optimized_mol, rigid_report = refine_structure(
                                 final_with_h, final_no_h, chain_dict,
                                 [tuple(link) for link in config.get('glycosidic_bonds', [])],

@@ -341,7 +341,7 @@ def chain_coordinates(chain_dict, mol_order):
 
 
 def build_glycan_chain(molecule_data_dict, config, iterations, face_state=None, seed=None,
-                       joint_rotation=True, max_gap=3.0, return_report=False):
+                       joint_rotation=True, max_gap=6.0, return_report=False):
     """
     Align molecules and create glycosidic bonds.
 

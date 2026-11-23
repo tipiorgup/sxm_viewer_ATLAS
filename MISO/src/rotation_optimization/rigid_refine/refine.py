@@ -20,16 +20,18 @@ Energy
                                                forms as force_field_optimization
       + k_xy  * sum_beads max(0, |dxy| - r0)^2     experimental xy
       + k_face * sum_beads max(0, margin - face * n_z)^2   keep the assembled face
-      + k_site * sum_linkages (|O - S_donor|^2 + |O - S_acceptor|^2)
-                                               the bridging O is tied to the two
-                                               hydroxyl sites it replaced; each
-                                               site is a body fixed point of its
-                                               bead (fourth tetrahedral direction
-                                               at the linkage carbon), so the O
-                                               cannot cross to the H side of a
-                                               linkage carbon and invert it, and
-                                               a stretched linkage shares its
-                                               stretch between the two C-O bonds
+      + k_site * sum_linkages |O - S_acceptor|^2
+                                               the glycosidic O is part of the
+                                               donor bead (its O1, exact C1-O
+                                               geometry); one spring ties it to
+                                               the acceptor's hydroxyl site, a
+                                               body fixed point (fourth
+                                               tetrahedral direction at the
+                                               acceptor carbon), so the O cannot
+                                               cross to the H side of the
+                                               acceptor carbon and invert it.
+                                               A linkage the layout cannot close
+                                               stretches the O to acceptor bond.
       + phi restraint per linkage              flat bottom torsion restraint
                                                added to the MMFF force field
 
@@ -52,8 +54,8 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from scipy.spatial.transform import Rotation as Rot
 
-from .beads import (BeadSet, bead_rigidity, build_beads, find_linkages,
-                    oriented_normal, ring_pucker, template_deviation)
+from .beads import (BeadSet, attach_bridging_oxygens, bead_rigidity, build_beads,
+                    find_linkages, oriented_normal, ring_pucker, template_deviation)
 from ..structure import pdb_export
 from ..geometry.geometry_utils import rotate_molecule_around_com
 
@@ -248,15 +250,16 @@ class RigidRefine:
         self.ceiling = cfg.ceiling_z if cfg.ceiling_z is not None else self.t_max + cfg.ceiling_margin
 
         # Hydroxyl sites: for each linkage, the point where the replaced
-        # hydroxyl oxygen sat at the donor and at the acceptor carbon, as body
-        # fixed vectors (relative to the bead pivot, in the start orientation).
+        # hydroxyl oxygen sat at the acceptor carbon, as a body fixed vector
+        # (relative to the bead pivot, in the start orientation).
         # site = C + site_bond * u, u opposite to the mean unit vector towards
         # the carbon's three remaining neighbours (fourth tetrahedral position).
+        # The donor side needs no site: the oxygen is rigid in the donor bead.
         conf = mol.GetConformer()
         pos0 = np.array([list(conf.GetAtomPosition(i)) for i in range(self.n)])
         self.sites = []                     # (link index, bead index, body vector, carbon atom)
         for li, l in enumerate(linkages):
-            for c, bk in ((l['cd'], l['donor']), (l['ca'], l['acceptor'])):
+            for c, bk in ((l['ca'], l['acceptor']),):
                 b = beadset.beads[bk]
                 nbrs = [a.GetIdx() for a in mol.GetAtomWithIdx(c).GetNeighbors()
                         if a.GetIdx() != l['o'] and a.GetIdx() in b.atoms]
@@ -315,6 +318,14 @@ class RigidRefine:
         nb = len(self.bs.beads)
         F = np.zeros((nb, 3))
         T = np.zeros((nb, 3))
+        site_reaction = []
+        if self.cfg.k_site > 0:
+            for li, bk, body, _ in self.sites:
+                o = self.links[li]['o']
+                sw = self._site_world(st, bk, body)
+                fs = -2.0 * self.cfg.k_site * (pos[o] - sw)   # force on the oxygen
+                f[o] += fs                     # reaches the donor bead through the atom sum below
+                site_reaction.append((bk, sw, -fs))
         for k, b in enumerate(self.bs.beads):
             fa = f[b.atoms]
             F[k] = fa.sum(axis=0)
@@ -327,14 +338,9 @@ class RigidRefine:
                     if viol > 0:
                         dE_dnz = -2.0 * self.cfg.k_face * viol * self.faces[k]
                         T[k] -= dE_dnz * np.cross(nrm, np.array([0.0, 0.0, 1.0]))
-        if self.cfg.k_site > 0:
-            for li, bk, body, _ in self.sites:
-                o = self.links[li]['o']
-                sw = self._site_world(st, bk, body)
-                fs = -2.0 * self.cfg.k_site * (pos[o] - sw)   # force on the oxygen
-                f[o] += fs
-                F[bk] -= fs                                     # reaction on the bead
-                T[bk] += np.cross(sw - st.pivots[bk], -fs)
+        for bk, sw, fr in site_reaction:       # reaction on the acceptor bead at its site
+            F[bk] += fr
+            T[bk] += np.cross(sw - st.pivots[bk], fr)
         dxy = st.pivots[:, :2] - self.target_xy
         r = np.linalg.norm(dxy, axis=1)
         out = r > self.cfg.r0_xy
@@ -574,6 +580,10 @@ def refine_structure(mol_h, mol_no_h=None, chain_dict=None, linkage_definitions=
 
     conf = mol.GetConformer()
     pos0 = np.array([list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())])
+    attach_bridging_oxygens(mol, bs, links, pos0, bond=cfg.site_bond, chain_dict=chain_dict,
+                            verbose=cfg.verbose)
+    for i in range(mol.GetNumAtoms()):
+        conf.SetAtomPosition(i, pos0[i].tolist())
     pre = template_deviation(mol, bs, chain_dict, verbose=cfg.verbose) if chain_dict else []
 
     engine = RigidRefine(mol, bs, links, cfg)
@@ -637,7 +647,8 @@ def refine_structure(mol_h, mol_no_h=None, chain_dict=None, linkage_definitions=
         key = 'site_angle_donor' if c == links[li]['cd'] else 'site_angle_acceptor'
         link_rows[li][key] = ang
     for r in link_rows:
-        r['stereo_ok'] = max(r.get('site_angle_donor', 0.0), r.get('site_angle_acceptor', 0.0)) < 90.0
+        r.setdefault('site_angle_donor', 0.0)      # rigid in the donor bead
+        r['stereo_ok'] = max(r['site_angle_donor'], r.get('site_angle_acceptor', 0.0)) < 90.0
     e_mmff = float(engine.ff_plain.CalcEnergy(st.pos.ravel().tolist()))
     e_mmff0 = float(engine.ff_plain.CalcEnergy(pos0.ravel().tolist()))
     report = {'run': run, 'beads': beads_rows, 'linkages': link_rows, 'state': state_rows,

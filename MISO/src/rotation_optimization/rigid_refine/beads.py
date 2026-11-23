@@ -94,15 +94,25 @@ def residue_key(atom) -> Optional[str]:
     return f"{info.GetResidueName().strip()}_{info.GetResidueNumber()}"
 
 
-def find_bridging_oxygens(mol) -> List[int]:
-    """Oxygens bonded to heavy atoms of two different residues."""
+def find_bridging_oxygens(mol, sugar_chain=pdb_export.SUGAR_CHAIN) -> List[int]:
+    """Glycosidic oxygens: bonded to two carbons that belong to two different
+    sugar residues.  An oxygen between a sugar and something else (the C6-O-P
+    of a phosphate or PEtN, an ester to a lipid) stays with its sugar."""
     out = []
     for atom in mol.GetAtoms():
         if atom.GetSymbol() != 'O':
             continue
-        keys = {residue_key(n) for n in atom.GetNeighbors() if n.GetSymbol() != 'H'}
-        keys.discard(None)
-        if len(keys) >= 2:
+        heavy = [n for n in atom.GetNeighbors() if n.GetSymbol() != 'H']
+        if len(heavy) != 2 or any(n.GetSymbol() != 'C' for n in heavy):
+            continue
+        keys = set()
+        for n in heavy:
+            info = n.GetMonomerInfo()
+            if info is None or info.GetChainId() != sugar_chain:
+                keys = set()
+                break
+            keys.add(residue_key(n))
+        if len(keys) == 2:
             out.append(atom.GetIdx())
     return out
 
@@ -140,7 +150,7 @@ def build_beads(mol, residue_index, chain_dict=None, fixed_atoms=(),
     pos = np.array([list(conf.GetAtomPosition(i)) for i in range(n_atoms)])
     mass = np.array([a.GetMass() for a in mol.GetAtoms()])
 
-    bridging = set(find_bridging_oxygens(mol))
+    bridging = set(find_bridging_oxygens(mol, sugar_chain))
     fixed = set(int(i) for i in fixed_atoms)
 
     key_to_unit = {}
@@ -249,6 +259,89 @@ def find_linkages(mol, beadset: BeadSet, linkage_definitions=None, verbose=True)
             print(f"    {l['name']:<28} donor={beadset.beads[l['donor']].name} "
                   f"acceptor={beadset.beads[l['acceptor']].name} anomer={l['anomer']}")
     return out
+
+
+def tetrahedral_site(mol, pos, carbon, exclude, bond=1.43):
+    """Fourth tetrahedral position at *carbon*: opposite to the mean unit
+    vector towards its neighbours other than *exclude* (hydrogens included),
+    at *bond* A.  None when fewer than two neighbours remain."""
+    nbrs = [a.GetIdx() for a in mol.GetAtomWithIdx(carbon).GetNeighbors()
+            if a.GetIdx() != exclude]
+    if len(nbrs) < 2:
+        return None
+    u = np.zeros(3)
+    for n in nbrs:
+        v = pos[n] - pos[carbon]
+        u += v / np.linalg.norm(v)
+    nu = np.linalg.norm(u)
+    if nu < 1e-6:
+        return None
+    return pos[carbon] - bond * u / nu
+
+
+def _template_hydroxyl_site(chain_dict, unit, carbon_name):
+    """Where the template's hydroxyl oxygen on *carbon_name* sits in the unit's
+    current (assembled) orientation, from the unit dict's oh_map, or None."""
+    if not chain_dict or unit not in chain_dict:
+        return None
+    md = chain_dict[unit]
+    oh = md.get('oh_map') or {}
+    entry = oh.get(carbon_name)
+    if not entry or entry[0] is None:
+        return None
+    coords = md.get('absolute_coordinates')
+    if coords is None or entry[0] >= len(coords):
+        return None
+    return np.asarray(coords[entry[0]], dtype=float)
+
+
+def attach_bridging_oxygens(mol, beadset: BeadSet, links, pos, bond=1.43, chain_dict=None,
+                            verbose=True):
+    """Make every glycosidic oxygen part of its donor bead, as the donor's O1.
+
+    The oxygen is snapped to the template's own O1 position (the hydroxyl the
+    linkage replaced, read from the unit dict's oh_map) or, without a
+    template, to the donor carbon's fourth tetrahedral position; exact C1-O
+    bond and anomeric geometry, rigid from then on.  It is removed from the
+    free atoms; *pos* is updated in place.  The linkage then has one
+    flexible bond, O to the acceptor carbon, handled by MMFF plus a single
+    spring from the acceptor's hydroxyl site to this oxygen.
+
+    Two springs (donor site and acceptor site) on a free oxygen were wrong:
+    their minimum is the midpoint of the two sites, which lies on the C...C
+    axis whenever the beads cannot bring the sites together, and on that axis
+    the C-O-C angle term has no gradient, so the linkage ended linear with
+    compressed bonds (seen on a glycolipid with a lipid on the root).
+    """
+    moved = []
+    for l in links:
+        o, cd, bk = l['o'], l['cd'], l['donor']
+        b = beadset.beads[bk]
+        if o in b.atoms:
+            continue
+        site = tetrahedral_site(mol, pos, cd, exclude=o, bond=bond)
+        if site is None:
+            continue
+        tsite = _template_hydroxyl_site(chain_dict, b.name, atom_name(mol.GetAtomWithIdx(cd)))
+        if tsite is not None and np.linalg.norm(tsite - site) < 0.8:
+            site = tsite
+        shift = float(np.linalg.norm(pos[o] - site))
+        pos[o] = site
+        b.atoms.append(o)
+        b.heavy.append(o)
+        b.body = np.vstack([b.body, (pos[o] - b.pivot)[None, :]])
+        m_o = float(mol.GetAtomWithIdx(o).GetMass())
+        b.masses = np.append(b.masses, m_o)
+        b.inertia = float((b.masses * (b.body ** 2).sum(axis=1)).sum())
+        b.atom_names[o] = 'O1'
+        if o in beadset.free_atoms:
+            beadset.free_atoms.remove(o)
+        l['o_in_donor'] = True
+        moved.append((l['name'], shift))
+    if verbose and moved:
+        print("  Bridging oxygens attached to their donor bead (snapped to the C1 "
+              "tetrahedral site): " + ", ".join(f"{n} moved {d:.2f} A" for n, d in moved))
+    return moved
 
 
 # ---------------------------------------------------------------------------
