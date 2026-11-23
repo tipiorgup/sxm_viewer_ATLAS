@@ -38,7 +38,15 @@ YAML_KEYS = {
     "orientation_csv_path": "fixed orientations",
     "monomer_data_path": "reuse of the built monomer geometry",
     "circle_input_path": "the positions CSV",
+    "build_options": "build options (faces, refine, k_xy, ...)",
 }
+# Engine options that the runner dialog sets through the YAML section build_options.
+# When the engine reads that section they are not "unused": they are set from the
+# "Build options" group of the dialog, or from the YAML itself.
+BUILD_OPTION_FLAGS = ("--faces", "--seed", "--duplicate_rmsd", "--no_screen",
+                      "--no_joint_rotation", "--max_gap", "--pool_factor", "--refine",
+                      "--r0_xy", "--k_xy", "--ceiling_margin", "--gravity",
+                      "--compression_steps")
 MAX_SOURCE_BYTES = 4_000_000
 
 
@@ -213,7 +221,8 @@ def compatibility_notes(info: EngineInfo, config: dict | None = None,
                      "previous version are assumed.")
     for var, label, wanted in (("DEFAULT_COMPRESSION_STEPS", "Compression steps", compression_steps_set),
                                ("DEFAULT_GRAVITY", "Gravity", gravity_set)):
-        if wanted and info.found and var not in info.env_vars:
+        flag = "--gravity" if var == "DEFAULT_GRAVITY" else "--compression_steps"
+        if wanted and info.found and var not in info.env_vars and not info.supports(flag):
             notes.append(f"{label} from this window may be ignored: this MISO version no "
                          f"longer reads {var}.")
     for key in sorted(config or {}):
@@ -221,6 +230,8 @@ def compatibility_notes(info: EngineInfo, config: dict | None = None,
             notes.append(f"The YAML has '{key}' ({YAML_KEYS[key]}), but this MISO version's "
                          "source never mentions it, so it may be ignored.")
     extra = info.extra_options()
+    if "build_options" in info.yaml_keys:
+        extra = [name for name in extra if name not in BUILD_OPTION_FLAGS]
     if extra:
         notes.append("New MISO options not used by this window (MISO defaults apply): "
                      + ", ".join(extra) + ".")

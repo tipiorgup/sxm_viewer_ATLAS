@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -161,6 +162,30 @@ class MISORunnerDialog(QtWidgets.QDialog):
 
         # Pre-fill CSV/NPZ from last position-coordinates export
         self._prefill_from_viewer()
+        self._apply_engine_capabilities()
+
+    def _apply_engine_capabilities(self):
+        """Warn on the controls the installed engine does not read."""
+        info = self._engine_info()
+        if info.found and "orientation_csv_path" not in info.yaml_keys:
+            self.fixed_ori_chk.setToolTip(
+                "Warning: this MISO version does not read fixed orientations or the "
+                "monomer pickle yet, so these values are written to the YAML but ignored.")
+        self._update_atom_fields()
+
+    def _update_atom_fields(self, *_):
+        """Explain what gravity and compression steps do in the installed engine."""
+        info = self._engine_info()
+        if (not info.found) or info.supports("--compression_steps"):
+            self.comp_spin.setToolTip(
+                "Number of increments in which the slab and ceiling press the structure onto "
+                "the surface in REFINE. More steps give a softer landing.")
+            self.gravity_spin.setToolTip("Strength of the pull towards the surface in REFINE.")
+            return
+        for widget in (self.comp_spin, self.gravity_spin):
+            widget.setToolTip(
+                "Warning: this MISO version's rigid REFINE has its own press and does not "
+                "read this value.")
 
     def _on_fixed_ori_toggled(self, checked):
         self._fixed_ori_group.setVisible(checked)
@@ -452,7 +477,23 @@ class MISORunnerDialog(QtWidgets.QDialog):
             self._queue = []
             self._finish_queue()
             return
+        # The window's values go on the command line, which beats any build_options in the YAML
+        if info.supports("--gravity"):
+            engine_args += ["--gravity", str(self.gravity_spin.value())]
+        if info.supports("--compression_steps"):
+            engine_args += ["--compression_steps", str(self.comp_spin.value())]
         notes += compatibility_notes(info, cfg)
+        if not info.supports("--compression_steps"):
+            notes.append("Gravity and Compression steps are not read by the rigid REFINE of "
+                         "this MISO version.")
+        if cfg.get("use_fixed_orientation") and "orientation_csv_path" in info.yaml_keys:
+            notes.append("Fixed orientation: every sugar with a row in the orientation CSV "
+                         "keeps that pose (QUEST is skipped for it and its face is fixed); "
+                         "sugars without a row still use QUEST. If all sugars have a row, "
+                         "fewer polymers than requested may be built.")
+        if cfg.get("use_fixed_orientation") and "orientation_csv_path" not in info.yaml_keys:
+            notes.append("Use fixed orientation is ticked, but this MISO version does not "
+                         "read it: the alignment (QUEST) still runs.")
         for note in notes:
             self._append(f"[MISO] Note: {note}")
         supported = set(info.options)
@@ -507,7 +548,19 @@ class MISORunnerDialog(QtWidgets.QDialog):
         self._cleanup_tmp()
         failed = exit_code != 0 or exit_status == QtCore.QProcess.CrashExit
         status = "stopped" if self._stopped_by_user else ("FAILED" if failed else "ok")
-        self._job_summary.append((Path(job["yaml"]).name, job["n_polymers"], status))
+        cap, problems = self._scan_job_log(self.log.toPlainText()[self._job_log_start:])
+        shown_polymers = job["n_polymers"]
+        if cap and not failed and not self._stopped_by_user:
+            shown_polymers = cap[0]
+            self._append(f"[MISO] Note: {cap[0]} of the {cap[1]} requested polymers were "
+                         f"built, because only {cap[0]} face states are possible.")
+        if problems and not failed and not self._stopped_by_user:
+            status = "CHECK"
+            self._append("[MISO] WARNING: MISO exited with code 0 but its log shows:")
+            for problem in problems:
+                self._append(f"[MISO]   {problem}")
+            self._append("[MISO] The structures may be incomplete. Check the log above.")
+        self._job_summary.append((Path(job["yaml"]).name, shown_polymers, status))
         if failed and not self._stopped_by_user:
             if self._failure is None:
                 # The troubleshooter explains the first failure of the batch,
@@ -519,6 +572,7 @@ class MISORunnerDialog(QtWidgets.QDialog):
                     "exit_code": exit_code or 1,
                 }
             self._append("[MISO] Click 'Why did MISO fail?' for checks and an explanation.")
+        self._remove_cg_outputs(job["results_dir"])
         if exit_code == 0:
             self._convert_sdf_outputs()
 
@@ -526,6 +580,50 @@ class MISORunnerDialog(QtWidgets.QDialog):
             self._start_next_job()
             return
         self._finish_queue()
+
+    _CG_FILE_RE = re.compile(r".*_cg_(bonded|unbonded)\.(gro|itp)$")
+
+    def _remove_cg_outputs(self, results_dir):
+        """The engine always writes the coarse grained (Martini) models; they are not wanted
+        here, so they are deleted when a job ends."""
+        removed = 0
+        try:
+            for path in Path(results_dir).iterdir():
+                if path.is_file() and self._CG_FILE_RE.match(path.name):
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        except OSError:
+            return
+        if removed:
+            self._append(f"[MISO] Removed {removed} coarse grained (CG) files; "
+                         "they are not kept.")
+
+    _CAP_RE = re.compile(r"generating at most (\d+) polymers instead of (\d+)")
+    _COUNT_RE = re.compile(r"^\s*(Failed|Partial):\s+(\d+)/(\d+)", re.MULTILINE)
+    _PROBLEM_TEXTS = (
+        ("missing from chain_dict", "a sugar named in the linkages was not built"),
+        ("Could not position all molecules", "some sugars could not be positioned"),
+        ("not found in processed_mols", "a bond was skipped when exporting"),
+    )
+
+    @classmethod
+    def _scan_job_log(cls, text):
+        """(cap, problems): the polymer cap line and the signs of a silently wrong run.
+
+        The engine exits with 0 even when a sugar is dropped or a polymer failed, so
+        the exit code alone cannot tell a good run from a bad one."""
+        cap = None
+        match = cls._CAP_RE.search(text)
+        if match:
+            cap = (int(match.group(1)), int(match.group(2)))
+        problems = [message for key, message in cls._PROBLEM_TEXTS if key in text]
+        for kind, count, total in cls._COUNT_RE.findall(text):
+            if int(count) > 0:
+                problems.append(f"{count} of {total} polymers {kind.lower()}")
+        return cap, problems
 
     def _finish_queue(self):
         if self._job_total > 1 and self._job_summary:
