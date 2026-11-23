@@ -204,6 +204,21 @@ def parse_arguments():
              "the circles and stretch the bond."
     )
     parser.add_argument(
+        "--gravity",
+        type=float,
+        default=None,
+        help="Rigid REFINE: gravity towards the surface (default: DEFAULT_GRAVITY from "
+             "src/constants.py, 2.0 unless the DEFAULT_GRAVITY environment variable is set)"
+    )
+    parser.add_argument(
+        "--compression_steps",
+        type=int,
+        default=None,
+        help="Rigid REFINE: number of press increments (default: DEFAULT_COMPRESSION_STEPS "
+             "from src/constants.py, 100 unless the environment variable is set). More "
+             "steps give a softer press."
+    )
+    parser.add_argument(
         "--ceiling_margin",
         type=float,
         default=1.0,
@@ -217,6 +232,7 @@ BUILD_OPTION_DEFAULTS = {
     'faces': 'enumerate', 'seed': 0, 'duplicate_rmsd': 0.25, 'no_screen': False,
     'no_joint_rotation': False, 'max_gap': 6.0, 'pool_factor': 4, 'refine': 'rigid',
     'r0_xy': 0.5, 'k_xy': 50.0, 'ceiling_margin': 1.0,
+    'gravity': None, 'compression_steps': None,       # None: src/constants.py
 }
 
 
@@ -244,7 +260,11 @@ def apply_build_options(args, config, argv=None):
             continue
         if key in opts:
             val = opts[key]
-            if isinstance(dflt, bool):
+            if key == 'gravity':
+                val = None if val is None else float(val)
+            elif key == 'compression_steps':
+                val = None if val is None else int(val)
+            elif isinstance(dflt, bool):
                 val = bool(val)
             elif isinstance(dflt, float):
                 val = float(val)
@@ -280,6 +300,9 @@ def main():
     args = parse_arguments()
     config = lpf.load_config(args.input_file)
     args = apply_build_options(args, config)
+    if config.get('orientation_constraints'):
+        print("  ! orientation_constraints (flat / perpendicular) is no longer supported and is "
+              "ignored; set orientations with use_fixed_orientation + orientation_csv_path")
 
     # Extract configuration parameters
     sugars = config.get('sugars', {})
@@ -320,12 +343,21 @@ def main():
 
     if sugars:
         with timer.section("Phase 1: Monomer Building (shared)", level=0):
-            with timer.section("  Conformer generation", level=1):
-                conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
-            with timer.section("  Conformer analysis", level=1):
-                lpf.analyze_conformers(conformers)
-            with timer.section("  Monomer data extraction", level=1):
-                monomer_data = lpf.extract_monomer_data(conformers)
+            monomer_data_path = config.get('monomer_data_path')
+            if monomer_data_path:
+                # The GUI's monomer geometry: conformer generation is skipped, so the
+                # CSV orientations apply to exactly the conformers the GUI placed.
+                with timer.section("  Load monomer data (no conformer generation)", level=1):
+                    monomer_data, conformers = lpf.load_monomer_data(
+                        monomer_data_path, sugars, config['experimental_positions'],
+                        base_dir=os.path.dirname(os.path.abspath(args.input_file)))
+            else:
+                with timer.section("  Conformer generation", level=1):
+                    conformers = lpf.generate_conformers(sugars, num_conformers, max_keep)
+                with timer.section("  Conformer analysis", level=1):
+                    lpf.analyze_conformers(conformers)
+                with timer.section("  Monomer data extraction", level=1):
+                    monomer_data = lpf.extract_monomer_data(conformers)
             with timer.section("  Translation to experimental positions", level=1):
                 translated_conformers, carbon_vectors = lpf.translate_conformers_to_positions(
                     monomer_data, config['experimental_positions'], circles
@@ -335,6 +367,12 @@ def main():
                     translated_conformers, config['experimental_positions'],
                     conformers_selection, brightness
                 )
+            with timer.section("  User defined orientations", level=1):
+                # use_fixed_orientation + orientation_csv_path in the yaml: the
+                # listed sugars take the user's rotation instead of QUEST.
+                lpf.apply_defined_orientations(
+                    config, molecule_data_dict, translated_conformers,
+                    base_dir=os.path.dirname(os.path.abspath(args.input_file)))
             with timer.section("  Pickle molecule data", level=1):
                 output_file = f'{base_name}_molecule_data.pkl'
                 with open(output_file, 'wb') as f:
@@ -597,9 +635,14 @@ def main():
                         with timer.section(f"{tag}   Rigid body REFINE", level=3):
                             from src.rotation_optimization.rigid_refine import (
                                 refine_structure, RigidRefineConfig)
+                            rigid_kw = {}
+                            if args.gravity is not None:
+                                rigid_kw['gravity'] = args.gravity
+                            if args.compression_steps is not None:
+                                rigid_kw['compression_steps'] = args.compression_steps
                             rigid_cfg = RigidRefineConfig(
                                 r0_xy=args.r0_xy, k_xy=args.k_xy,
-                                ceiling_margin=args.ceiling_margin)
+                                ceiling_margin=args.ceiling_margin, **rigid_kw)
                             optimized_mol, rigid_report = refine_structure(
                                 final_with_h, final_no_h, chain_dict,
                                 [tuple(link) for link in config.get('glycosidic_bonds', [])],
