@@ -16,16 +16,8 @@ Main entry points (called by structure/building_chain.py)
 find_rotation_FULL_3D_QUATERNION(
         template, mol_carbon, target_mol, target_carbon,
         existing_chain, fixed_com, n_samples, additional_bonds)
-    Single-bond or multi-bond 3D rotation search with no surface
-    orientation constraint.  Delegates to QUEST + uniform sampling
-    with face (normal vs reflected) selection.
- 
-find_rotation_1D_Z_AXIS(
-        template, donor_c, target, acceptor_c,
-        chain_list, fixed_com, target_orientation, ...)
-    Z-axis spin search for rings constrained to lie flat (or perpendicular)
-    on the surface.  Establishes flatness via QUEST, then spins around Z.
-    Tests both faces.
+    Single-bond or multi-bond 3D rotation search.  Delegates to QUEST +
+    uniform sampling with face (normal vs reflected) selection.
  
 find_rotation_QUEST_VARIANTS_TOP_N(
         template, bonds_to_optimize, existing_chain, existing_linkages,
@@ -37,10 +29,6 @@ find_rotation_for_phosphate_linkage(
         mol_template, mol_carbon_name, target_mol, target_carbon_name,
         existing_chain, n_torsion_samples)
     Torsion search for phosphodiester linkage positioning.
- 
-orient_root_molecule(mol_data, target_orientation, n_samples)
-    Rotate the fixed root monomer to satisfy a surface orientation constraint
-    ('flat' or 'perpendicular') using coarse Z-search + scipy refinement.
  
 Geometric scoring and filtering
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -58,12 +46,6 @@ detect_clashes(new_mol, existing_chain, clash_factor, exclude_last_n)
  
 calculate_collision_penalty(mol, chain_list, clash_factor)
     Continuous collision penalty (sum of exponential clash severities).
- 
-calculate_surface_orientation_score(mol_data, target_orientation)
-    0.0 = perfect alignment with surface normal; 1.0 = worst.
- 
-get_orientation_dot_product(mol_data)
-    n_ring · z_surface scalar.
  
 Utilities
 ~~~~~~~~~

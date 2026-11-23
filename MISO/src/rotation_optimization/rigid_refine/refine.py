@@ -58,23 +58,33 @@ from .beads import (BeadSet, attach_bridging_oxygens, bead_rigidity, build_beads
                     find_linkages, oriented_normal, ring_pucker, template_deviation)
 from ..structure import pdb_export
 from ..geometry.geometry_utils import rotate_molecule_around_com
+from ... import constants
 
 
 @dataclass
 class RigidRefineConfig:
-    # External potential (same forms as force_field_optimization)
-    gravity: float = 2.0
+    # External potential (same forms as force_field_optimization).  Gravity,
+    # slab force scale, slab step, slab interval and the number of compression
+    # steps come from src/constants.py, which reads the same environment
+    # variables as the atom level REFINE (DEFAULT_GRAVITY,
+    # DEFAULT_SLAB_FORCE_SCALE, DEFAULT_SLAB_STEP_SIZE,
+    # DEFAULT_SLAB_STEP_INTERVAL, DEFAULT_COMPRESSION_STEPS).
+    gravity: float = constants.DEFAULT_GRAVITY
     use_brightness: bool = True
-    slab_force_scale: float = 50.0
+    slab_force_scale: float = constants.DEFAULT_SLAB_FORCE_SCALE
     floor_z: float = 0.0
     ceiling_z: Optional[float] = None     # None: thickest bead + ceiling_margin
     ceiling_margin: float = 1.0
     slab_start_offset: float = 2.0         # slab starts this far below the lowest atom,
                                            # ceiling this far above the highest
     start_clearance: float = 1.0           # whole structure lifted so its lowest atom sits here above the floor
-    slab_step: float = 0.05
-    slab_interval: int = 10                # descent iterations per slab increment
-    max_slab_increments: int = 400
+    slab_step: float = constants.DEFAULT_SLAB_STEP_SIZE   # minimum rise per increment (A)
+    slab_interval: int = constants.DEFAULT_SLAB_STEP_INTERVAL  # descent iterations per increment
+    # Compression steps = number of press increments.  The press always ends
+    # at its target (slab stop and final ceiling): if compression_steps x
+    # slab_step is too short for the distance, each increment rises by
+    # distance / compression_steps instead, and the log says so.
+    compression_steps: int = constants.DEFAULT_COMPRESSION_STEPS
     slab_stop_margin: float = 0.5          # stop rising when slab + thickest bead + margin reaches ceiling
 
     # Restraints
@@ -229,6 +239,7 @@ class RigidRefine:
 
         self.target_xy = np.array([b.pivot[:2] for b in beadset.beads], dtype=float)
         self.faces = np.array([b.face for b in beadset.beads], dtype=float)
+
         self.bead_mass = np.array([b.masses.sum() for b in beadset.beads])
         self.bead_inertia = np.array([max(b.inertia, 1.0) for b in beadset.beads])
         self.fixed = np.array(beadset.fixed_atoms, dtype=int)
@@ -463,12 +474,25 @@ class RigidRefine:
                   f"{self.ceiling:.2f} A (thickest bead {self.t_max:.2f} A)")
             print(f"  start: E = {E0:.3f} (ff {parts0['ff']:.2f}, ext {parts0['ext']:.2f}, "
                   f"xy {parts0['xy']:.3f}, face {parts0['face']:.3f})")
+        # Press schedule: compression_steps increments, each followed by
+        # slab_interval descent iterations.  The rise per increment is the
+        # user's slab step, or more if that is too short to reach the target.
+        n_steps = max(1, int(cfg.compression_steps))
+        travel = max(slab_stop - slab_z, ceiling - self.ceiling, 0.0)
+        step = max(cfg.slab_step, travel / n_steps)
+        if cfg.verbose:
+            print(f"  REFINE settings: gravity {cfg.gravity}, slab force scale "
+                  f"{cfg.slab_force_scale}, compression steps {n_steps}, slab step "
+                  f"{cfg.slab_step} A, interval {cfg.slab_interval} descent iterations")
+            if step > cfg.slab_step + 1e-12:
+                print(f"  ! {n_steps} steps of {cfg.slab_step} A cover {n_steps * cfg.slab_step:.2f} A "
+                      f"of the {travel:.2f} A the press needs; using {step:.3f} A per step")
         n_inc = 0
         frames = []
-        while (slab_z < slab_stop or ceiling > self.ceiling) and n_inc < cfg.max_slab_increments:
+        while (slab_z < slab_stop or ceiling > self.ceiling) and n_inc < n_steps:
             st, E, _, _ = self.descend(st, slab_z, ceiling, cfg.slab_interval)
-            slab_z = min(slab_z + cfg.slab_step, slab_stop)
-            ceiling = max(ceiling - cfg.slab_step, self.ceiling)
+            slab_z = min(slab_z + step, slab_stop)
+            ceiling = max(ceiling - step, self.ceiling)
             n_inc += 1
             if cfg.trajectory_path and n_inc % cfg.trajectory_interval == 0:
                 frames.append(st.pos.copy())

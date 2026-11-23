@@ -11,14 +11,11 @@ coordinate arrays extracted from molecule_data_dict entries.
 Main entry points called by structure/building_chain.py
 -------------------------------------------------------
 find_rotation_FULL_3D_QUATERNION
-    Single-bond or multi-bond 3D rotation search (no orientation constraint).
+    Single-bond or multi-bond 3D rotation search.
 
 find_rotation_with_face
     Same search, but the requested face (+1 / -1) is part of the QUEST
     objective and checked on every candidate.  Used for face enumeration.
-
-find_rotation_1D_Z_AXIS
-    Z-axis spin search for rings constrained to lie flat on the surface.
 
 find_rotation_QUEST_VARIANTS_TOP_N
     Returns the top-N rotations across QUEST variants and uniform samples;
@@ -26,9 +23,6 @@ find_rotation_QUEST_VARIANTS_TOP_N
 
 find_rotation_for_phosphate_linkage
     Torsion search for phosphodiester linkage positioning.
-
-orient_root_molecule
-    Align the root (fixed) monomer to a surface orientation constraint.
 """
 
 import numpy as np
@@ -603,33 +597,6 @@ def check_multibond_intersections(bonds_to_optimize, rotated_mol):
 _SURFACE_NORMAL = np.array([0.0, 0.0, 1.0])
 
 
-def calculate_surface_orientation_score(mol_data, target_orientation):
-    """
-    Score how well the ring normal aligns with the surface normal.
-
-    Parameters
-    ----------
-    mol_data : dict
-    target_orientation : 'flat' | 'perpendicular'
-
-    Returns
-    -------
-    float  0.0 = perfect; 1.0 = worst.
-    """
-    n_ring = get_ring_normal_absolute(mol_data)
-    dot = np.dot(n_ring, _SURFACE_NORMAL)
-    if target_orientation == 'flat':
-        return 1.0 - abs(dot)
-    if target_orientation == 'perpendicular':
-        return abs(dot)
-    raise ValueError(f"Unknown orientation: {target_orientation}")
-
-
-def get_orientation_dot_product(mol_data):
-    """Return n_ring · z_surface."""
-    return np.dot(get_ring_normal_absolute(mol_data), _SURFACE_NORMAL)
-
-
 # ============================================================================
 # Filter pipeline
 # ============================================================================
@@ -758,20 +725,17 @@ def generate_quest_weight_variants(n_bonds, include_normal=False):
 # Internal helpers shared by the main search functions
 # ============================================================================
 
-def _score_candidate(mol, bonds_to_optimize, existing_chain, clash_factor,
-                     target_orientation=None):
+def _score_candidate(mol, bonds_to_optimize, existing_chain, clash_factor):
     """Compute a composite score for sorting candidates (lower = better)."""
     distance  = calculate_average_bond_distance(mol, bonds_to_optimize)
     collision = calculate_collision_penalty(mol, existing_chain, clash_factor)
     score = distance * 10.0 + collision * 50.0
-    if target_orientation:
-        score += calculate_surface_orientation_score(mol, target_orientation) * 200.0
     return distance, collision, score
 
 
 def _test_quest_variants(template, bonds_to_optimize, existing_chain,
                          existing_linkages, com, n_variants, face_label,
-                         clash_factor, target_orientation=None):
+                         clash_factor):
     """Run QUEST for each weight variant and return passing solutions."""
     observations = []
     references   = []
@@ -783,15 +747,7 @@ def _test_quest_variants(template, bonds_to_optimize, existing_chain,
         ref = ref / np.linalg.norm(ref)
         references.append(ref)
 
-    if target_orientation:
-        mol_normal = get_ring_normal(template)
-        mol_normal = mol_normal / np.linalg.norm(mol_normal)
-        observations.append(mol_normal)
-        references.append(np.array([0.0, 0.0, 1.0]))
-
-    weight_variants = generate_quest_weight_variants(
-        len(bonds_to_optimize), include_normal=(target_orientation is not None)
-    )[:n_variants]
+    weight_variants = generate_quest_weight_variants(len(bonds_to_optimize))[:n_variants]
 
     passing = []
     for weights, description in weight_variants:
@@ -805,8 +761,7 @@ def _test_quest_variants(template, bonds_to_optimize, existing_chain,
 
         if filter_result['passes']:
             distance, collision, score = _score_candidate(
-                mol_test, bonds_to_optimize, existing_chain, clash_factor,
-                target_orientation)
+                mol_test, bonds_to_optimize, existing_chain, clash_factor)
             passing.append({
                 'mol': mol_test, 'rotation': rot_matrix,
                 'distance': distance, 'collision_penalty': collision,
@@ -820,22 +775,13 @@ def _test_quest_variants(template, bonds_to_optimize, existing_chain,
 
 def _test_uniform_samples(template, bonds_to_optimize, existing_chain,
                           existing_linkages, com, n_samples, face_label,
-                          clash_factor, target_count, quest_rotation=None,
-                          target_orientation=None):
-    """
-    Test uniform rotation samples; stop early once *target_count* pass.
-
-    If *quest_rotation* is provided (for flat-mode), each sample is composed
-    with the QUEST base rotation to preserve flatness.
-    """
+                          clash_factor, target_count):
+    """Test uniform rotation samples; stop early once *target_count* pass."""
     rotations = generate_uniform_rotations(n_samples)
     passing   = []
 
     for idx, rotation in enumerate(rotations):
-        if quest_rotation is not None:
-            combined = rotation @ quest_rotation
-        else:
-            combined = rotation
+        combined = rotation
 
         mol_test = rotate_molecule_around_com(template, combined)
         mol_test['COM'] = com.tolist()
@@ -848,8 +794,7 @@ def _test_uniform_samples(template, bonds_to_optimize, existing_chain,
             continue
 
         distance, collision, score = _score_candidate(
-            mol_test, bonds_to_optimize, existing_chain, clash_factor,
-            target_orientation)
+            mol_test, bonds_to_optimize, existing_chain, clash_factor)
 
         passing.append({
             'mol': mol_test, 'rotation': combined,
@@ -1189,134 +1134,6 @@ def find_rotation_with_face(template, mol_carbon, target_mol, target_carbon,
     return best['mol'], best['distance'], params
 
 
-def find_rotation_1D_Z_AXIS(template, donor_c, target, acceptor_c,
-                             chain_list, fixed_com,
-                             target_orientation, n_samples=360,
-                             clash_factor=0.6, debug=False,
-                             additional_bonds=None, existing_linkages=None,
-                             future_bonds_to_this_mol=None):
-    """
-    Z-axis spin search for surface-flat (or perpendicular) rings.
-
-    Uses QUEST with a normal constraint to establish flatness, then spins
-    around the Z-axis while keeping the ring orientation locked.
-    Tests both faces (normal and Y-reflected).
-
-    Returns
-    -------
-    tuple (best_mol, best_distance, params_dict)
-    """
-    com = fixed_com
-    donor_idx = template['carbon_map'][donor_c]
-
-    if isinstance(target, dict) and 'carbon_map' in target:
-        t_idx = target['carbon_map'][acceptor_c]
-        target_pos = np.array(target['absolute_coordinates'][t_idx])
-    else:
-        target_pos = np.array(target)
-
-    bonds = [{'donor_idx': donor_idx, 'donor_name': donor_c,
-               'target_pos': target_pos, 'target': target,
-               'target_carbon': acceptor_c if isinstance(target, dict) else None}]
-
-    if additional_bonds:
-        for ab in additional_bonds:
-            ab_idx = template['carbon_map'][ab['donor_carbon']]
-            if isinstance(ab['target'], dict) and 'carbon_map' in ab['target']:
-                ab_t_idx = ab['target']['carbon_map'][ab['target_carbon']]
-                ab_pos = np.array(ab['target']['absolute_coordinates'][ab_t_idx])
-            else:
-                ab_pos = np.array(ab['target'])
-            bonds.append({'donor_idx': ab_idx, 'donor_name': ab['donor_carbon'],
-                           'target_pos': ab_pos, 'target': ab['target'],
-                           'target_carbon': ab.get('target_carbon')})
-
-    molecule_normal = get_ring_normal(template)
-    surface_normal  = np.array([0.0, 0.0, 1.0])
-    template_reflected = flip_molecule_coordinates(template, com)
-
-    def _optimize_flat_face(tmpl, label):
-        observations = []
-        references   = []
-        for i, bond in enumerate(bonds):
-            obs = np.array(tmpl['relative_coordinates'][bond['donor_idx']])
-            obs = obs / np.linalg.norm(obs)
-            observations.append(obs)
-            ref = bond['target_pos'] - np.array(com)
-            ref = ref / np.linalg.norm(ref)
-            references.append(ref)
-        observations.append(molecule_normal / np.linalg.norm(molecule_normal))
-        references.append(surface_normal)
-        weights = [2.0 if i == 0 else 1.0 for i in range(len(bonds))] + [3.0]
-
-        quest_rot = solve_wahba_quest(observations, references, weights)
-        mol_quest = rotate_molecule_around_com(tmpl, quest_rot)
-        mol_quest['COM'] = com.tolist()
-        quest_dist  = calculate_average_bond_distance(mol_quest, bonds)
-        quest_passes = check_ring_clearance(mol_quest, bonds, mode='binary')
-
-        if quest_passes:
-            return {'mol': mol_quest, 'distance': quest_dist, 'n_valid': 1,
-                    'best_score': quest_dist * 10.0, 'quest_mol': mol_quest,
-                    'quest_distance': quest_dist,
-                    'params': {'method': f'QUEST_flat_{label}', 'face': label}}
-
-        # Z-spin (preserves flatness established by QUEST)
-        passing = _test_uniform_samples(
-            tmpl, bonds, chain_list, existing_linkages,
-            com, n_samples, label, clash_factor, n_samples,
-            quest_rotation=quest_rot,
-            target_orientation=target_orientation)
-
-        # Remove candidates with bond intersections
-        passing = [p for p in passing
-                   if calculate_bond_intersection_penalty(
-                       p['mol'], bonds[0]['donor_idx'], bonds[0]['target_pos'],
-                       chain_list, existing_linkages) == 0]
-
-        if passing:
-            passing.sort(key=lambda x: x['score'])
-            best = passing[0]
-            return {'mol': best['mol'], 'distance': best['distance'],
-                    'n_valid': len(passing), 'best_score': best['score'],
-                    'quest_mol': mol_quest, 'quest_distance': quest_dist,
-                    'best_candidates': passing[:5],
-                    'params': {'method': f'Z_axis_flat_{label}', 'face': label,
-                               'n_valid': len(passing)}}
-
-        return {'mol': mol_quest, 'distance': quest_dist, 'n_valid': 0,
-                'best_score': float('inf'), 'quest_mol': mol_quest,
-                'quest_distance': quest_dist,
-                'params': {'method': f'QUEST_fallback_{label}', 'face': label}}
-
-    res_n = _optimize_flat_face(template, "NORMAL")
-    res_r = _optimize_flat_face(template_reflected, "REFLECTED")
-
-    # Optional future-bond conflict tiebreaker
-    if future_bonds_to_this_mol and (res_n['n_valid'] > 0 or res_r['n_valid'] > 0):
-        nc = _count_future_bond_conflicts(
-            res_n.get('best_candidates', [res_n]) if res_n['n_valid'] > 0 else [],
-            future_bonds_to_this_mol) if res_n['n_valid'] > 0 else float('inf')
-        rc = _count_future_bond_conflicts(
-            res_r.get('best_candidates', [res_r]) if res_r['n_valid'] > 0 else [],
-            future_bonds_to_this_mol) if res_r['n_valid'] > 0 else float('inf')
-        if nc < rc and res_n['n_valid'] > 0:
-            return res_n['mol'], res_n['distance'], res_n['params']
-        if rc < nc and res_r['n_valid'] > 0:
-            return res_r['mol'], res_r['distance'], res_r['params']
-
-    if res_n['n_valid'] > 0 and res_r['n_valid'] > 0:
-        winner = res_n if res_n['best_score'] <= res_r['best_score'] else res_r
-        return winner['mol'], winner['distance'], winner['params']
-    for res in [res_n, res_r]:
-        if res['n_valid'] > 0:
-            return res['mol'], res['distance'], res['params']
-
-    if res_n['quest_distance'] <= res_r['quest_distance']:
-        return res_n['quest_mol'], res_n['quest_distance'], res_n['params']
-    return res_r['quest_mol'], res_r['quest_distance'], res_r['params']
-
-
 def find_rotation_QUEST_VARIANTS_TOP_N(template, bonds_to_optimize,
                                        existing_chain, existing_linkages,
                                        fixed_com, n_top=5,
@@ -1381,41 +1198,6 @@ def find_rotation_QUEST_VARIANTS_TOP_N(template, bonds_to_optimize,
         'best_score': top_n[0]['score'] if top_n else None,
     }
     return top_n, metadata
-
-
-def orient_root_molecule(mol_data, target_orientation, n_samples=360):
-    """
-    Rotate the root (fixed) molecule to satisfy a surface orientation constraint.
-
-    Uses a coarse Z-axis search followed by scipy local refinement.
-
-    Returns
-    -------
-    dict  updated mol_data at the best orientation.
-    """
-    from scipy.optimize import minimize_scalar
-
-    com = np.array(mol_data['COM'])
-
-    def objective(theta_z):
-        rotated = rotate_molecule_z(mol_data, theta_z, com)
-        return calculate_surface_orientation_score(rotated, target_orientation)
-
-    angles = np.linspace(0, 360, n_samples, endpoint=False)
-    candidates = sorted([(objective(a), a) for a in angles], key=lambda x: x[0])[:5]
-
-    best_score, best_angle, best_mol = float('inf'), 0.0, mol_data
-    for _, coarse_angle in candidates:
-        result = minimize_scalar(objective,
-                                 bounds=(coarse_angle - 2, coarse_angle + 2),
-                                 method='bounded',
-                                 options={'xatol': 0.001})
-        if result.fun < best_score:
-            best_score = result.fun
-            best_angle = result.x
-            best_mol   = rotate_molecule_z(mol_data, best_angle, com)
-
-    return best_mol
 
 
 def find_rotation_for_phosphate_linkage(mol_template, mol_carbon_name,

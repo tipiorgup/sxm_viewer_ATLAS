@@ -70,7 +70,7 @@ def joint_rigid_rotation(chain_dict, linkages, face_state=None,
                          k_face=200.0, k_clash=1.0,
                          face_margin=0.3, clash_limit=2.9, bonded_clash_limit=2.5,
                          max_iter=4000, tol=1e-7, max_step=0.1,
-                         max_gap=6.0, min_gap=2.1, verbose=True):
+                         max_gap=6.0, min_gap=2.1, fixed=None, verbose=True):
     """
     Rotate every sugar in chain_dict about its COM to close the linkages.
 
@@ -98,6 +98,8 @@ def joint_rigid_rotation(chain_dict, linkages, face_state=None,
                  wrong sugar, or sugars that do not bond), hence rejected.
     min_gap    : linkage C...C below which the result is rejected (A); the
                  bridge angle would be far too acute.
+    fixed      : names of sugars that keep their orientation (user defined
+                 rotations from the orientation CSV); they do not rotate here.
 
     Returns
     -------
@@ -231,13 +233,18 @@ def joint_rigid_rotation(chain_dict, linkages, face_state=None,
                    for k in range(len(names))]
         return e, torques, pos
 
+    fixed = set(fixed or ())
+    pinned = [n in fixed for n in names]
     rots = [np.eye(3) for _ in names]
     e, torques, pos = evaluate(rots)
     e_start = e
     alpha, it = 0.05, 0
     for it in range(1, max_iter + 1):
         steps = []
-        for t in torques:
+        for k_, t in enumerate(torques):
+            if pinned[k_]:
+                steps.append(np.zeros(3))
+                continue
             s = -alpha * t
             n_s = np.linalg.norm(s)
             if n_s > max_step:

@@ -53,16 +53,8 @@ def _bead_mass(bead_type: str) -> float:
     return 72.0
 
 # Constant harmonic force constant for the debug topology (kJ/mol/nm^2).
-# Intra-residue bonds (both beads on the same unit) keep the stiff default,
-# inter-residue bonds (glycosidic, phosphate, PEtN, lipid-anchor linkages,
-# identified by resnum mismatch, which is exactly the yaml-defined
-# connectivity, since no other mechanism ever bonds two units together)
-# get the softer INTER_RESIDUE_BOND_K instead.
+# The plan calls for a placeholder k; b0 is measured per bond from the structure.
 DEFAULT_BOND_K = 20000
-INTER_RESIDUE_BOND_K = 2000
-LIP_BOND_K = 125  # lipid tail bonds (intra-chain and anchor-to-sugar), soft
-                  # regardless of intra/inter classification, so the tails
-                  # stay floppy rather than rigid
 ANGSTROM_TO_NM = 0.1
 
 
@@ -216,27 +208,19 @@ def build_cg_model(mol: Chem.Mol, residue_index: Dict[str, dict]) -> dict:
       ``beads`` : list of {index, bead_type, mass, resname, resnum, pos(nm)}
       ``bonds`` : list of (i, j, b0_nm) for the bonded model (0-based bead idx)
       ``uncovered`` : list of unit keys that could not be mapped
-      ``unit_beads`` : {unit_key: [bead_index, ...]}, built directly from the
-        unique residue_index key while iterating, never from resnum/resname
-        (resnum is NOT globally unique in this pipeline's numbering, e.g. a
-        KDO unit and a GAL unit can share the same resnum, so any downstream
-        code needing "all beads of this specific unit" should use this dict,
-        not resnum equality)
     """
     conf = mol.GetConformer()
 
     beads: List[dict] = []
     atom_to_bead: Dict[int, int] = {}
     uncovered: List[str] = []
-    unit_beads: Dict[str, List[int]] = {}
 
     for unit_key, meta in residue_index.items():
-        unit_beads_data = _map_residue_beads(mol, unit_key, meta)
-        if unit_beads_data is None:
+        unit_beads = _map_residue_beads(mol, unit_key, meta)
+        if unit_beads is None:
             uncovered.append(unit_key)
             continue
-        unit_beads[unit_key] = []
-        for ub in unit_beads_data:
+        for ub in unit_beads:
             bead_index = len(beads)
             for gi in ub['atom_globals']:
                 atom_to_bead[gi] = bead_index
@@ -246,11 +230,9 @@ def build_cg_model(mol: Chem.Mol, residue_index: Dict[str, dict]) -> dict:
                 'mass': ub['mass'],
                 'resname': meta['resname'],
                 'resnum': meta['resnum'],
-                'unit_key': unit_key,
                 'atom_globals': list(ub['atom_globals']),  # heavy atoms, for backmapping
                 'pos': _bead_position(mol, conf, ub['atom_globals']),
             })
-            unit_beads[unit_key].append(bead_index)
 
     # Bonds: any assembled bond whose heavy endpoints fall in different beads.
     bond_pairs = set()
@@ -269,10 +251,7 @@ def build_cg_model(mol: Chem.Mol, residue_index: Dict[str, dict]) -> dict:
     bonds = []
     for i, j in sorted(bond_pairs):
         b0 = float(np.linalg.norm(beads[i]['pos'] - beads[j]['pos']))
-        # unit_key, not resnum, since resnum is not globally unique here
-        # (e.g. a KDO unit and a GAL unit can share the same resnum).
-        inter_residue = beads[i]['unit_key'] != beads[j]['unit_key']
-        bonds.append((i, j, b0, inter_residue))
+        bonds.append((i, j, b0))
 
     if uncovered:
         print(f"  ! CG: {len(uncovered)} unit(s) not coarse-grained: "
@@ -280,69 +259,12 @@ def build_cg_model(mol: Chem.Mol, residue_index: Dict[str, dict]) -> dict:
     if skipped_bonds:
         print(f"  ! CG: {skipped_bonds} bond(s) skipped (touch an uncovered unit)")
 
-    return {'beads': beads, 'bonds': bonds, 'uncovered': uncovered, 'unit_beads': unit_beads}
+    return {'beads': beads, 'bonds': bonds, 'uncovered': uncovered}
 
 
 # ---------------------------------------------------------------------------
 # Writers
 # ---------------------------------------------------------------------------
-
-SUGAR_RESNAMES = {"GAL", "GLC", "GLA", "RHM", "KDO"}
-
-
-def build_ring_anchors(model: dict, sugar_resnames: set = SUGAR_RESNAMES) -> dict:
-    """For every sugar unit, finds the existing bead whose own position is
-    closest to that unit's own centroid (mean bead position), using the
-    model's own unit_beads/pos directly, no resnum-based lookup, so the
-    resnum collision (a KDO unit and a GAL unit can share the same resnum)
-    cannot affect this.
-
-    Returns {unit_key: {"resname":.., "resnum":.., "anchor_bead":..}}.
-    """
-    beads_by_index = {b['index']: b for b in model['beads']}
-    anchors = {}
-
-    for unit_key, bead_indices in model['unit_beads'].items():
-        sample = beads_by_index[bead_indices[0]]
-        if sample['resname'].strip().upper() not in sugar_resnames:
-            continue
-
-        positions = [beads_by_index[i]['pos'] for i in bead_indices]
-        centroid = np.mean(positions, axis=0)
-
-        best_idx, best_dist = None, None
-        for i in bead_indices:
-            d2 = float(np.sum((beads_by_index[i]['pos'] - centroid) ** 2))
-            if best_dist is None or d2 < best_dist:
-                best_dist = d2
-                best_idx = i
-
-        anchors[unit_key] = {
-            "resname": sample['resname'],
-            "resnum": sample['resnum'],
-            "anchor_bead": best_idx,
-        }
-
-    return anchors
-
-
-def write_ring_posre_file(anchors: dict, path: Path, fc_xy: float = 5000) -> Path:
-    """Writes a posre.itp restraining only the ring-anchor beads: fcx=fcy
-    rigid (in-plane), fcz=0 (free), so each ring can still rotate in 3D
-    about that point while its own translation is suppressed. No other
-    bead gets any restraint."""
-    lines = ["[ position_restraints ]", "; ai   funct   fcx    fcy    fcz"]
-    for unit_key in sorted(anchors, key=lambda k: anchors[k]["anchor_bead"]):
-        a = anchors[unit_key]
-        bead_1based = a["anchor_bead"] + 1
-        lines.append(
-            f"{bead_1based} 1 {fc_xy:.0f} {fc_xy:.0f} 0  "
-            f"; ring anchor: {unit_key} ({a['resname']}{a['resnum']})"
-        )
-    path.write_text("\n".join(lines) + "\n")
-    print(f"  [ring-posre] Wrote {path} ({len(anchors)} ring anchors)")
-    return path
-
 
 def _bead_atom_name(index: int) -> str:
     """GROMACS atom name (<=5 chars) for a bead."""
@@ -384,82 +306,14 @@ def write_itp(model: dict, name: str, path: Path, *, bonded: bool) -> Path:
     lines.append("[ bonds ]")
     if bonded:
         lines.append(";  ai    aj  funct       b0(nm)        k(kJ/mol/nm^2)")
-        for i, j, b0, inter_residue in model['bonds']:
-            if beads[i]['resname'].strip().upper() == 'LIP' or beads[j]['resname'].strip().upper() == 'LIP':
-                k = LIP_BOND_K
-            else:
-                k = INTER_RESIDUE_BOND_K if inter_residue else DEFAULT_BOND_K
-            line = f"{i + 1:5d} {j + 1:5d} {1:5d} {b0:12.5f} {k:12d}"
-            if inter_residue:
-                ri, rj = beads[i]['resname'].strip(), beads[j]['resname'].strip()
-                rni, rnj = beads[i]['resnum'], beads[j]['resnum']
-                line += f"  ; inter-residue: {ri}{rni} - {rj}{rnj}"
-            lines.append(line)
+        for i, j, b0 in model['bonds']:
+            lines.append(f"{i + 1:5d} {j + 1:5d} {1:5d} {b0:12.5f} {DEFAULT_BOND_K:12d}")
     else:
         lines.append("; (unbonded debug model - no bonds)")
-    lines.append("")
-    lines.append("#ifdef POSRES")
-    lines.append('#include "posre.itp"')
-    lines.append("#endif")
     lines.append("")
     path.write_text("\n".join(lines) + "\n")
     kind = "bonded" if bonded else "unbonded"
     print(f"  [cg] Wrote {path} ({kind}, {len(model['bonds']) if bonded else 0} bonds)")
-    return path
-
-
-def build_carbon_guide(
-    model: dict,
-    residue_index: Dict[str, dict],
-    mol: Chem.Mol,
-) -> dict:
-    """Maps each bead back to the atom name(s) (C1, C2, O5, ...) RDKit's
-    AtomPDBResidueInfo already carries on each atom, per pdb_export.py's
-    assign_sugar_residues/_set_atom_info. No index arithmetic, no
-    carbon_map, no molecule_data_dict needed: the name is read directly off
-    the atom object, which survives every atom removal/reindexing done
-    during assembly, since RDKit keeps MonomerInfo attached to the atom
-    itself rather than to its index.
-
-    Structural units (PO4/PEN/LIP) get element+counter names from
-    finalize_residue_info, not sugar carbon names, those are reported as-is.
-
-    Returns {unit_key: {"resname":.., "resnum":.., "beads": [
-        {"bead_index":.., "bead_type":.., "atom_names": [...]}
-    ]}}
-    """
-    guide: dict = {}
-    for unit_key, meta in residue_index.items():
-        guide[unit_key] = {
-            "resname": meta.get("resname"),
-            "resnum": meta.get("resnum"),
-            "beads": [],
-        }
-
-    for bead in model['beads']:
-        owning_unit = bead.get("unit_key")
-        if owning_unit is None or owning_unit not in guide:
-            continue
-
-        names = []
-        for gi in bead["atom_globals"]:
-            atom = mol.GetAtomWithIdx(gi)
-            info = atom.GetMonomerInfo()
-            if info is not None:
-                names.append(info.GetName().strip())
-        guide[owning_unit]["beads"].append({
-            "bead_index": bead["index"],
-            "bead_type": bead["bead_type"],
-            "atom_names": sorted(set(names)) if names else None,
-        })
-
-    return guide
-
-
-def write_carbon_guide(guide: dict, path: Path) -> Path:
-    import json
-    path.write_text(json.dumps(guide, indent=2))
-    print(f"  [cg] Wrote {path} (bead-to-carbon guide)")
     return path
 
 
@@ -468,24 +322,11 @@ def export_cg_models(
     residue_index: Dict[str, dict],
     name: str,
     out_dir: str = ".",
-    write_guide: bool = True,
-    write_ring_posre: bool = True,
 ) -> dict:
     """Build and write both debug CG models.
 
     ``name`` is the SDF stem (e.g. ``<prefix>_p1_lowest_energy_optimized``);
     the two models append ``_cg_unbonded`` / ``_cg_bonded``.
-
-    When ``write_guide`` is True (default), also writes
-    ``<name>_bead_carbon_guide.json``, mapping each bead back to the atom
-    name(s) (C1, O5, ...) already carried on ``mol``'s atoms via
-    AtomPDBResidueInfo (see build_carbon_guide's docstring).
-
-    When ``write_ring_posre`` is True (default), also writes
-    ``<name>_ring_posre.itp``, restraining only one bead per sugar ring (the
-    bead closest to that ring's own centroid) rigid in-plane (fcz=0, free),
-    so the ring can still rotate in 3D about that point (see
-    build_ring_anchors's docstring).
     """
     if not residue_index:
         print("  ! CG: no residue map available; skipping CG export")
@@ -505,17 +346,5 @@ def export_cg_models(
     write_gro(model, name, out / f"{name}_cg_bonded.gro")
     paths['bonded_gro'] = out / f"{name}_cg_bonded.gro"
     paths['bonded_itp'] = write_itp(model, name, out / f"{name}_cg_bonded.itp", bonded=True)
-
-    if write_guide:
-        guide = build_carbon_guide(model, residue_index, mol)
-        paths['carbon_guide'] = write_carbon_guide(
-            guide, out / f"{name}_bead_carbon_guide.json"
-        )
-
-    if write_ring_posre:
-        anchors = build_ring_anchors(model)
-        paths['ring_posre'] = write_ring_posre_file(
-            anchors, out / f"{name}_ring_posre.itp"
-        )
 
     return {'model': model, 'paths': paths}
