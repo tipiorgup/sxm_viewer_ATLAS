@@ -398,6 +398,7 @@ def main():
     assembled_coords = []          # (polymer_idx, label, coords) for duplicate checks
     state_log = []                 # (label, status, polymer_idx, worst_gap, reason)
     rigid_log = []                 # (polymer_idx, label, rigid REFINE report)
+    lipid_log = []                 # (polymer_idx, label, lipid info, before, after)
     if sugars and args.faces == "enumerate":
         face_mol_order, face_states, screening = lpf.plan_face_states(
             molecule_data_dict, config, args.n_polymers, seed=args.seed,
@@ -508,7 +509,9 @@ def main():
                         with timer.section(f"{tag}   PEtN modifications", level=3):
                             petn_linkages = lpf.add_petn_modifications(config, chain_dict, circles)
                         with timer.section(f"{tag}   Lipid chain building", level=3):
-                            all_lipids = lpf.add_lipid_chains(config, molecule_data_dict, circles)
+                            all_lipids = lpf.add_lipid_chains(
+                                config, lpf.lipid_source_dict(molecule_data_dict, chain_dict,
+                                                              unbonded_monomers), circles)
                     else:
                         chain_dict = {}
                         bonds_glyco = []
@@ -646,7 +649,8 @@ def main():
                             optimized_mol, rigid_report = refine_structure(
                                 final_with_h, final_no_h, chain_dict,
                                 [tuple(link) for link in config.get('glycosidic_bonds', [])],
-                                fixed_atoms=fixed_atoms, config=rigid_cfg)
+                                fixed_atoms=fixed_atoms, config=rigid_cfg,
+                                pins=lpf.lipid_pins(final_with_h, all_lipids))
                             success = (rigid_report['max_rigid_rmsd'] < 1e-6
                                        and rigid_report['faces_kept'])
                             rigid_log.append((polymer_idx, face_label, rigid_report))
@@ -673,6 +677,15 @@ def main():
                                 torsion_constraints=torsion_constraints,
                                 save_debug_checkpoints=args.debug_checkpoints
                             )
+
+                    if all_lipids:
+                        for info in lpf.lipid_atoms(final_with_h, all_lipids):
+                            after = (lpf.lipid_geometry(optimized_mol, info)
+                                     if optimized_mol is not None
+                                     and optimized_mol.GetNumAtoms() == final_with_h.GetNumAtoms()
+                                     else None)
+                            lipid_log.append((polymer_idx, face_label, info,
+                                              lpf.lipid_geometry(final_with_h, info), after))
 
                     with timer.section(f"{tag}   Save results", level=3):
                         lpf.save_optimization_results(
@@ -706,6 +719,31 @@ def main():
                 'success': False,
                 'error': str(e)
             })
+
+    if lipid_log:
+        path = f"{base_name}_lipids.csv"
+        keys = ('anchor_bond', 'cc_min', 'cc_max', 'ccc_min', 'ccc_max',
+                'z_min', 'z_max', 'tail_z_spread', 'mid_off', 'tip_off')
+        fmt = lambda v: '' if v is None else f"{v:.3f}"
+        with open(path, "w") as fh:
+            fh.write("polymer,face_state,lipid,linkage,branched,n_requested,n_used,"
+                     + ",".join(f"{k}_built" for k in keys) + ","
+                     + ",".join(f"{k}_refined" for k in keys) + "\n")
+            for pidx, label, info, before, after in lipid_log:
+                fh.write(f"{pidx},{label},\"{info['label']}\",{info['linkage']},"
+                         f"{int(info['branched'])},{info['n_requested'] or 'auto'},{info['n_used']},"
+                         + ",".join(fmt(before[k]) for k in keys) + ","
+                         + ",".join(fmt(after[k] if after else None) for k in keys) + "\n")
+        print(f"\nLipid geometry (built and after REFINE) -> {path}")
+        for pidx, label, info, before, after in lipid_log:
+            g = after or before
+            pts = " ".join(f"{w} {g[k]:.2f} A" for w, k in (('mid', 'mid_off'), ('tip', 'tip_off'))
+                           if g[k] is not None)
+            print(f"  polymer {pidx} {info['label']}: carbons {info['n_used']} "
+                  f"(asked {info['n_requested'] or 'auto'}), bond {g['anchor_bond']:.2f} A, "
+                  f"C-C {g['cc_min']:.2f}..{g['cc_max']:.2f} A, C-C-C "
+                  f"{g['ccc_min']:.0f}..{g['ccc_max']:.0f} deg, tail z spread "
+                  f"{g['tail_z_spread']:.2f} A, off point: {pts}")
 
     if rigid_log:
         path = f"{base_name}_rigid_refine.csv"

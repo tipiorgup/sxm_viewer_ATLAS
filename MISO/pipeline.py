@@ -862,11 +862,126 @@ def add_petn_modifications(config, chain_dict, circles):
 # LIPID CHAINS
 # ============================================================================
 
+def lipid_source_dict(molecule_data_dict, chain_dict, unbonded_monomers=None):
+    """The molecules lipids are built on: each sugar as positioned in this
+    polymer (chain_dict, then phosphate attached monomers), falling back to the
+    template only for molecules the chain does not hold.  Lipids used to be
+    built on the template, the sugar before QUEST and the joint rotation turned
+    it, so the lipid did not start at the sugar carbon it is bonded to."""
+    src = dict(molecule_data_dict)
+    src.update(unbonded_monomers or {})
+    src.update(chain_dict or {})
+    return src
+
+
+def lipid_pins(mol, lipids, tol=0.05):
+    """Atoms to pin in REFINE: for every lipid, the carbon built on its
+    midpoint and the carbon built on its tip, with the point's xy.
+
+    Returns [{'atom': index, 'xy': (x, y), 'label': str}].  Carbons are found
+    in *mol* by position (the exporter copies the builder's coordinates)."""
+    if not lipids:
+        return []
+    conf = mol.GetConformer()
+    pos = np.array(conf.GetPositions())
+    carbons = np.array([a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == 'C'])
+    pins = []
+    for k, lip in enumerate(lipids):
+        chain = lip.get('chain_carbons') or []
+        name = f"lipid {k + 1} ({lip.get('mol_name')}.{lip.get('carbon_name')})"
+        for which, ikey, tkey in (('midpoint', 'mid_carbon_index', 'mid_target'),
+                                  ('tip', 'end_carbon_index', 'end_target')):
+            i, target = lip.get(ikey), lip.get(tkey)
+            if i is None or target is None or i >= len(chain):
+                continue
+            d = np.linalg.norm(pos[carbons] - np.asarray(chain[i]), axis=1)
+            j = int(np.argmin(d))
+            if d[j] > tol:
+                print(f"  ! {name}: {which} carbon not found in the structure "
+                      f"(nearest carbon {d[j]:.2f} A away); not pinned")
+                continue
+            pins.append({'atom': int(carbons[j]), 'xy': (float(target[0]), float(target[1])),
+                         'label': f"{name} {which}"})
+    return pins
+
+
+
+def lipid_atoms(mol, lipids, tol=0.05):
+    """Find each lipid's atoms in *mol* by position (the exporter copies the
+    builder's coordinates): the atom it hangs from (sugar carbon or parent
+    chain carbon), the linkage atom, the chain carbons (carbonyl C first for
+    amide and ester), and the midpoint and tip carbons.  Lipids whose atoms
+    cannot all be found are skipped with a note."""
+    if not lipids:
+        return []
+    pos = np.array(mol.GetConformer().GetPositions())
+
+    def find(xyz):
+        d = np.linalg.norm(pos - np.asarray(xyz, dtype=float), axis=1)
+        j = int(np.argmin(d))
+        return j if d[j] <= tol else None
+
+    out = []
+    for k, lip in enumerate(lipids):
+        name = f"lipid {k + 1} ({lip.get('mol_name')}.{lip.get('carbon_name')})"
+        link_xyz = (lip.get('n_link_position') or lip.get('o_ester_position')
+                    or lip.get('o_ether_position'))
+        chain_xyz = list(lip.get('chain_carbons') or [])
+        if lip.get('c_carbonyl_position') is not None:
+            chain_xyz = [lip['c_carbonyl_position']] + chain_xyz
+        anchor = find(lip['sugar_carbon']) if lip.get('sugar_carbon') is not None else None
+        link = find(link_xyz) if link_xyz is not None else None
+        chain = [find(c) for c in chain_xyz]
+        if anchor is None or link is None or any(c is None for c in chain):
+            print(f"  ! {name}: atoms not found in the structure; left out of the lipid report")
+            continue
+        off = 1 if lip.get('c_carbonyl_position') is not None else 0
+        mi, ei = lip.get('mid_carbon_index'), lip.get('end_carbon_index')
+        out.append({'label': name, 'linkage': lip.get('linkage'),
+                    'branched': bool(lip.get('is_branched')),
+                    'n_requested': lip.get('n_requested'), 'n_used': lip.get('n_carbons'),
+                    'anchor': anchor, 'link': link, 'chain': chain,
+                    'mid': chain[mi + off] if mi is not None else None,
+                    'tip': chain[ei + off] if ei is not None else None,
+                    'mid_target': lip.get('mid_target'), 'tip_target': lip.get('end_target')})
+    return out
+
+
+def lipid_geometry(mol, info):
+    """Geometry of one lipid (an entry of lipid_atoms) in *mol*: bond to the
+    sugar (or parent chain), C-C and C-C-C ranges along the chain, chain
+    height range, height spread of the tail (second half of the chain), and
+    the xy offsets of the midpoint and tip carbons from their points."""
+    P = np.array(mol.GetConformer().GetPositions())
+    ch = info['chain']
+    bonds = [float(np.linalg.norm(P[ch[i + 1]] - P[ch[i]])) for i in range(len(ch) - 1)]
+    angs = []
+    for i in range(1, len(ch) - 1):
+        v1, v2 = P[ch[i - 1]] - P[ch[i]], P[ch[i + 1]] - P[ch[i]]
+        angs.append(float(np.degrees(np.arccos(np.clip(
+            v1 @ v2 / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1, 1)))))
+    tail = ch[len(ch) // 2:]
+
+    def off(atom, target):
+        if atom is None or target is None:
+            return None
+        return float(np.linalg.norm(P[atom, :2] - np.asarray(target[:2], dtype=float)))
+
+    return {'anchor_bond': float(np.linalg.norm(P[info['link']] - P[info['anchor']])),
+            'cc_min': min(bonds, default=0.0), 'cc_max': max(bonds, default=0.0),
+            'ccc_min': min(angs, default=0.0), 'ccc_max': max(angs, default=0.0),
+            'z_min': float(P[ch, 2].min()), 'z_max': float(P[ch, 2].max()),
+            'tail_z_spread': float(np.ptp(P[tail, 2])),
+            'mid_off': off(info['mid'], info['mid_target']),
+            'tip_off': off(info['tip'], info['tip_target'])}
+
+
 def initialize_lipid_storage(molecule_data_dict):
-    """Initialize lipid_chains list in each molecule."""
+    """Start every molecule with an empty lipid_chains list.  Fresh per call:
+    the dicts can be shared between polymers, and appending to a list left
+    from an earlier polymer piled up one lipid per polymer."""
     for mol_name in molecule_data_dict:
-        if 'lipid_chains' not in molecule_data_dict[mol_name]:
-            molecule_data_dict[mol_name]['lipid_chains'] = []
+        molecule_data_dict[mol_name]['lipid_chains'] = []
 
 def add_lipid_chains(config, molecule_data_dict, circles):
     """
